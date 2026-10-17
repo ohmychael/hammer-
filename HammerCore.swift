@@ -70,6 +70,63 @@ struct CommandQueue {
     }
 }
 
+// MARK: - Reconnect timing
+
+/// When Hammer may try connecting to a bulb again after something went wrong.
+/// The first failure is retried at once (it's usually a one-off, like your phone
+/// grabbing the bulb); after that each failure in a row doubles the wait (3 s,
+/// 6 s, 12 s … up to a minute), so a bulb that keeps refusing isn't flooded with
+/// attempts. A lasting link resets it.
+struct ConnectBackoff {
+    static let first: TimeInterval = 3
+    static let longest: TimeInterval = 60
+
+    private(set) var failures: [UUID: Int] = [:]
+    private(set) var notBefore: [UUID: Date] = [:]
+
+    static func delay(afterFailures count: Int) -> TimeInterval {
+        guard count > 1 else { return 0 }
+        return min(first * pow(2, Double(min(count, 16) - 2)), longest)
+    }
+
+    func canTry(_ id: UUID, now: Date = Date()) -> Bool {
+        now >= (notBefore[id] ?? .distantPast)
+    }
+
+    /// Seconds until the next try is allowed (0 if it already is).
+    func wait(_ id: UUID, now: Date = Date()) -> TimeInterval {
+        max(0, (notBefore[id] ?? now).timeIntervalSince(now))
+    }
+
+    /// Records one more failure in a row and returns the wait before the next try.
+    @discardableResult
+    mutating func failed(_ id: UUID, now: Date = Date()) -> TimeInterval {
+        let count = (failures[id] ?? 0) + 1
+        failures[id] = count
+        let delay = Self.delay(afterFailures: count)
+        notBefore[id] = now.addingTimeInterval(delay)
+        return delay
+    }
+
+    /// Waits at least `seconds` before the next try (e.g. a bulb that can't take Hammer's commands).
+    mutating func pause(_ id: UUID, for seconds: TimeInterval, now: Date = Date()) {
+        let until = now.addingTimeInterval(seconds)
+        notBefore[id] = max(notBefore[id] ?? until, until)
+    }
+
+    /// You just asked for this bulb, so try within `seconds` even if Hammer was waiting longer.
+    mutating func hurry(_ id: UUID, within seconds: TimeInterval, now: Date = Date()) {
+        guard let until = notBefore[id] else { return }
+        notBefore[id] = min(until, now.addingTimeInterval(seconds))
+    }
+
+    /// The link lasted: start counting from scratch.
+    mutating func succeeded(_ id: UUID) {
+        failures[id] = nil
+        notBefore[id] = nil
+    }
+}
+
 // MARK: - Govee bulb names
 
 enum GoveeName {

@@ -18,7 +18,9 @@ Open the menu from the hammer icon in the menu bar, by pressing **Control-Option
 
 A bulb talks to one device at a time over Bluetooth, and the Govee app on a phone keeps trying to connect in the background. So Hammer keeps a standing connection to your bulbs (only yours, never Other Lights), reconnects by itself whenever the link drops, and finds them again after a restart even while they're busy. Your phone's Govee app keeps working over Wi-Fi.
 
-If a bulb shows **can't reach**, something else has it: usually the Govee app on your phone. Force-quit the app and Hammer connects within seconds. To stop it happening at all, turn off Bluetooth for Govee Home on the phone (iPhone: Settings → Privacy & Security → Bluetooth → Govee Home); the app still controls your Wi-Fi bulbs. Taps made while a bulb can't be reached are dropped after 15 seconds rather than firing later.
+If a bulb shows **can't reach**, something else has it: usually the Govee app on your phone. Force-quit the app and Hammer connects within seconds. To stop it happening at all, turn off Bluetooth for Govee Home on the phone (iPhone: Settings → Privacy & Security → Bluetooth → Govee Home); the app still controls your Wi-Fi bulbs. A tap made while a bulb can't be reached is sent as soon as it's free, if that's within 15 seconds; older taps are dropped rather than firing later.
+
+If a bulb keeps refusing, Hammer retries more slowly each time (up to once a minute) instead of flooding it; using the light makes it try again within 2 seconds. A bulb that connects but doesn't accept Hammer's commands (for example after a firmware update) is let go, so it doesn't block your phone, and is checked again every 5 minutes.
 
 Each bulb's menu shows its link status at the top, and **Turn On** / **Turn Off** are checked from what the bulb itself reports.
 
@@ -55,6 +57,7 @@ Bluetooth bulbs are controlled from the menu bar app only.
 | `Hammer.swift` | The app: menu, monitor, Govee Wi-Fi/cloud/Bluetooth |
 | `HammerCore.swift` | Logic that needs only Foundation: packets, the Bluetooth command queue, name parsing |
 | `Tests/main.swift` | Tests for `HammerCore.swift`, run before every install |
+| `Tests/Bluetooth/` | Bluetooth scenarios (phone grabs the bulb, failures, resets…) against a stand-in CoreBluetooth; run on Linux |
 | `build.sh` | Compiles and installs `~/Applications/Hammer.app` |
 | `update.sh` | Pulls the latest commit and rebuilds |
 | `install-hammer.sh` | One-time setup |
@@ -72,4 +75,11 @@ pkill -x Hammer; rm -rf ~/Applications/Hammer.app ~/Hammer ~/.config/hammer
 ```
 cd ~/Hammer/repo
 swiftc HammerCore.swift Tests/main.swift -o /tmp/hammer-tests && /tmp/hammer-tests
+```
+
+The Bluetooth scenarios play out 22 situations in real time, such as your phone taking a bulb and letting it go, connections that fail or hang, Bluetooth resetting, and a neighbor's bulb nearby. They check what Hammer does in each one. They need Linux with Swift 5.9+, because the real CoreBluetooth on a Mac gets in the way of the stand-in:
+
+```
+Tests/Bluetooth/run.sh              # about 2 minutes
+Tests/Bluetooth/run.sh phone storm  # just these
 ```

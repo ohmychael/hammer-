@@ -108,6 +108,52 @@ queue.add([0x33], at: at(0))
 queue.add([], at: at(0))
 expect(queue.isEmpty, "packets shorter than 2 bytes are ignored")
 
+// MARK: Reconnect timing
+
+expect(ConnectBackoff.delay(afterFailures: 0) == 0, "no failures, no wait")
+expect([1, 2, 3, 4, 5, 6, 7, 8].map { ConnectBackoff.delay(afterFailures: $0) } == [0, 3, 6, 12, 24, 48, 60, 60],
+       "first retry at once, then waits double up to a minute")
+expect(ConnectBackoff.delay(afterFailures: 10_000) == 60, "a huge failure count stays at a minute")
+expect(ConnectBackoff.delay(afterFailures: -5) == 0, "a negative count is harmless")
+
+let bulbA = UUID(), bulbB = UUID()
+var backoff = ConnectBackoff()
+expect(backoff.canTry(bulbA, now: at(0)) && backoff.wait(bulbA, now: at(0)) == 0, "a new bulb can be tried right away")
+expect(backoff.failed(bulbA, now: at(0)) == 0 && backoff.canTry(bulbA, now: at(0)), "first failure: try again at once")
+expect(backoff.failed(bulbA, now: at(0)) == 3, "second failure in a row waits 3 s")
+expect(!backoff.canTry(bulbA, now: at(2.9)) && backoff.canTry(bulbA, now: at(3)), "allowed again after 3 s")
+expect(abs(backoff.wait(bulbA, now: at(1)) - 2) < 0.001, "2 s left after 1 s")
+expect(backoff.canTry(bulbB, now: at(0)), "one bulb's failures don't hold up another")
+expect(backoff.failed(bulbA, now: at(3)) == 6, "third failure in a row waits 6 s")
+
+// 200 quick failures (the old retry storm) end up a minute apart, not milliseconds.
+var storm = ConnectBackoff()
+var clock = 0.0, attempts = 0
+while clock < 600 {
+    if storm.canTry(bulbA, now: at(clock)) { attempts += 1; storm.failed(bulbA, now: at(clock)) }
+    clock += 0.05
+}
+expect(attempts <= 15, "a bulb that always fails is tried at most ~15 times in 10 minutes: \(attempts)")
+
+// Tapping a light while Hammer is waiting: try within 2 s, but never later than planned.
+backoff = ConnectBackoff()
+for _ in 1...7 { backoff.failed(bulbA, now: at(0)) }         // waiting a minute now
+backoff.hurry(bulbA, within: 2, now: at(0))
+expect(backoff.canTry(bulbA, now: at(2)) && !backoff.canTry(bulbA, now: at(1.9)), "a tap brings the next try forward to 2 s")
+backoff.hurry(bulbA, within: 30, now: at(0))
+expect(backoff.canTry(bulbA, now: at(2)), "hurrying never pushes a try later")
+backoff.hurry(bulbB, within: 2, now: at(0))
+expect(backoff.canTry(bulbB, now: at(0)), "hurrying a bulb that isn't waiting changes nothing")
+
+// A pause for a bulb that doesn't take Hammer's commands, and a lasting link resetting everything.
+backoff.pause(bulbA, for: 300, now: at(0))
+expect(!backoff.canTry(bulbA, now: at(299)) && backoff.canTry(bulbA, now: at(300)), "5 minute pause")
+backoff.pause(bulbA, for: 10, now: at(0))
+expect(!backoff.canTry(bulbA, now: at(100)), "a shorter pause doesn't cut a longer one short")
+backoff.succeeded(bulbA)
+expect(backoff.canTry(bulbA, now: at(0)) && backoff.failures[bulbA] == nil, "success clears the wait")
+expect(backoff.failed(bulbA, now: at(0)) == 0, "and the count starts over")
+
 // MARK: Bulb names
 
 expect(GoveeName.model(in: "ihoment_H6006_0FC3") == "H6006", "model from a Govee name")

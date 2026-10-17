@@ -422,6 +422,15 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     private static let freshFor: TimeInterval = 15
     /// How long a connection attempt runs before the menu says the bulb can't be reached.
     private static let patience: TimeInterval = 6
+    /// How often your connected bulbs are asked "are you on?". Govee's own app does
+    /// this every 2 seconds; it keeps the link alive and the checkmarks current.
+    private static let keepAliveEvery: TimeInterval = 2
+    /// A link that drops sooner than this after becoming ready counts as a failure.
+    private static let shortLink: TimeInterval = 10
+    /// Connected but still not ready for commands after this long: start over.
+    private static let setupTimeout: TimeInterval = 10
+    /// A bulb that connects without Govee's control channel is checked again this often.
+    private static let incompatiblePause: TimeInterval = 300
 
     /// Called on the main thread whenever the bulbs, their connections or their state change.
     var onChange: (() -> Void)?
@@ -429,11 +438,20 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     private var central: CBCentralManager?
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var found: [UUID: (model: String, name: String)] = [:]
+    private var placeholders: Set<UUID> = []                 // listed, but its real name isn't known yet
     private var signalStrength: [UUID: Int] = [:]            // latest signal strength, in dBm
     private var controls: [UUID: CBCharacteristic] = [:]
     private var outbox: [UUID: CommandQueue] = [:]           // see CommandQueue in HammerCore.swift
     private var writeInFlight: [UUID: Date] = [:]
+    private var waitingToWrite: [UUID: Date] = [:]           // since when the link has said "not yet"
+    private var pumpScheduled: Set<UUID> = []
     private var connectingSince: [UUID: Date] = [:]
+    private var connectedAt: [UUID: Date] = [:]
+    private var readyAt: [UUID: Date] = [:]                  // when the link could take commands
+    private var backoff = ConnectBackoff()                  // see HammerCore.swift
+    private var retryAt: [UUID: Date] = [:]
+    private var patienceCheck: Set<UUID> = []
+    private var setupRetries: [UUID: Int] = [:]
     private var releaseTimers: [UUID: DispatchWorkItem] = [:]
     private var held: Set<UUID> = []                         // your bulbs: always kept connected
     private var incompatible: Set<UUID> = []                 // connected, but no Govee control channel
@@ -441,6 +459,7 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     private var lastHeard: [UUID: Date] = [:]
     private var seenThisRun: Set<UUID> = []                  // advertised since Hammer started
     private var keepAlive: Timer?
+    private var ticks = 0
 
     /// macOS requires a Bluetooth usage message in the app's Info.plist, which the
     /// installer adds. Without it (e.g. the bare Terminal binary) Bluetooth stays off.
@@ -485,10 +504,10 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         return Date().timeIntervalSince(since) > Self.patience
     }
 
-    /// Connected, but the bulb doesn't offer the control channel Hammer uses.
+    /// The bulb connected but doesn't offer the control channel Hammer uses.
     func isIncompatible(_ id: UUID) -> Bool { incompatible.contains(id) }
 
-    /// On or off, as the bulb itself last reported; nil if it hasn't said.
+    /// On or off, as the bulb itself reported over the current link; nil if it hasn't said.
     func isOn(_ id: UUID) -> Bool? { powerState[id] }
 
     /// Whether the bulb has answered Hammer recently.
@@ -503,9 +522,9 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         guard isAvailable, central == nil else { return }
         central = CBCentralManager(delegate: self, queue: .main)   // asks for Bluetooth permission
 
-        // Every 10 seconds: a status read to each of your bulbs (keeps the link
-        // alive and refreshes on/off), and reconnect anything that dropped.
-        let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in self?.tick() }
+        // Every 2 seconds: "are you on?" to each connected bulb of yours.
+        // Every 10 seconds: reconnect anything of yours that dropped.
+        let timer = Timer(timeInterval: Self.keepAliveEvery, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(timer, forMode: .common)
         keepAlive = timer
     }
@@ -517,11 +536,15 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         central.stopScan()
         central.scanForPeripherals(withServices: nil,
                                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
-        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.central?.stopScan() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+            guard let central = self?.central, central.state == .poweredOn else { return }
+            central.stopScan()
+        }
     }
 
     /// Your bulbs. Hammer keeps these connected; any others it lets go of.
     func hold(_ ids: Set<UUID>) {
+        guard ids != held else { return }
         let letGo = held.subtracting(ids)
         held = ids
         for id in letGo { if let peripheral = peripherals[id] { releaseSoon(peripheral) } }
@@ -533,7 +556,14 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     /// but macOS can still hand it over by its ID).
     func connectHeld() {
         for id in held where found[id] == nil {
-            if let saved = knownBulbs[id.uuidString] { found[id] = saved }
+            if let saved = knownBulbs[id.uuidString] {
+                found[id] = saved
+            } else {
+                // Yours, but Hammer hasn't heard its name yet: list it anyway so it can
+                // be used and shows its status. The real name replaces this once known.
+                found[id] = ("", "Bluetooth bulb \(id.uuidString.prefix(4))")
+                placeholders.insert(id)
+            }
         }
         guard let central, central.state == .poweredOn else { return }
         let unseen = held.filter { peripherals[$0] == nil }
@@ -544,10 +574,11 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     }
 
     private func tick() {
-        for id in held where isConnected(id) && (outbox[id]?.isEmpty ?? true) {
-            send([0xAA, 0x01], to: id)            // "are you on?" — keeps the link alive
+        ticks += 1
+        for id in held where isConnected(id) {
+            send([0xAA, 0x01], to: id)            // "are you on?" (replaces any unsent one)
         }
-        connectHeld()
+        if ticks % 5 == 0 { connectHeld() }
     }
 
     // MARK: Remembering bulbs between runs
@@ -568,17 +599,25 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         UserDefaults.standard.set(saved, forKey: "bluetoothBulbs")
     }
 
+    /// Takes a bulb's model and name from what it calls itself, if Hammer didn't know
+    /// them yet. Returns true if anything changed.
+    @discardableResult
+    private func learnName(_ id: UUID, from advertised: String?) -> Bool {
+        guard found[id] == nil || placeholders.contains(id), let advertised,
+              let model = GoveeName.model(in: advertised), Self.supportedModels.contains(model) else { return false }
+        let name = GoveeName.displayName(model: model, advertised: advertised)
+        found[id] = (model, name)
+        placeholders.remove(id)
+        remember(id, model: model, name: name)
+        return true
+    }
+
     private func adopt(_ peripheral: CBPeripheral) {
         let id = peripheral.identifier
         guard peripherals[id] == nil else { return }
         peripherals[id] = peripheral
-        if found[id] == nil {
-            if let saved = knownBulbs[id.uuidString] {
-                found[id] = saved
-            } else if let model = peripheral.name.flatMap({ GoveeName.model(in: $0) }) {
-                found[id] = (model, "\(model) bulb")
-            }
-        }
+        if found[id] == nil, let saved = knownBulbs[id.uuidString] { found[id] = saved }
+        learnName(id, from: peripheral.name)
         onChange?()
     }
 
@@ -595,7 +634,12 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         if GoveePacket.isCommand(packet) { enqueue(GoveePacket.statusRead, for: id) }   // then ask, so the menu learns on/off
 
         if !held.contains(id) { releaseSoon(peripheral) }            // someone else's bulb: brief visit only
-        if isConnected(id) { pump(peripheral) } else { connect(peripheral) }
+        if isConnected(id) {
+            pump(peripheral)
+        } else {
+            backoff.hurry(id, within: 2)                             // you asked for it: don't wait out a long backoff
+            connect(peripheral)
+        }
     }
 
     /// Queues a packet, replacing any older one of the same kind: if you change the
@@ -606,37 +650,105 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         outbox[id] = queue
     }
 
+    private func hasWork(_ id: UUID) -> Bool {
+        guard var queue = outbox[id] else { return false }
+        queue.dropStale()
+        outbox[id] = queue
+        return !queue.isEmpty
+    }
+
+    /// Hammer always wants a link to your bulbs, and to anyone else's only while it
+    /// has something to send (Blink to Identify).
+    private func wantsLink(_ id: UUID) -> Bool { held.contains(id) || hasWork(id) }
+
     /// Writes queued packets one at a time, as fast as the bulb can take them.
     /// (Writing faster than the link allows makes macOS silently drop packets.)
     private func pump(_ peripheral: CBPeripheral) {
         let id = peripheral.identifier
         guard peripheral.state == .connected, let control = controls[id] else { return }
-        if let started = writeInFlight[id], Date().timeIntervalSince(started) < 2 { return }
-        writeInFlight[id] = nil
+        if let started = writeInFlight[id] {
+            let left = 2 - Date().timeIntervalSince(started)
+            if left > 0 { schedulePump(id, after: left + 0.05); return }   // the answer never came: carry on after 2 s
+            writeInFlight[id] = nil
+        }
 
         var queue = outbox[id] ?? CommandQueue(freshFor: Self.freshFor)
         queue.dropStale()
         while let next = queue.first {
             if control.properties.contains(.writeWithoutResponse) {
-                guard peripheral.canSendWriteWithoutResponse else { break }   // resumes in peripheralIsReady
+                if !peripheral.canSendWriteWithoutResponse {
+                    // macOS usually says when the link is ready again, but not always:
+                    // look again shortly, and after a second of "not yet" send anyway.
+                    let since = waitingToWrite[id] ?? Date()
+                    waitingToWrite[id] = since
+                    if Date().timeIntervalSince(since) < 1 {
+                        schedulePump(id, after: 0.25)
+                        break
+                    }
+                }
+                waitingToWrite[id] = nil
                 peripheral.writeValue(Data(next), for: control, type: .withoutResponse)
                 queue.removeFirst()
             } else {
                 peripheral.writeValue(Data(next), for: control, type: .withResponse)
                 queue.removeFirst()
                 writeInFlight[id] = Date()                                     // resumes in didWriteValueFor
+                schedulePump(id, after: 2.05)
                 break
             }
         }
         outbox[id] = queue
     }
 
+    /// One pending re-check per bulb.
+    private func schedulePump(_ id: UUID, after delay: TimeInterval) {
+        guard !pumpScheduled.contains(id) else { return }
+        pumpScheduled.insert(id)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.pumpScheduled.remove(id)
+            if let peripheral = self.peripherals[id] { self.pump(peripheral) }
+        }
+    }
+
+    // MARK: Connecting
+
     private func connect(_ peripheral: CBPeripheral) {
+        let id = peripheral.identifier
         guard let central, central.state == .poweredOn, peripheral.state == .disconnected else { return }
-        connectingSince[peripheral.identifier] = Date()
+        guard backoff.canTry(id) else { scheduleRetry(id); return }
+        incompatible.remove(id)                    // checked again once connected
+        connectingSince[id] = Date()
         central.connect(peripheral)                // waits as long as it takes; no timeout
         // Let the menu say "can't reach" if this is taking a while.
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.patience + 0.5) { [weak self] in self?.onChange?() }
+        if !patienceCheck.contains(id) {
+            patienceCheck.insert(id)
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.patience + 0.5) { [weak self] in
+                self?.patienceCheck.remove(id)
+                self?.onChange?()
+            }
+        }
+    }
+
+    /// Tries again once the backoff is over. One pending try per bulb; a sooner one replaces it.
+    private func scheduleRetry(_ id: UUID) {
+        let when = Date().addingTimeInterval(backoff.wait(id) + 0.05)
+        if let pending = retryAt[id], pending <= when { return }
+        retryAt[id] = when
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, when.timeIntervalSinceNow)) { [weak self] in
+            guard let self, self.retryAt[id] == when else { return }
+            self.retryAt[id] = nil
+            if self.wantsLink(id), let peripheral = self.peripherals[id] { self.connect(peripheral) }
+        }
+    }
+
+    /// Ends a link that isn't working and waits before trying again, so a bulb that
+    /// keeps failing isn't flooded with retries (and isn't kept from your phone).
+    private func dropLink(_ peripheral: CBPeripheral, pause: TimeInterval? = nil) {
+        let id = peripheral.identifier
+        if let pause { backoff.pause(id, for: pause) } else { backoff.failed(id) }
+        guard let central, central.state == .poweredOn else { return }
+        central.cancelPeripheralConnection(peripheral)        // didDisconnect follows, and waits out the backoff
     }
 
     /// Lets go of a bulb that isn't yours 10 seconds after Hammer last used it.
@@ -644,10 +756,15 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         let id = peripheral.identifier
         releaseTimers[id]?.cancel()
         let release = DispatchWorkItem { [weak self] in
-            guard let self, !self.held.contains(id) else { return }
-            self.central?.cancelPeripheralConnection(peripheral)
-            self.connectingSince[id] = nil
+            guard let self else { return }
+            self.releaseTimers[id] = nil
+            guard !self.held.contains(id) else { return }
             self.outbox[id] = nil
+            self.connectingSince[id] = nil
+            if let central = self.central, central.state == .poweredOn, let current = self.peripherals[id],
+               current.state != .disconnected {
+                central.cancelPeripheralConnection(current)
+            }
         }
         releaseTimers[id] = release
         DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: release)
@@ -660,10 +777,24 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
             rescan()
             connectHeld()
         } else {
-            // Bluetooth went off (or isn't allowed): every connection is gone.
+            // Bluetooth went off, is resetting, or isn't allowed: every link is gone,
+            // and after a reset macOS's bulb objects are no good either, so they're
+            // fetched again when it's back.
+            peripherals.removeAll()
             controls.removeAll()
             writeInFlight.removeAll()
+            waitingToWrite.removeAll()
             connectingSince.removeAll()
+            connectedAt.removeAll()
+            readyAt.removeAll()
+            outbox.removeAll()
+            powerState.removeAll()
+            lastHeard.removeAll()
+            retryAt.removeAll()
+            setupRetries.removeAll()
+            releaseTimers.values.forEach { $0.cancel() }
+            releaseTimers.removeAll()
+            backoff = ConnectBackoff()
         }
         onChange?()
     }
@@ -677,10 +808,11 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         if RSSI.intValue < 0 { signalStrength[id] = RSSI.intValue }   // 127 means "unknown"
         if peripherals[id] == nil { peripherals[id] = peripheral }
 
-        if !seenThisRun.contains(id) {
+        if !seenThisRun.contains(id) || placeholders.contains(id) {
             seenThisRun.insert(id)
             let name = GoveeName.displayName(model: model, advertised: advertised)
             found[id] = (model, name)
+            placeholders.remove(id)
             remember(id, model: model, name: name)
             onChange?()
         }
@@ -688,17 +820,29 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        connectingSince[peripheral.identifier] = nil
+        let id = peripheral.identifier
+        connectingSince[id] = nil
+        let session = Date()
+        connectedAt[id] = session
+        setupRetries[id] = 0
+        learnName(id, from: peripheral.name)
         peripheral.delegate = self
         peripheral.discoverServices([Self.serviceUUID])
+        // If getting the link ready stalls, start over (after a pause) rather than sit on it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.setupTimeout) { [weak self] in
+            guard let self, self.connectedAt[id] == session, self.controls[id] == nil,
+                  let current = self.peripherals[id], current.state == .connected else { return }
+            self.dropLink(current)
+        }
         onChange?()
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         let id = peripheral.identifier
         connectingSince[id] = nil
+        backoff.failed(id)
         if held.contains(id) {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.connect(peripheral) }
+            scheduleRetry(id)                             // keep trying, a little slower each time
         } else {
             outbox[id] = nil
         }
@@ -710,38 +854,86 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         let id = peripheral.identifier
         controls[id] = nil
         writeInFlight[id] = nil
-        if held.contains(id) { connect(peripheral) }      // reconnects the moment it's free again
+        waitingToWrite[id] = nil
+        connectingSince[id] = nil
+        powerState[id] = nil                              // it may change while someone else has it
+        lastHeard[id] = nil
+        let ready = readyAt.removeValue(forKey: id)
+        if connectedAt.removeValue(forKey: id) != nil {
+            if let ready, Date().timeIntervalSince(ready) >= Self.shortLink {
+                backoff.succeeded(id)                     // it was a good link: reconnect right away
+            } else if backoff.canTry(id) {
+                backoff.failed(id)                        // never got going, or dropped soon after: back off if it repeats
+            }
+        }
+        if wantsLink(id) { connect(peripheral) }          // yours: reconnects the moment it's free again
         onChange?()
     }
 
     // MARK: CBPeripheralDelegate
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let service = peripheral.services?.first(where: { $0.uuid == Self.serviceUUID }) else {
-            incompatible.insert(peripheral.identifier)
-            onChange?()
-            return
+        if peripheral.services?.contains(where: { $0.uuid == Self.serviceUUID }) == true {
+            continueSetup(peripheral)
+        } else if error != nil {
+            retrySetup(peripheral)                        // a hiccup, not an answer
+        } else {
+            markIncompatible(peripheral)                  // the bulb really has no Govee service
         }
-        peripheral.discoverCharacteristics(nil, for: service)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         let id = peripheral.identifier
         let characteristics = service.characteristics ?? []
         guard let control = characteristics.first(where: { $0.uuid == Self.controlUUID }) else {
-            incompatible.insert(id)
-            onChange?()
+            if error != nil { retrySetup(peripheral) } else { markIncompatible(peripheral) }
             return
         }
-        incompatible.remove(id)
         controls[id] = control
-        // Listen for the bulb's replies (on/off state, and proof it's answering).
+        readyAt[id] = Date()
+        setupRetries[id] = 0
+        // Listen for the bulb's replies (on/off state, and proof it's answering). Not on
+        // the control channel itself: an echo of "are you on?" would read as "off".
         for characteristic in characteristics
-        where characteristic.properties.contains(.notify) || characteristic.properties.contains(.indicate) {
+        where characteristic.uuid != Self.controlUUID
+            && (characteristic.properties.contains(.notify) || characteristic.properties.contains(.indicate)) {
             peripheral.setNotifyValue(true, for: characteristic)
         }
         enqueue(GoveePacket.statusRead, for: id)
         pump(peripheral)
+        onChange?()
+    }
+
+    /// The next step of getting a fresh link ready: find the service, then its channels.
+    private func continueSetup(_ peripheral: CBPeripheral) {
+        if let service = peripheral.services?.first(where: { $0.uuid == Self.serviceUUID }) {
+            peripheral.discoverCharacteristics(nil, for: service)
+        } else {
+            peripheral.discoverServices([Self.serviceUUID])
+        }
+    }
+
+    /// A setup step failed on a working link (it happens now and then): try it again
+    /// twice, then start the link over after a pause.
+    private func retrySetup(_ peripheral: CBPeripheral) {
+        let id = peripheral.identifier
+        let tries = (setupRetries[id] ?? 0) + 1
+        setupRetries[id] = tries
+        guard tries <= 2 else { dropLink(peripheral); return }
+        let session = connectedAt[id]
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, session != nil, self.connectedAt[id] == session,
+                  let current = self.peripherals[id], current.state == .connected else { return }
+            self.continueSetup(current)
+        }
+    }
+
+    /// The bulb connected but doesn't offer Govee's control channel (e.g. after a
+    /// firmware update). Keeping the link would only block your phone, so let go
+    /// and check again in 5 minutes, or sooner if you use the light.
+    private func markIncompatible(_ peripheral: CBPeripheral) {
+        incompatible.insert(peripheral.identifier)
+        dropLink(peripheral, pause: Self.incompatiblePause)
         onChange?()
     }
 
@@ -755,7 +947,7 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard let value = characteristic.value else { return }
+        guard error == nil, characteristic.uuid != Self.controlUUID, let value = characteristic.value else { return }
         let id = peripheral.identifier
         var changed = !isAnswering(id)
         lastHeard[id] = Date()
@@ -1241,9 +1433,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         guard let ble = light.bluetoothID else { return }
         if bluetooth.isIncompatible(ble) {
-            submenu.addItem(hint("Connected, but this bulb doesn't accept Hammer's"))
-            submenu.addItem(hint("commands. Was its firmware just updated in the"))
-            submenu.addItem(hint("Govee app? Tell Claude the new version."))
+            submenu.addItem(hint("This bulb answered but doesn't accept Hammer's"))
+            submenu.addItem(hint("commands, so Hammer let it go. Was its firmware just"))
+            submenu.addItem(hint("updated in the Govee app? Tell Claude the new version."))
         } else if bluetooth.cantReach(ble) {
             submenu.addItem(hint("Can't reach this bulb right now. If the Govee app on"))
             submenu.addItem(hint("your phone has it, force-quit the app; Hammer connects"))
