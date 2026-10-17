@@ -584,5 +584,104 @@ if let result = try? DeliveryCheck.run(state: backlogState, now: now, command: b
     expect(false, "backlog check failed")
 }
 
+// MARK: The Google script route
+
+let scriptKey = DeliveryScript.newKey()
+expect(DeliveryScript.isKey(scriptKey) && DeliveryScript.newKey() != scriptKey, "random 64-character keys")
+expect(!DeliveryScript.isKey("") && !DeliveryScript.isKey(String(repeating: "g", count: 64))
+       && !DeliveryScript.isKey(String(repeating: "A", count: 64)), "not keys")
+let scriptText = DeliveryScript.source(key: scriptKey)
+expect(scriptText.contains("const HAMMER_KEY = '\(scriptKey)';") && !scriptText.contains(DeliveryScript.keyPlaceholder),
+       "the script carries the key")
+expect(scriptText.hasPrefix("/**") && scriptText.contains("function doGet(e)"), "and starts cleanly (no stray indentation)")
+
+let deployed = "https://script.google.com/macros/s/AKfycbx1234567890abcdef/exec"
+expect(DeliveryScript.webAppURL(deployed)?.absoluteString == deployed, "a web app URL")
+expect(DeliveryScript.webAppURL("  \(deployed)\n")?.absoluteString == deployed, "pasted with spaces")
+for bad in ["", "script.google.com/macros/s/x/exec", "http://script.google.com/macros/s/x/exec",
+            "https://script.google.com/macros/s/x/dev", "https://evil.example.com/macros/s/x/exec",
+            "https://script.google.com.evil.com/macros/s/x/exec", "https://script.google.com/home/projects/x/edit",
+            "https://script.google.com/macros/s/x/exec?key=abc"] {
+    expect(DeliveryScript.webAppURL(bad) == nil, "not a web app URL: \(bad)")
+}
+let asked = DeliveryScript.requestURL(base: URL(string: deployed)!, key: scriptKey)?.absoluteString
+expect(asked == deployed + "?key=\(scriptKey)&v=1", "asks with the key: \(asked ?? "-")")
+
+func reply(_ json: String, status: Int = 200) -> Result<ScriptCheck.Reply, CheckFailure> {
+    ScriptCheck.read(status: status, body: Data(json.utf8))
+}
+let good = #"{"ok":true,"version":1,"account":"you@gmail.com","emails":[{"id":"m1","messageID":"<m1@mail>","from":"\"eBay\" <ebay@ebay.com>","subject":"Your package was delivered: Apple iPhone 15 Pro Max","date":"2026-10-17T15:00:00.000Z"}]}"#
+if case .success(let r) = reply(good) {
+    expect(r.account == "you@gmail.com" && r.emails?.count == 1 && r.emails?.first?.id == "m1", "reads the script's answer")
+} else { expect(false, "good answer rejected") }
+func failure(_ result: Result<ScriptCheck.Reply, CheckFailure>) -> CheckFailure? {
+    if case .failure(let f) = result { return f }
+    return nil
+}
+expect(failure(reply(#"{"ok":false,"error":"key"}"#))?.needsSetup == true, "wrong key: set up again")
+let gmailBusy = failure(reply(#"{"ok":false,"error":"gmail","message":"Service invoked too many times"}"#))
+expect(gmailBusy?.needsSetup == false && gmailBusy?.message.contains("keep trying") == true, "Gmail error: retried")
+let signIn = failure(reply("<html><body>Sign in - Google Accounts <a href='https://accounts.google.com/'>", status: 200))
+expect(signIn?.needsSetup == true && signIn?.message.contains("Anyone") == true, "sign-in page: access must be Anyone")
+expect(failure(reply("<html>Script function not found: doGet</html>"))?.message.contains("saved") == true, "not saved")
+expect(failure(reply("<html>Authorization is required to perform that action.</html>"))?.message.contains("Run") == true,
+       "needs permission again")
+expect(failure(reply("Not Found", status: 404))?.needsSetup == true, "wrong address")
+expect(failure(reply("<html>Error</html>", status: 503))?.needsSetup == false, "Google busy: retried")
+expect(failure(reply("garbage"))?.needsSetup == false, "nonsense: retried")
+expect(failure(reply(""))?.needsSetup == false, "empty: retried")
+
+func email(_ id: String, _ subject: String, from: String = "\"eBay\" <ebay@ebay.com>", hoursAgo: Double = 1,
+           messageID: String? = nil) -> ScriptCheck.Email {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return ScriptCheck.Email(id: id, messageID: messageID ?? "<\(id)@mail>", from: from, subject: subject,
+                             date: formatter.string(from: now.addingTimeInterval(-hoursAgo * 3600)))
+}
+var scriptState = ScriptState()
+var processed = ScriptCheck.process([email("old1", "Your package was delivered")], state: scriptState, now: now)
+expect(processed.deliveries.isEmpty && processed.state.started && processed.state.seen == ["old1"],
+       "first answer: notes what's there, announces nothing")
+scriptState = processed.state
+let batch = [
+    email("old1", "Your package was delivered"),
+    email("n2", #"Delivered: "Cable""#, from: "Amazon.com <a@amazon.com>", hoursAgo: 0.5, messageID: ""),
+    email("n1", "Your package was delivered: Apple iPhone 15 Pro Max", hoursAgo: 2),
+    email("n3", #"Out for delivery: "Lamp""#, from: "Target <t@target.com>"),
+    email("n4", "Your package was delivered", hoursAgo: 24 * 5),
+]
+processed = ScriptCheck.process(batch, state: scriptState, now: now)
+expect(processed.deliveries.map(\.body) == ["Apple iPhone 15 Pro Max", "Cable"],
+       "new deliveries only, oldest first: \(processed.deliveries.map(\.body))")
+expect(processed.deliveries.map(\.store) == ["eBay", "Amazon"] && processed.deliveries[1].messageID == nil
+       && processed.deliveries[1].gmailID == "n2", "store, and Gmail's ID when there's no Message-ID")
+expect(processed.state.seen == ["old1", "n2", "n1", "n3", "n4"], "everything looked at is remembered")
+expect(processed.deliveries[1].gmailLink(account: "you@gmail.com")?.absoluteString
+       == "https://mail.google.com/mail/?authuser=you@gmail.com#all/n2", "link by Gmail's ID")
+scriptState = processed.state
+processed = ScriptCheck.process(batch, state: scriptState, now: now)
+expect(processed.deliveries.isEmpty, "nothing announced twice")
+processed = ScriptCheck.process([ScriptCheck.Email(id: "", messageID: nil, from: nil, subject: "Delivered: x", date: nil)],
+                                state: scriptState, now: now)
+expect(processed.deliveries.isEmpty, "an email without an ID is ignored")
+var bigScript = ScriptState(started: true, seen: [])
+for chunk in 0..<6 {
+    bigScript = ScriptCheck.process((0..<100).map { email("x\(chunk)-\($0)", "newsletter") }, state: bigScript, now: now).state
+}
+expect(bigScript.seen.count == 500 && bigScript.seen.last == "x5-99", "only the last 500 IDs are kept")
+
+let noLink = Delivery(kind: .delivered, store: "Hammer", item: "test", subject: "", messageID: nil, date: nil, uid: 0)
+expect(noLink.gmailLink(account: "you@gmail.com") == nil, "the test notification has no email to open")
+let noAccount = Delivery(kind: .delivered, store: "eBay", item: nil, subject: "s", messageID: "<a@b>", date: nil, uid: 0)
+expect(noAccount.gmailLink(account: "")?.absoluteString == "https://mail.google.com/mail/u/0/#search/rfc822msgid%3Aa@b",
+       "no account known: the first Gmail account")
+expect(CheckFailure(.badLogin("[AUTHENTICATIONFAILED] x")).needsSetup && CheckFailure(.offline).offline
+       && !CheckFailure(.failed("x")).needsSetup, "app-password errors map across")
+
+// Saved deliveries from before this change still load.
+let savedBefore = #"[{"kind":"delivered","store":"eBay","item":"x","subject":"s","messageID":"<a@b>","uid":3}]"#
+expect((try? JSONDecoder().decode([Delivery].self, from: Data(savedBefore.utf8)))?.first?.gmailID == nil,
+       "older saved deliveries still load")
+
 print("\(checks) checks, \(failures) failed")
 exit(failures == 0 ? 0 : 1)

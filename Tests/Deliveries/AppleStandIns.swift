@@ -75,9 +75,21 @@ struct NSRect { init(x: Int, y: Int, width: Int, height: Int) {} }
 class NSView { init(frame: NSRect) {}; func addSubview(_ view: NSView) {} }
 class NSTextField: NSView { var stringValue = ""; var placeholderString: String? }
 class NSSecureTextField: NSTextField {}
-class NSWindow { var initialFirstResponder: NSView? }
+class NSWindow {
+    struct Level: Equatable { let raw: Int; static let floating = Level(raw: 3), normal = Level(raw: 0) }
+    var initialFirstResponder: NSView?
+    var level = Level.normal
+}
+final class NSPasteboard {
+    struct PasteboardType: Equatable { let raw: String; static let string = PasteboardType(raw: "public.utf8-plain-text") }
+    static let general = NSPasteboard()
+    var contents: String?
+    func clearContents() { contents = nil }
+    @discardableResult func setString(_ string: String, forType type: PasteboardType) -> Bool { contents = string; return true }
+}
 struct NSModalResponse: Equatable { let raw: Int
-    static let alertFirstButtonReturn = Self(raw: 1000), alertSecondButtonReturn = Self(raw: 1001) }
+    static let alertFirstButtonReturn = Self(raw: 1000), alertSecondButtonReturn = Self(raw: 1001),
+               alertThirdButtonReturn = Self(raw: 1002) }
 class NSAlert {
     var messageText = "", informativeText = ""
     var accessoryView: NSView?

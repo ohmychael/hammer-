@@ -22,20 +22,33 @@ struct Delivery: Codable, Equatable {
     let messageID: String?     // for opening the email in Gmail
     let date: Date?
     let uid: Int
+    var gmailID: String? = nil // Gmail's own ID for the email (from the Google script)
 
     /// Identifies this delivery in the menu.
-    var key: String { messageID ?? "uid:\(uid)" }
+    var key: String { messageID ?? gmailID ?? "uid:\(uid)" }
     var title: String { kind == .delivered ? "Delivered · \(store)" : "Delivery problem · \(store)" }
     var body: String { item ?? DeliveryMail.tidy(subject) }
 
-    /// Opens this email in Gmail in the browser (in the right account).
+    /// Opens this email in Gmail in the browser (in the right account), or nil if
+    /// there's no email to open (e.g. the test notification).
     func gmailLink(account email: String) -> URL? {
-        let query = messageID.map { "rfc822msgid:" + $0.trimmingCharacters(in: CharacterSet(charactersIn: "<> ")) }
-            ?? "subject:(\(subject))"
         let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~@")
-        guard let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: allowed),
-              let encodedUser = email.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
-        return URL(string: "https://mail.google.com/mail/?authuser=\(encodedUser)#search/\(encodedQuery)")
+        func encoded(_ text: String) -> String? { text.addingPercentEncoding(withAllowedCharacters: allowed) }
+        let messageID = (self.messageID ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "<> "))
+        let target: String
+        if !messageID.isEmpty, let query = encoded("rfc822msgid:" + messageID) {
+            target = "search/" + query
+        } else if let gmailID, !gmailID.isEmpty, let id = encoded(gmailID) {
+            target = "all/" + id
+        } else if !subject.isEmpty, let query = encoded("subject:(\(subject))") {
+            target = "search/" + query
+        } else {
+            return nil
+        }
+        guard !email.isEmpty, let user = encoded(email) else {
+            return URL(string: "https://mail.google.com/mail/u/0/#" + target)
+        }
+        return URL(string: "https://mail.google.com/mail/?authuser=\(user)#" + target)
     }
 }
 
@@ -615,5 +628,217 @@ enum DeliveryCheck {
         case .offline: return "Can't reach Gmail right now. Hammer will keep trying."
         case .failed(let text): return text
         }
+    }
+}
+
+// MARK: - The Google script route (no app password)
+//
+// Instead of logging in to Gmail, Hammer can ask a small Google Apps Script that
+// runs in your own Google account. You paste the script (below) into
+// script.google.com and deploy it as a web app; Hammer then asks its web address
+// every few minutes, with a random key only the two of them know. The script
+// answers with the sender, subject, date and ID of recent emails whose subject
+// mentions a delivery, and Hammer decides which are deliveries (DeliveryMail).
+
+enum DeliveryScript {
+    static let keyPlaceholder = "__HAMMER_KEY__"
+
+    /// A new random key for the script and Hammer to share (64 hex characters).
+    static func newKey() -> String {
+        (UUID().uuidString + UUID().uuidString).replacingOccurrences(of: "-", with: "").lowercased()
+    }
+
+    static func isKey(_ text: String) -> Bool {
+        text.count == 64 && text.allSatisfy { $0.isHexDigit && ($0.isNumber || $0.isLowercase) }
+    }
+
+    /// The script to paste into Google, with this key in it.
+    static func source(key: String) -> String {
+        template.replacingOccurrences(of: keyPlaceholder, with: key)
+    }
+
+    /// The web app address Google shows after deploying, e.g.
+    /// https://script.google.com/macros/s/AKfy…/exec. Nil if it isn't one.
+    static func webAppURL(_ text: String) -> URL? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parts = URLComponents(string: trimmed), parts.scheme == "https",
+              parts.host == "script.google.com", parts.path.hasPrefix("/macros/"), parts.path.hasSuffix("/exec"),
+              parts.query == nil || parts.query == "" else { return nil }
+        return URL(string: "https://script.google.com" + parts.path)
+    }
+
+    /// The address Hammer asks: the web app, with the key.
+    static func requestURL(base: URL, key: String) -> URL? {
+        guard var parts = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return nil }
+        parts.queryItems = [URLQueryItem(name: "key", value: key), URLQueryItem(name: "v", value: "1")]
+        return parts.url
+    }
+
+    static let template = #"""
+    /**
+     * Hammer delivery alerts. This runs in your own Google account.
+     *
+     * Every few minutes Hammer (the Mac app) asks this script for recent emails whose
+     * subject mentions a delivery. The script answers with just the sender, subject,
+     * date and ID of those from the last 2 days. It doesn't change, send or delete
+     * anything, and it only answers requests that carry Hammer's key.
+     */
+    const HAMMER_KEY = '__HAMMER_KEY__';
+    const SEARCH = 'in:inbox newer_than:2d subject:(delivered OR delivery OR deliver OR arrived OR ' +
+        'undeliverable OR "dropped off" OR "return to sender" OR "returned to sender")';
+    const MAX_THREADS = 20;
+
+    function doGet(e) {
+      const key = e && e.parameter ? e.parameter.key : '';
+      if (key !== HAMMER_KEY) return answer({ ok: false, error: 'key' });
+      try {
+        return answer({
+          ok: true,
+          version: 1,
+          account: Session.getEffectiveUser().getEmail(),
+          emails: recentDeliveryEmails()
+        });
+      } catch (error) {
+        return answer({ ok: false, error: 'gmail', message: String(error) });
+      }
+    }
+
+    function recentDeliveryEmails() {
+      const since = Date.now() - 2 * 24 * 60 * 60 * 1000;
+      const emails = [];
+      GmailApp.search(SEARCH, 0, MAX_THREADS).forEach(function (thread) {
+        thread.getMessages().forEach(function (message) {
+          const date = message.getDate();
+          if (date.getTime() < since || message.isInTrash()) return;
+          emails.push({
+            id: message.getId(),
+            messageID: message.getHeader('Message-ID') || '',
+            from: message.getFrom(),
+            subject: message.getSubject(),
+            date: date.toISOString()
+          });
+        });
+      });
+      return emails;
+    }
+
+    function answer(value) {
+      return ContentService.createTextOutput(JSON.stringify(value))
+          .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    /** Run this from the editor to see what Hammer would get. */
+    function test() {
+      Logger.log(JSON.stringify(recentDeliveryEmails(), null, 2));
+    }
+    """#
+}
+
+/// Why a check didn't work, for the menu. `needsSetup` shows "Set Up Gmail Again…".
+struct CheckFailure: Error, Equatable {
+    let message: String
+    var needsSetup = false
+    var offline = false
+
+    static let offline = CheckFailure(message: "Can't reach Google right now. Hammer will keep trying.", offline: true)
+
+    init(message: String, needsSetup: Bool = false, offline: Bool = false) {
+        self.message = message
+        self.needsSetup = needsSetup
+        self.offline = offline
+    }
+
+    /// From the app-password (IMAP) route.
+    init(_ error: IMAPError) {
+        switch error {
+        case .badLogin: self.init(message: DeliveryCheck.explain(error), needsSetup: true)
+        case .offline: self = .offline
+        case .failed: self.init(message: DeliveryCheck.explain(error))
+        }
+    }
+}
+
+/// What Hammer remembers between script checks.
+struct ScriptState: Codable, Equatable {
+    var started = false           // the first answer only notes what's already there
+    var seen: [String] = []       // Gmail IDs already looked at (the last 500)
+}
+
+enum ScriptCheck {
+    struct Reply: Decodable {
+        let ok: Bool
+        let error: String?
+        let message: String?
+        let account: String?
+        let emails: [Email]?
+    }
+
+    struct Email: Decodable, Equatable {
+        let id: String
+        let messageID: String?
+        let from: String?
+        let subject: String?
+        let date: String?
+    }
+
+    /// Reads the script's answer, or makes sense of the page Google sends instead.
+    static func read(status: Int, body: Data) -> Result<Reply, CheckFailure> {
+        if status == 404 {
+            return .failure(CheckFailure(message: "Hammer can't find the script at that address. "
+                + "Check the web app URL (it ends in /exec).", needsSetup: true))
+        }
+        if status == 429 || status >= 500 {
+            return .failure(CheckFailure(message: "Google is busy right now. Hammer will keep trying."))
+        }
+        if let reply = try? JSONDecoder().decode(Reply.self, from: body) {
+            if reply.ok { return .success(reply) }
+            if reply.error == "key" {
+                return .failure(CheckFailure(message: "The script's key doesn't match Hammer's. Set up Gmail again "
+                    + "and paste the new script over the old one.", needsSetup: true))
+            }
+            return .failure(CheckFailure(message: "The script couldn't read Gmail just now. Hammer will keep trying."))
+        }
+        let page = String(decoding: body.prefix(200_000), as: UTF8.self).lowercased()
+        if page.contains("script function not found") {
+            return .failure(CheckFailure(message: "The script wasn't saved before it was deployed. Set up Gmail again.",
+                                         needsSetup: true))
+        }
+        if page.contains("authorization is required") || page.contains("authorisation is required") {
+            return .failure(CheckFailure(message: "The script needs your permission again: open it at "
+                + "script.google.com and click Run.", needsSetup: true))
+        }
+        if status == 401 || status == 403 || page.contains("accounts.google.com") || page.contains("sign in") {
+            return .failure(CheckFailure(message: "Google asked for a sign-in instead of running the script. In the "
+                + "script, open Deploy → Manage deployments and set Who has access to Anyone.", needsSetup: true))
+        }
+        return .failure(CheckFailure(message: "The script sent an answer Hammer didn't understand. Hammer will keep trying."))
+    }
+
+    /// New deliveries in the script's answer, oldest first, and what to remember.
+    static func process(_ emails: [Email], state: ScriptState, now: Date = Date())
+    -> (deliveries: [Delivery], state: ScriptState) {
+        var next = state
+        var known = Set(state.seen)
+        var deliveries: [Delivery] = []
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let isoPlain = ISO8601DateFormatter()
+        for email in emails where !email.id.isEmpty && !known.contains(email.id) {
+            known.insert(email.id)
+            next.seen.append(email.id)
+            guard state.started else { continue }
+            let messageID = (email.messageID ?? "").isEmpty ? nil : email.messageID
+            var headers = ["from": email.from ?? "", "subject": email.subject ?? ""]
+            if let messageID { headers["message-id"] = messageID }
+            guard let found = DeliveryMail.classify(headers: headers, uid: 0) else { continue }
+            let date = email.date.flatMap { iso.date(from: $0) ?? isoPlain.date(from: $0) }
+            if let date, now.timeIntervalSince(date) > DeliveryCheck.tooOld { continue }
+            deliveries.append(Delivery(kind: found.kind, store: found.store, item: found.item, subject: found.subject,
+                                       messageID: messageID, date: date, uid: 0, gmailID: email.id))
+        }
+        next.started = true
+        next.seen = Array(next.seen.suffix(500))
+        deliveries.sort { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
+        return (deliveries, next)
     }
 }

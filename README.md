@@ -27,20 +27,26 @@ Each bulb's menu shows its link status at the top, and **Turn On** / **Turn Off*
 
 ## Delivery alerts
 
-Choose **Set Up Delivery Alerts…** in the menu. It needs a Gmail **app password**, a separate 16-letter password Google makes for one app. You need 2-Step Verification on your Google account to make one:
+Choose **Set Up Delivery Alerts…** in the menu, then **Start**. Hammer reads your delivery emails through a small script in your own Google account, so no app password is needed. Setup takes about 2 minutes:
 
-1. Click **Get App Password** in Hammer's setup window (or go to myaccount.google.com/apppasswords).
-2. Type `Hammer` as the name and click **Create**.
-3. Copy the 16 letters, paste them into Hammer with your Gmail address, and click **Turn On**.
-4. When macOS asks, allow notifications from Hammer.
+1. Hammer copies the script and opens a new Google Apps Script project in your browser (script.new). Sign in as the Gmail account your deliveries go to.
+2. In the editor, press ⌘A, then ⌘V to paste over what's there, then ⌘S to save.
+3. Click **Deploy → New deployment**. Click the gear ⚙ next to "Select type" and choose **Web app**.
+4. Set **Execute as: Me** and **Who has access: Anyone**. Click **Deploy**.
+5. Click **Authorize access** and choose your account. Google warns that it hasn't verified the app (it's your own script): click **Advanced**, then **Go to … (unsafe)**, then **Allow**.
+6. Copy the **Web app URL** (it ends in `/exec`), paste it into Hammer, and click **Turn On**.
+7. When macOS asks, allow notifications from Hammer.
+
+Google's permission screen lists everything a Gmail script *could* do. This one only reads the sender, subject and date of recent inbox emails whose subject mentions a delivery. It doesn't change, send or delete anything, and it only answers Hammer, which sends a random 64-character key the script checks. The script's code is in `Deliveries.swift` (`DeliveryScript.template`), so you can read what you're pasting.
 
 How it works:
-- Every 3 minutes, and right after the Mac wakes, Hammer looks at new mail in your inbox for subjects about deliveries.
-- It reads only the sender, subject, date and message ID. The inbox is opened read-only, so nothing is marked as read.
-- Mail that was already there when you turned alerts on is never announced, and nothing is announced twice.
-- Shipping updates like "Out for delivery" or "Arriving today" are skipped. Only delivered (or failed) packages make a notification.
-- The app password is kept in your login Keychain, not in Hammer's files. **Turn Off Delivery Alerts** deletes it. You can also revoke it any time at myaccount.google.com/apppasswords.
-- If Gmail stops accepting the password, Hammer stops trying (so your account isn't locked) and shows **Set Up Gmail Again…** in the menu.
+- Every 3 minutes, and shortly after the Mac wakes, Hammer asks the script. The script looks at the last 2 days.
+- Hammer decides which emails are deliveries. Shipping updates like "Out for delivery" or "Arriving today" are skipped. Only delivered (or failed) packages make a notification. Click one to open the email in Gmail.
+- Emails already there when you turn alerts on are never announced, and nothing is announced twice.
+- The key is kept in your login Keychain. **Turn Off Delivery Alerts** deletes it. To stop the script completely, delete it at script.google.com, or remove its access at myaccount.google.com/connections.
+- If the script's deployment is wrong (for example, access isn't **Anyone**), the menu says what to fix and offers **Set Up Gmail Again…**. Fixing the deployment in Google works too: Hammer keeps asking and picks it up.
+
+**With an app password instead:** choose **Use an App Password Instead** in the setup window. Hammer then reads Gmail directly over IMAP with a 16-letter app password from myaccount.google.com/apppasswords, which needs 2-Step Verification. The inbox is opened read-only and only headers are read. If Gmail stops accepting the password, Hammer stops trying, so your account isn't locked.
 
 ## Install
 
@@ -77,7 +83,7 @@ Bluetooth bulbs are controlled from the menu bar app only.
 | `Deliveries.swift` | Delivery alerts logic (Foundation only): which emails are deliveries, reading Gmail over IMAP |
 | `DeliveryAlerts.swift` | Delivery alerts on the Mac: secure connection to Gmail, Keychain, notifications |
 | `Tests/main.swift` | Tests for `HammerCore.swift`, run before every install |
-| `Tests/Deliveries/` | Delivery alerts end to end, against a fake Gmail server |
+| `Tests/Deliveries/` | Delivery alerts end to end: fake Gmail and Google script servers, and the script itself in node |
 | `Tests/Bluetooth/` | Bluetooth scenarios (phone grabs the bulb, failures, resets…) against a stand-in CoreBluetooth; run on Linux |
 | `build.sh` | Compiles and installs `~/Applications/Hammer.app` |
 | `update.sh` | Pulls the latest commit and rebuilds |
@@ -89,7 +95,7 @@ Bluetooth bulbs are controlled from the menu bar app only.
 launchctl bootout gui/$(id -u)/local.hammer.updater
 rm ~/Library/LaunchAgents/local.hammer.plist ~/Library/LaunchAgents/local.hammer.updater.plist
 pkill -x Hammer; rm -rf ~/Applications/Hammer.app ~/Hammer ~/.config/hammer
-security delete-generic-password -s local.hammer.gmail   # the Gmail app password, if you set up delivery alerts
+security delete-generic-password -s local.hammer.gmail   # delivery alerts' key or app password (run until it says not found)
 ```
 
 ## Running the tests by hand
@@ -106,8 +112,8 @@ Tests/Bluetooth/run.sh              # about 2 minutes
 Tests/Bluetooth/run.sh phone storm  # just these
 ```
 
-The delivery tests run Hammer's Gmail code against a fake Gmail server. They cover new mail, read flags left alone, a wrong password, Gmail unreachable or silent, and the whole setup-to-notification flow, with stand-ins for Apple's frameworks. They need Swift and python3:
+The delivery tests run Hammer's Gmail code against fake Gmail and Google-script servers, and the Google script itself in node with a fake Gmail. They cover the whole setup-to-notification flow for both routes, with stand-ins for Apple's frameworks. They also cover a wrong key or password, deployment mistakes, and Google being offline or silent. They need Swift, python3 and node:
 
 ```
-Tests/Deliveries/run.sh             # about 15 seconds
+Tests/Deliveries/run.sh             # about 40 seconds
 ```

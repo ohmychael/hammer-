@@ -1326,7 +1326,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let settings = NSMenu()
-        settings.addItem(hint(watcher.email ?? ""))
+        let account = (watcher.email ?? "").isEmpty ? "Gmail" : watcher.email ?? "Gmail"
+        settings.addItem(hint(watcher.source == .script ? "\(account), through your Google script" : account))
         if watcher.isChecking {
             settings.addItem(hint("Checking now…"))
         } else if let last = watcher.lastChecked {
@@ -1374,6 +1375,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func setUpDeliveries() {
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+        let alert = NSAlert()
+        alert.messageText = "Delivery alerts from Gmail"
+        alert.informativeText = """
+        Hammer can show a notification when a package is delivered, from the delivery \
+        emails in your Gmail: eBay, Amazon, UPS, USPS, FedEx and most other stores.
+
+        To read them, you add a small script to your own Google account. It takes \
+        about 2 minutes and needs no app password. The script only tells Hammer the \
+        sender and subject of recent delivery emails.
+        """
+        alert.addButton(withTitle: "Start")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Use an App Password Instead")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: setUpWithScript()
+        case .alertThirdButtonReturn: setUpWithAppPassword()
+        default: return
+        }
+    }
+
+    /// Copies the script, opens a new Google Apps Script project, and walks through
+    /// deploying it; then asks for the web app address.
+    private func setUpWithScript() {
+        let key = DeliveryScript.newKey()
+        copyScript(key: key)
+        if let url = URL(string: "https://script.new") { NSWorkspace.shared.open(url) }
+        askForScriptAddress(key: key, address: "", note: nil)
+    }
+
+    private func copyScript(key: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(DeliveryScript.source(key: key), forType: .string)
+    }
+
+    /// The steps, and a box for the web app address. Shown again, with the problem,
+    /// if the address doesn't work, keeping the same script and key.
+    private func askForScriptAddress(key: String, address: String, note: String?) {
+        var address = address
+        var note = note
+        while true {
+            if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+            let alert = NSAlert()
+            alert.messageText = "Add the script to your Google account"
+            alert.informativeText = (note.map { "⚠︎ " + $0 + "\n\n" } ?? "") + """
+            The script is copied, and a new Google Apps Script project is open in your browser \
+            (sign in as the Gmail account your deliveries go to).
+
+            1. Click in the code, press ⌘A then ⌘V to replace it, and press ⌘S to save.
+            2. Click Deploy → New deployment. Click the gear ⚙ next to "Select type" and choose Web app.
+            3. Set Execute as: Me, and Who has access: Anyone. Click Deploy.
+            4. Click Authorize access and choose your account. Google says it hasn't verified \
+            the app (it's your own script): click Advanced, then Go to … (unsafe), then Allow.
+            5. Copy the Web app URL (it ends in /exec), paste it below, and click Turn On.
+
+            Google's permission screen lists everything a Gmail script could do. This one only \
+            reads the sender and subject of delivery emails; you can see that in the code.
+            """
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+            field.placeholderString = "https://script.google.com/macros/s/…/exec"
+            field.stringValue = address
+            alert.accessoryView = field
+            alert.addButton(withTitle: "Turn On")
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Copy Script Again")
+            alert.window.initialFirstResponder = field
+            // Hammer has no Dock icon to click back to, so keep the steps above the browser.
+            alert.window.level = .floating
+            let choice = alert.runModal()
+            address = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if choice == .alertThirdButtonReturn {
+                copyScript(key: key)
+                note = "Copied again."
+                continue
+            }
+            guard choice == .alertFirstButtonReturn else { return }
+            guard let url = DeliveryScript.webAppURL(address) else {
+                note = "That isn't the web app URL. It starts with https://script.google.com/macros/s/ and ends in /exec."
+                continue
+            }
+            let tried = address
+            DeliveryWatcher.shared.turnOn(scriptURL: url, key: key) { [weak self] error in
+                guard let delegate = self else { return }
+                Task { @MainActor in
+                    if let error {
+                        delegate.askForScriptAddress(key: key, address: tried, note: error)
+                    } else {
+                        delegate.deliverySetupFinished(error: nil) {}
+                    }
+                }
+            }
+            return
+        }
+    }
+
+    private func setUpWithAppPassword() {
+        if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
         var email = DeliveryWatcher.shared.email ?? ""
         var note: String?
         while true {
@@ -1402,6 +1499,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.addButton(withTitle: "Get App Password")
             alert.addButton(withTitle: "Cancel")
             alert.window.initialFirstResponder = email.isEmpty ? emailField : passwordField
+            alert.window.level = .floating                 // stays above the browser while you get the password
             let choice = alert.runModal()
             email = emailField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if choice == .alertSecondButtonReturn {
@@ -1420,13 +1518,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             DeliveryWatcher.shared.turnOn(email: email, password: password) { [weak self] error in
                 guard let delegate = self else { return }
-                Task { @MainActor in delegate.deliverySetupFinished(error: error) }
+                Task { @MainActor in delegate.deliverySetupFinished(error: error) { delegate.setUpWithAppPassword() } }
             }
             return
         }
     }
 
-    private func deliverySetupFinished(error: String?) {
+    private func deliverySetupFinished(error: String?, tryAgain: () -> Void) {
         rebuildMenuSoon()
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
         let alert = NSAlert()
@@ -1435,7 +1533,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.informativeText = error
             alert.addButton(withTitle: "Try Again")
             alert.addButton(withTitle: "Cancel")
-            if alert.runModal() == .alertFirstButtonReturn { setUpDeliveries() }
+            if alert.runModal() == .alertFirstButtonReturn { tryAgain() }
         } else {
             alert.messageText = "Delivery alerts are on"
             alert.informativeText = "Hammer will show a notification when a package is delivered. "

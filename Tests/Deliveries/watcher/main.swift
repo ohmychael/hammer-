@@ -116,5 +116,113 @@ check(!watcher.isOn && watcher.recent.isEmpty && GmailKeychain.password(for: "yo
 check(!watcher.needsSetup && watcher.problem == nil, "and no leftover warnings")
 watcher.checkNow()
 check(!watcher.isChecking, "checks nothing when off")
+// MARK: The Google script route
+
+let scriptPort = UInt16(CommandLine.arguments[4])!, scriptStatePath = CommandLine.arguments[5]
+let scriptLogPath = CommandLine.arguments[6]
+let scriptKey = DeliveryScript.newKey()
+var scriptBox: [String: Any] = ["key": scriptKey, "account": "you@gmail.com", "mode": "ok", "emails": [[String: Any]]()]
+func saveScriptBox() { try! JSONSerialization.data(withJSONObject: scriptBox).write(to: URL(fileURLWithPath: scriptStatePath)) }
+func scriptMail(_ id: String, _ subject: String, from: String = "\"eBay\" <ebay@ebay.com>", messageID: String? = nil) {
+    var emails = scriptBox["emails"] as! [[String: Any]]
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    emails.append(["id": id, "messageID": messageID ?? "<\(id)@mail>", "from": from, "subject": subject,
+                   "date": iso.string(from: Date())])
+    scriptBox["emails"] = emails
+    saveScriptBox()
+}
+func mode(_ value: String) { scriptBox["mode"] = value; saveScriptBox() }
+let scriptAddress = URL(string: "http://127.0.0.1:\(scriptPort)/macros/s/AKfycbTEST/exec")!
+scriptMail("old", "Your package was delivered")
+
+print("[script: wrong key]")
+answer = .none
+watcher.turnOn(scriptURL: scriptAddress, key: DeliveryScript.newKey()) { answer = .some($0) }
+wait(2)
+check(answer != nil && (answer!)?.contains("key") == true && !watcher.isOn, "refused: \(String(describing: answer))")
+
+print("[script: set up]")
+answer = .none
+watcher.turnOn(scriptURL: scriptAddress, key: scriptKey) { answer = .some($0) }
+wait(2)
+check(answer != nil && answer! == nil, "accepted")
+check(watcher.isOn && watcher.source == .script && watcher.email == "you@gmail.com", "on, through the script")
+check(GmailKeychain.scriptKey() == scriptKey, "key in the Keychain")
+let postedBefore = simPosted.count
+check(watcher.recent.isEmpty, "the email already there isn't announced")
+let scriptLog = (try? String(contentsOfFile: scriptLogPath, encoding: .utf8)) ?? ""
+check(scriptLog.contains("/macros/echo"), "followed Google's redirect")
+
+print("[script: a delivery arrives]")
+scriptMail("new1", "Your package was delivered: Apple iPhone 15 Pro Max")
+scriptMail("new2", #"Out for delivery: "Lamp""#, from: "Target <t@target.com>")
+watcher.checkNow()
+wait(2)
+check(simPosted.count == postedBefore + 1 && simPosted.last?.1 == "Apple iPhone 15 Pro Max", "one notification: \(simPosted.suffix(2))")
+check(simPosted.last?.2 == "https://mail.google.com/mail/?authuser=you@gmail.com#search/rfc822msgid%3Anew1@mail",
+      "opens the email: \(simPosted.last?.2 ?? "-")")
+watcher.checkNow()
+wait(2)
+check(simPosted.count == postedBefore + 1, "not announced twice")
+
+print("[script: deployment not open to Anyone]")
+mode("signin")
+watcher.checkNow()
+wait(2)
+check(watcher.needsSetup && watcher.problem?.contains("Anyone") == true, "says how to fix it: \(watcher.problem ?? "-")")
+mode("ok")
+scriptMail("new3", #"Delivered: "Cable""#, from: "Amazon.com <a@amazon.com>", messageID: "")
+watcher.checkNow()
+wait(2)
+check(!watcher.needsSetup && watcher.problem == nil && simPosted.last?.1 == "Cable",
+      "fixing the deployment fixes it, no new setup needed")
+check(simPosted.last?.2 == "https://mail.google.com/mail/?authuser=you@gmail.com#all/new3", "link by Gmail's ID")
+
+print("[script: other problems]")
+for (name, expected, setup) in [("busy", "busy", false), ("gmail", "couldn't read Gmail", false),
+                                ("unsaved", "saved", true), ("notfound", "can't find", true)] {
+    mode(name)
+    watcher.checkNow()
+    wait(2)
+    check(watcher.problem?.contains(expected) == true && watcher.needsSetup == setup,
+          "\(name): \(watcher.problem ?? "-")")
+}
+mode("ok")
+let realFetch = DeliveryWatcher.fetch
+DeliveryWatcher.fetch = { _ in nil }
+watcher.checkNow()
+wait(1)
+check(watcher.problem?.contains("Can't reach") == true && !watcher.needsSetup,
+      "offline: keeps trying: \(watcher.problem ?? "-") setup=\(watcher.needsSetup) checking=\(watcher.isChecking)")
+DeliveryWatcher.fetch = realFetch
+watcher.checkNow()
+wait(2)
+check(watcher.problem == nil, "back online: fine")
+
+print("[script: Keychain key missing at launch]")
+let launched = DeliveryWatcher()
+GmailKeychain.deleteScriptKey()
+launched.checkNow()
+wait(1)
+check(launched.needsSetup && launched.problem?.contains("script's key") == true, "says so")
+GmailKeychain.saveScriptKey(scriptKey)
+
+print("[switching routes]")
+setPassword("abcdefghijklmnop")                                // the fake Gmail's password was changed above
+answer = .none
+watcher.turnOn(email: "you@gmail.com", password: "abcdefghijklmnop") { answer = .some($0) }
+wait(2)
+check(answer != nil && answer! == nil && watcher.source == .appPassword, "to the app password")
+check(GmailKeychain.scriptKey() == nil, "the script's key is removed")
+answer = .none
+watcher.turnOn(scriptURL: scriptAddress, key: scriptKey) { answer = .some($0) }
+wait(2)
+check(answer != nil && answer! == nil && watcher.source == .script, "back to the script")
+check(GmailKeychain.password(for: "you@gmail.com") == nil, "the app password is removed")
+watcher.turnOff()
+wait(0.5)
+check(!watcher.isOn && GmailKeychain.scriptKey() == nil && watcher.scriptURL == nil, "turned off: all gone")
+
 print(failures == 0 ? "passed" : "\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)
