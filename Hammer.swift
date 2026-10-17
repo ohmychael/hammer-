@@ -1298,6 +1298,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func addDeliveries(to menu: NSMenu) {
         let watcher = DeliveryWatcher.shared
         menu.addItem(label("Deliveries"))
+        if watcher.isSettingUp {
+            menu.addItem(hint("Checking your Gmail setup…"))
+            return
+        }
         guard watcher.isOn else {
             menu.addItem(hint("Get a notification when a package is delivered."))
             menu.addItem(action("Set Up Delivery Alerts…", #selector(setUpDeliveries)))
@@ -1374,6 +1378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func setUpDeliveries() {
+        guard !DeliveryWatcher.shared.isSettingUp else { return }      // the first check is still running
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
         let alert = NSAlert()
         alert.messageText = "Delivery alerts from Gmail"
@@ -1419,14 +1424,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let alert = NSAlert()
             alert.messageText = "Add the script to your Google account"
             alert.informativeText = (note.map { "⚠︎ " + $0 + "\n\n" } ?? "") + """
-            The script is copied, and a new Google Apps Script project is open in your browser \
-            (sign in as the Gmail account your deliveries go to).
+            The script is copied, and a new Google Apps Script project is open in your browser. \
+            It has to be in the Google account your deliveries go to: if you use several, check \
+            the picture at the top right of the editor. Drag this window aside as you go.
 
             1. Click in the code, press ⌘A then ⌘V to replace it, and press ⌘S to save.
             2. Click Deploy → New deployment. Click the gear ⚙ next to "Select type" and choose Web app.
             3. Set Execute as: Me, and Who has access: Anyone. Click Deploy.
-            4. Click Authorize access and choose your account. Google says it hasn't verified \
-            the app (it's your own script): click Advanced, then Go to … (unsafe), then Allow.
+            4. Click Authorize access and choose that account. Google says it hasn't verified \
+            the app (it's your own script): click Advanced, then Go to … (unsafe). Tick Select all \
+            (so it can read Gmail), then click Continue.
             5. Copy the Web app URL (it ends in /exec), paste it below, and click Turn On.
 
             Google's permission screen lists everything a Gmail script could do. This one only \
@@ -1440,8 +1447,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.addButton(withTitle: "Cancel")
             alert.addButton(withTitle: "Copy Script Again")
             alert.window.initialFirstResponder = field
-            // Hammer has no Dock icon to click back to, so keep the steps above the browser.
+            // Hammer has no Dock icon to click back to, so keep the steps above the browser,
+            // off to the side of it.
             alert.window.level = .floating
+            alert.layout()
+            if let screen = NSScreen.main?.visibleFrame {
+                let size = alert.window.frame.size
+                alert.window.setFrameTopLeftPoint(NSPoint(x: screen.maxX - size.width - 16, y: screen.maxY - 16))
+            }
             let choice = alert.runModal()
             address = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if choice == .alertThirdButtonReturn {
@@ -1536,7 +1549,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if alert.runModal() == .alertFirstButtonReturn { tryAgain() }
         } else {
             alert.messageText = "Delivery alerts are on"
-            alert.informativeText = "Hammer will show a notification when a package is delivered. "
+            let account = DeliveryWatcher.shared.email ?? ""
+            alert.informativeText = (account.isEmpty ? "" : "Reading deliveries from \(account). ")
+                + "Hammer will show a notification when a package is delivered. "
                 + "If macOS asks, allow notifications from Hammer."
             alert.addButton(withTitle: "Done")
             alert.addButton(withTitle: "Send Test Notification")

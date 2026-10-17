@@ -605,7 +605,12 @@ for bad in ["", "script.google.com/macros/s/x/exec", "http://script.google.com/m
     expect(DeliveryScript.webAppURL(bad) == nil, "not a web app URL: \(bad)")
 }
 let asked = DeliveryScript.requestURL(base: URL(string: deployed)!, key: scriptKey)?.absoluteString
-expect(asked == deployed + "?key=\(scriptKey)&v=1", "asks with the key: \(asked ?? "-")")
+expect(asked == deployed + "?key=\(scriptKey)&v=2", "asks with the key: \(asked ?? "-")")
+let askedSince = DeliveryScript.requestURL(base: URL(string: deployed)!, key: scriptKey,
+                                           after: Date(timeIntervalSince1970: 1_792_250_000))?.absoluteString
+expect(askedSince == deployed + "?key=\(scriptKey)&v=2&after=1792250000", "and when it last asked")
+let workspace = "https://script.google.com/a/macros/example.com/s/AKfycbx123/exec"
+expect(DeliveryScript.webAppURL(workspace)?.absoluteString == workspace, "a Google Workspace web app URL")
 
 func reply(_ json: String, status: Int = 200) -> Result<ScriptCheck.Reply, CheckFailure> {
     ScriptCheck.read(status: status, body: Data(json.utf8))
@@ -619,6 +624,9 @@ func failure(_ result: Result<ScriptCheck.Reply, CheckFailure>) -> CheckFailure?
     return nil
 }
 expect(failure(reply(#"{"ok":false,"error":"key"}"#))?.needsSetup == true, "wrong key: set up again")
+let noPermission = failure(reply(#"{"ok":false,"error":"permission","message":"no permission"}"#))
+expect(noPermission?.needsSetup == true && noPermission?.message.contains("Select all") == true,
+       "Gmail access not granted: says how to grant it")
 let gmailBusy = failure(reply(#"{"ok":false,"error":"gmail","message":"Service invoked too many times"}"#))
 expect(gmailBusy?.needsSetup == false && gmailBusy?.message.contains("keep trying") == true, "Gmail error: retried")
 let signIn = failure(reply("<html><body>Sign in - Google Accounts <a href='https://accounts.google.com/'>", status: 200))
@@ -639,7 +647,11 @@ func email(_ id: String, _ subject: String, from: String = "\"eBay\" <ebay@ebay.
                              date: formatter.string(from: now.addingTimeInterval(-hoursAgo * 3600)))
 }
 var scriptState = ScriptState()
-var processed = ScriptCheck.process([email("old1", "Your package was delivered")], state: scriptState, now: now)
+expect(scriptState.searchFrom == nil, "first check: no 'after'")
+var processed = ScriptCheck.process([email("old1", "Your package was delivered")], state: scriptState, now: now,
+                                    askedAt: now)
+expect(processed.state.askedAt == now && processed.state.searchFrom == now.addingTimeInterval(-15 * 60),
+       "remembers when it asked, and looks back 15 minutes before that next time")
 expect(processed.deliveries.isEmpty && processed.state.started && processed.state.seen == ["old1"],
        "first answer: notes what's there, announces nothing")
 scriptState = processed.state

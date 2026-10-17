@@ -7,10 +7,13 @@ Like Google, /macros/s/<id>/exec answers with a redirect to /macros/echo?…, wh
 returns what the script would. STATE.json (re-read on every request) says what
 that is: {"key": "...", "account": "...", "emails": [...], "mode": "ok"} where
 mode can also be "signin" (deployment not open to Anyone), "notfound",
-"unsaved" (doGet missing), "busy" (HTTP 503) or "gmail" (the script's Gmail error).
+"unsaved" (doGet missing), "busy" (HTTP 503), "gmail" (the script's Gmail error)
+or "permission" (Gmail access not granted). Like the script, an `after` (seconds)
+leaves out emails dated before it.
 Each request's path is logged to LOG.txt with the key masked.
 """
 import json, re, sys
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs, urlencode
 
@@ -44,7 +47,8 @@ class Handler(BaseHTTPRequestHandler):
             if mode == "signin":
                 return self.send(302, "", "text/html", {"Location": "/accounts/signin"})
             echo = "/macros/echo?" + urlencode({"user_content_key": "abc123", "lib": "M1",
-                                                "k": query.get("key", [""])[0]})
+                                                "k": query.get("key", [""])[0],
+                                                "after": query.get("after", ["0"])[0]})
             return self.send(302, "", "text/html", {"Location": echo})
         if url.path == "/accounts/signin":
             return self.send(200, "<html><title>Sign in - Google Accounts</title>accounts.google.com</html>", "text/html")
@@ -57,8 +61,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, json.dumps({"ok": False, "error": "key"}))
             if mode == "gmail":
                 return self.send(200, json.dumps({"ok": False, "error": "gmail", "message": "Service invoked too many times"}))
-            return self.send(200, json.dumps({"ok": True, "version": 1, "account": state["account"],
-                                              "emails": state["emails"]}))
+            if mode == "permission":
+                return self.send(200, json.dumps({"ok": False, "error": "permission",
+                                                  "message": "Exception: You do not have permission to call GmailApp.search"}))
+            after = float(query.get("after", ["0"])[0] or 0)
+            emails = [e for e in state["emails"]
+                      if datetime.fromisoformat(e["date"].replace("Z", "+00:00")).timestamp() >= after]
+            return self.send(200, json.dumps({"ok": True, "version": 2, "account": state["account"], "emails": emails}))
         return self.send(404, "not found", "text/plain")
 
 

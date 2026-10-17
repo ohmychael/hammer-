@@ -33,14 +33,14 @@ Choose **Set Up Delivery Alerts…** in the menu, then **Start**. Hammer reads y
 2. In the editor, press ⌘A, then ⌘V to paste over what's there, then ⌘S to save.
 3. Click **Deploy → New deployment**. Click the gear ⚙ next to "Select type" and choose **Web app**.
 4. Set **Execute as: Me** and **Who has access: Anyone**. Click **Deploy**.
-5. Click **Authorize access** and choose your account. Google warns that it hasn't verified the app (it's your own script): click **Advanced**, then **Go to … (unsafe)**, then **Allow**.
+5. Click **Authorize access** and choose your account. Google warns that it hasn't verified the app (it's your own script): click **Advanced**, then **Go to … (unsafe)**. Tick **Select all** so it can read Gmail, then click **Continue**.
 6. Copy the **Web app URL** (it ends in `/exec`), paste it into Hammer, and click **Turn On**.
 7. When macOS asks, allow notifications from Hammer.
 
 Google's permission screen lists everything a Gmail script *could* do. This one only reads the sender, subject and date of recent inbox emails whose subject mentions a delivery. It doesn't change, send or delete anything, and it only answers Hammer, which sends a random 64-character key the script checks. The script's code is in `Deliveries.swift` (`DeliveryScript.template`), so you can read what you're pasting.
 
 How it works:
-- Every 3 minutes, and shortly after the Mac wakes, Hammer asks the script. The script looks at the last 2 days.
+- Every 3 minutes, and shortly after the Mac wakes, Hammer asks the script. The first time it looks at the last 2 days; after that, only at mail since the last check (with 15 minutes' overlap), which keeps it well inside Gmail's daily limits.
 - Hammer decides which emails are deliveries. Shipping updates like "Out for delivery" or "Arriving today" are skipped. Only delivered (or failed) packages make a notification. Click one to open the email in Gmail.
 - Emails already there when you turn alerts on are never announced, and nothing is announced twice.
 - The key is kept in your login Keychain. **Turn Off Delivery Alerts** deletes it. To stop the script completely, delete it at script.google.com, or remove its access at myaccount.google.com/connections.

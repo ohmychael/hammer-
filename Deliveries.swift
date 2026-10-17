@@ -662,17 +662,25 @@ enum DeliveryScript {
     static func webAppURL(_ text: String) -> URL? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let parts = URLComponents(string: trimmed), parts.scheme == "https",
-              parts.host == "script.google.com", parts.path.hasPrefix("/macros/"), parts.path.hasSuffix("/exec"),
+              parts.host == "script.google.com",
+              parts.path.hasPrefix("/macros/") || parts.path.hasPrefix("/a/macros/"), parts.path.hasSuffix("/exec"),
               parts.query == nil || parts.query == "" else { return nil }
         return URL(string: "https://script.google.com" + parts.path)
     }
 
-    /// The address Hammer asks: the web app, with the key.
-    static func requestURL(base: URL, key: String) -> URL? {
+    /// The address Hammer asks: the web app, with the key, and (after the first
+    /// time) when it last asked, so the script only searches newer mail.
+    static func requestURL(base: URL, key: String, after: Date? = nil) -> URL? {
         guard var parts = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return nil }
-        parts.queryItems = [URLQueryItem(name: "key", value: key), URLQueryItem(name: "v", value: "1")]
+        var items = [URLQueryItem(name: "key", value: key), URLQueryItem(name: "v", value: "2")]
+        if let after { items.append(URLQueryItem(name: "after", value: String(Int(after.timeIntervalSince1970)))) }
+        parts.queryItems = items
         return parts.url
     }
+
+    /// How far back each check looks past the last one, in case Gmail's search
+    /// hadn't caught up with an email yet (seen ones are skipped anyway).
+    static let overlap: TimeInterval = 15 * 60
 
     static let template = #"""
     /**
@@ -680,33 +688,37 @@ enum DeliveryScript {
      *
      * Every few minutes Hammer (the Mac app) asks this script for recent emails whose
      * subject mentions a delivery. The script answers with just the sender, subject,
-     * date and ID of those from the last 2 days. It doesn't change, send or delete
-     * anything, and it only answers requests that carry Hammer's key.
+     * date and ID of those from the last 2 days (only those since Hammer last asked).
+     * It doesn't change, send or delete anything, and it only answers requests that
+     * carry Hammer's key.
      */
     const HAMMER_KEY = '__HAMMER_KEY__';
     const SEARCH = 'in:inbox newer_than:2d subject:(delivered OR delivery OR deliver OR arrived OR ' +
-        'undeliverable OR "dropped off" OR "return to sender" OR "returned to sender")';
+        'undeliverable OR returned OR "dropped off" OR "return to sender" OR "returned to sender")';
     const MAX_THREADS = 20;
 
     function doGet(e) {
-      const key = e && e.parameter ? e.parameter.key : '';
-      if (key !== HAMMER_KEY) return answer({ ok: false, error: 'key' });
+      const parameter = e && e.parameter ? e.parameter : {};
+      if (parameter.key !== HAMMER_KEY) return answer({ ok: false, error: 'key' });
       try {
         return answer({
           ok: true,
-          version: 1,
+          version: 2,
           account: Session.getEffectiveUser().getEmail(),
-          emails: recentDeliveryEmails()
+          emails: recentDeliveryEmails(Number(parameter.after) || 0)
         });
       } catch (error) {
-        return answer({ ok: false, error: 'gmail', message: String(error) });
+        const permission = /permission|authoriz|scope/i.test(String(error));
+        return answer({ ok: false, error: permission ? 'permission' : 'gmail', message: String(error) });
       }
     }
 
-    function recentDeliveryEmails() {
-      const since = Date.now() - 2 * 24 * 60 * 60 * 1000;
+    /** Delivery emails from the last 2 days, or only since `after` (seconds) if given. */
+    function recentDeliveryEmails(after) {
+      const since = Math.max(Date.now() - 2 * 24 * 60 * 60 * 1000, after * 1000);
+      const query = after > 0 ? SEARCH + ' after:' + Math.floor(after) : SEARCH;
       const emails = [];
-      GmailApp.search(SEARCH, 0, MAX_THREADS).forEach(function (thread) {
+      GmailApp.search(query, 0, MAX_THREADS).forEach(function (thread) {
         thread.getMessages().forEach(function (message) {
           const date = message.getDate();
           if (date.getTime() < since || message.isInTrash()) return;
@@ -729,7 +741,7 @@ enum DeliveryScript {
 
     /** Run this from the editor to see what Hammer would get. */
     function test() {
-      Logger.log(JSON.stringify(recentDeliveryEmails(), null, 2));
+      Logger.log(JSON.stringify(recentDeliveryEmails(0), null, 2));
     }
     """#
 }
@@ -762,6 +774,10 @@ struct CheckFailure: Error, Equatable {
 struct ScriptState: Codable, Equatable {
     var started = false           // the first answer only notes what's already there
     var seen: [String] = []       // Gmail IDs already looked at (the last 500)
+    var askedAt: Date? = nil      // when the last good answer was asked for
+
+    /// What to send as `after`: a little before the last good check, or nil (look at 2 days).
+    var searchFrom: Date? { askedAt.map { $0.addingTimeInterval(-DeliveryScript.overlap) } }
 }
 
 enum ScriptCheck {
@@ -793,8 +809,13 @@ enum ScriptCheck {
         if let reply = try? JSONDecoder().decode(Reply.self, from: body) {
             if reply.ok { return .success(reply) }
             if reply.error == "key" {
-                return .failure(CheckFailure(message: "The script's key doesn't match Hammer's. Set up Gmail again "
-                    + "and paste the new script over the old one.", needsSetup: true))
+                return .failure(CheckFailure(message: "The script's key doesn't match Hammer's. Choose Set Up Gmail "
+                    + "Again: it makes a fresh script with a new key.", needsSetup: true))
+            }
+            if reply.error == "permission" {
+                return .failure(CheckFailure(message: "The script isn't allowed to read Gmail. Open it at "
+                    + "script.google.com, choose test, click Run, tick Select all, and click Continue.",
+                    needsSetup: true))
             }
             return .failure(CheckFailure(message: "The script couldn't read Gmail just now. Hammer will keep trying."))
         }
@@ -815,9 +836,10 @@ enum ScriptCheck {
     }
 
     /// New deliveries in the script's answer, oldest first, and what to remember.
-    static func process(_ emails: [Email], state: ScriptState, now: Date = Date())
+    static func process(_ emails: [Email], state: ScriptState, now: Date = Date(), askedAt: Date? = nil)
     -> (deliveries: [Delivery], state: ScriptState) {
         var next = state
+        if let askedAt { next.askedAt = askedAt }
         var known = Set(state.seen)
         var deliveries: [Delivery] = []
         let iso = ISO8601DateFormatter()

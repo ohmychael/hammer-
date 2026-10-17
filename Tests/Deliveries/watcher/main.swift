@@ -165,6 +165,9 @@ check(simPosted.last?.2 == "https://mail.google.com/mail/?authuser=you@gmail.com
 watcher.checkNow()
 wait(2)
 check(simPosted.count == postedBefore + 1, "not announced twice")
+let askedLines = ((try? String(contentsOfFile: scriptLogPath, encoding: .utf8)) ?? "").split(separator: "\n")
+    .filter { $0.contains("/exec") }
+check(askedLines.suffix(2).allSatisfy { $0.contains("after=") }, "later checks only ask for newer mail")
 
 print("[script: deployment not open to Anyone]")
 mode("signin")
@@ -181,6 +184,7 @@ check(simPosted.last?.2 == "https://mail.google.com/mail/?authuser=you@gmail.com
 
 print("[script: other problems]")
 for (name, expected, setup) in [("busy", "busy", false), ("gmail", "couldn't read Gmail", false),
+                                ("permission", "Select all", true),
                                 ("unsaved", "saved", true), ("notfound", "can't find", true)] {
     mode(name)
     watcher.checkNow()

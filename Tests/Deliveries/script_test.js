@@ -34,7 +34,7 @@ function sandbox(threads, options = {}) {
     GmailApp: {
       search(query, start, max) {
         calls.search.push({ query, start, max });
-        if (options.throws) throw new Error('Service invoked too many times for one day: gmail.');
+        if (options.throws) throw new Error(options.throws);
         return threads.map((messages) => ({ getMessages: () => messages }));
       },
     },
@@ -78,7 +78,7 @@ check(calls.search.length === 0, 'and Gmail is never touched without the key');
 
 console.log('[answer]');
 const { body, mime } = get(context, { key: KEY, v: '1' });
-check(body.ok === true && body.version === 1 && body.account === 'you@gmail.com', 'ok, with the account');
+check(body.ok === true && body.version === 2 && body.account === 'you@gmail.com', 'ok, with the account');
 check(mime === 'application/json', 'sent as JSON');
 check(JSON.stringify(body.emails.map((e) => e.id)) === '["m1","m2"]', `recent, not in the trash: ${body.emails.map((e) => e.id)}`);
 const first = body.emails[0];
@@ -91,10 +91,24 @@ check(search.query.startsWith('in:inbox newer_than:2d subject:(') && search.quer
       'searches the inbox, last 2 days, delivery words');
 check(search.start === 0 && search.max === 20, 'at most 20 conversations');
 
+check(!search.query.includes('after:'), 'the first time: no "after"');
+
+console.log('[only since the last check]');
+({ context, calls } = sandbox(threads));
+const lastCheck = Math.floor((now - 0.3 * DAY) / 1000);
+const since = get(context, { key: KEY, after: String(lastCheck) }).body;
+check(calls.search[0].query.endsWith(' after:' + lastCheck), `Gmail is asked for newer mail only: ${calls.search[0].query.slice(-20)}`);
+check(JSON.stringify(since.emails.map((e) => e.id)) === '["m1"]', `and older messages in the thread are left out: ${since.emails.map((e) => e.id)}`);
+({ context, calls } = sandbox(threads));
+get(context, { key: KEY, after: 'nonsense' });
+check(!calls.search[0].query.includes('after:'), 'a nonsense "after" is ignored');
+
 console.log('[Gmail error]');
-({ context } = sandbox(threads, { throws: true }));
+({ context } = sandbox(threads, { throws: 'Service invoked too many times for one day: gmail.' }));
 const failed = get(context, { key: KEY }).body;
 check(failed.ok === false && failed.error === 'gmail' && failed.message.includes('too many times'), 'reported, not thrown');
+({ context } = sandbox(threads, { throws: 'Exception: You do not have permission to call GmailApp.search. Required permissions: https://mail.google.com/' }));
+check(get(context, { key: KEY }).body.error === 'permission', 'Gmail access not granted: reported as such');
 
 console.log('[empty inbox]');
 ({ context } = sandbox([]));

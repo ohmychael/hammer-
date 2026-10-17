@@ -159,6 +159,7 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
     private(set) var notificationsOff = false
     private(set) var isChecking = false
     private(set) var needsSetup = false        // e.g. Gmail refused the app password, or the script's key is wrong
+    private(set) var isSettingUp = false       // the first check after Turn On is running
     private var secret: String?                // the app password or script key, once read from the Keychain
     private var generation = 0                 // changes when alerts are set up or turned off
     private var timer: Timer?
@@ -220,20 +221,24 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
     /// thread (it can stop to ask for your Mac password).
     func turnOn(scriptURL: URL, key: String, done: @escaping (String?) -> Void) {
         let previous = (source: source, email: email)
+        settingUp(true)
         queue.async {
+            let asked = Date()
             let answer: (failure: String?, account: String, start: ScriptState?)
-            switch Self.askScript(scriptURL, key: key) {
+            switch Self.askScript(scriptURL, key: key, after: nil) {
             case .failure(let failure):
                 answer = (failure.message, "", nil)
             case .success(let reply):
                 if GmailKeychain.saveScriptKey(key) {
                     if previous.source == .appPassword, let old = previous.email { GmailKeychain.delete(email: old) }
-                    answer = (nil, reply.account ?? "", ScriptCheck.process(reply.emails ?? [], state: ScriptState()).state)
+                    let start = ScriptCheck.process(reply.emails ?? [], state: ScriptState(), askedAt: asked).state
+                    answer = (nil, reply.account ?? "", start)
                 } else {
                     answer = ("The script works, but Hammer couldn't save its key to your Keychain.", "", nil)
                 }
             }
             DispatchQueue.main.async {
+                self.settingUp(false)
                 guard let start = answer.start else {
                     done(answer.failure)
                     return
@@ -251,6 +256,7 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
     /// Tries the email and app password; if Gmail accepts them, saves them and starts.
     func turnOn(email: String, password: String, done: @escaping (String?) -> Void) {
         let previous = (source: source, email: self.email)
+        settingUp(true)
         queue.async {
             let result = DeliveryCheck.run(state: DeliveryState(), email: email, password: password,
                                            transport: Self.connect)
@@ -270,6 +276,7 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
                 }
             }
             DispatchQueue.main.async {
+                self.settingUp(false)
                 guard let start = answer.start else {
                     done(answer.failure)
                     return
@@ -281,6 +288,11 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
                 done(nil)
             }
         }
+    }
+
+    private func settingUp(_ busy: Bool) {
+        isSettingUp = busy
+        onChange?()
     }
 
     private func started(secret: String) {
@@ -349,11 +361,12 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
                 case .failure(let error): outcome = Outcome(result: .failure(CheckFailure(error)))
                 }
             case .script:
-                let asked = url.map { Self.askScript($0, key: secret) }
+                let askedAt = Date()
+                let asked = url.map { Self.askScript($0, key: secret, after: savedScriptState.searchFrom) }
                     ?? .failure(CheckFailure(message: "Hammer lost the script's address.", needsSetup: true))
                 switch asked {
                 case .success(let reply):
-                    let checked = ScriptCheck.process(reply.emails ?? [], state: savedScriptState)
+                    let checked = ScriptCheck.process(reply.emails ?? [], state: savedScriptState, askedAt: askedAt)
                     outcome = Outcome(result: .success(checked.deliveries), scriptState: checked.state,
                                       account: reply.account)
                 case .failure(let failure):
@@ -406,13 +419,16 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         onChange?()
     }
 
-    private static func askScript(_ base: URL, key: String) -> Result<ScriptCheck.Reply, CheckFailure> {
-        guard let url = DeliveryScript.requestURL(base: base, key: key) else {
+    private static func askScript(_ base: URL, key: String, after: Date?) -> Result<ScriptCheck.Reply, CheckFailure> {
+        guard let url = DeliveryScript.requestURL(base: base, key: key, after: after) else {
             return .failure(CheckFailure(message: "That web app address doesn't look right.", needsSetup: true))
         }
         guard let answer = fetch(url) else { return .failure(.offline) }
         return ScriptCheck.read(status: answer.status, body: answer.body)
     }
+
+    /// No disk cache or cookies: the request carries the script's key.
+    private static let session = URLSession(configuration: .ephemeral)
 
     /// One HTTPS request, waiting for the answer (off the main thread). Google answers
     /// with a redirect to googleusercontent.com, which URLSession follows.
@@ -420,7 +436,7 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         let done = DispatchSemaphore(value: 0)
         let result = Box<(status: Int, body: Data)?>(nil)
-        URLSession.shared.dataTask(with: request) { data, response, _ in
+        session.dataTask(with: request) { data, response, _ in
             if let http = response as? HTTPURLResponse { result.value = (http.statusCode, data ?? Data()) }
             done.signal()
         }.resume()

@@ -71,7 +71,14 @@ class NSWorkspace {
 extension NotificationCenter {
     func addObserver(_ observer: Any, selector: Selector, name: Notification.Name?, object: Any?) {}
 }
-struct NSRect { init(x: Int, y: Int, width: Int, height: Int) {} }
+struct NSRect {
+    var size = NSSize()
+    var maxX = 1440.0, maxY = 900.0
+    init(x: Int, y: Int, width: Int, height: Int) {}
+}
+struct NSSize { var width = 400.0, height = 300.0 }
+struct NSPoint { init(x: Double, y: Double) {} }
+final class NSScreen { static let main: NSScreen? = NSScreen(); var visibleFrame = NSRect(x: 0, y: 0, width: 1440, height: 900) }
 class NSView { init(frame: NSRect) {}; func addSubview(_ view: NSView) {} }
 class NSTextField: NSView { var stringValue = ""; var placeholderString: String? }
 class NSSecureTextField: NSTextField {}
@@ -79,6 +86,8 @@ class NSWindow {
     struct Level: Equatable { let raw: Int; static let floating = Level(raw: 3), normal = Level(raw: 0) }
     var initialFirstResponder: NSView?
     var level = Level.normal
+    var frame = NSRect(x: 0, y: 0, width: 400, height: 300)
+    func setFrameTopLeftPoint(_ point: NSPoint) {}
 }
 final class NSPasteboard {
     struct PasteboardType: Equatable { let raw: String; static let string = PasteboardType(raw: "public.utf8-plain-text") }
@@ -96,6 +105,7 @@ class NSAlert {
     let window = NSWindow()
     @discardableResult func addButton(withTitle title: String) -> AnyObject { NSView(frame: NSRect(x: 0, y: 0, width: 0, height: 0)) }
     func runModal() -> NSModalResponse { .alertFirstButtonReturn }
+    func layout() {}
 }
 class NSApplication { func activate() {}; func activate(ignoringOtherApps: Bool) {} }
 let NSApp = NSApplication()
