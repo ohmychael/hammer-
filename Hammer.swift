@@ -8,8 +8,8 @@
 // Install (builds it and keeps it updated from GitHub):
 //   curl -fsSL https://raw.githubusercontent.com/ohmychael/hammer-/main/install-hammer.sh | bash
 //
-// Build by hand:  swiftc -parse-as-library -O Hammer.swift HammerCore.swift -o Hammer
-// Tests:          swiftc HammerCore.swift Tests/main.swift -o hammer-tests && ./hammer-tests
+// Build by hand:  swiftc -parse-as-library -O Hammer.swift HammerCore.swift Deliveries.swift DeliveryAlerts.swift -o Hammer
+// Tests:          swiftc HammerCore.swift Deliveries.swift Tests/main.swift -o hammer-tests && ./hammer-tests
 // Run:    ./Hammer                        menu bar app (hammer icon)
 //         If the icon is hidden behind the notch, open Hammer from Apps or
 //         Spotlight, or press Control-Option-H: the menu appears at the pointer.
@@ -1111,6 +1111,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         GoveeBluetooth.shared.start()        // first time: macOS asks to allow Bluetooth
         GoveeBluetooth.shared.hold(heldBluetoothIDs)
+        DeliveryWatcher.shared.onChange = { [weak self] in
+            guard let delegate = self else { return }
+            Task { @MainActor in delegate.rebuildMenuSoon() }
+        }
+        DeliveryWatcher.shared.start()       // checks Gmail for deliveries, if set up
         scheduleUpdateChecks()
         rescanLights()                       // also builds the menu
 
@@ -1234,6 +1239,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(action("Rescan Lights", #selector(rescanLights)))
 
         menu.addItem(.separator())
+        addDeliveries(to: menu)
+
+        menu.addItem(.separator())
         menu.addItem(hint("Open this menu anywhere: Control-Option-H"))
         menu.addItem(action("Check for Updates", #selector(checkForUpdates)))
         menu.addItem(hint("Version \(Self.version) · updates automatically"))
@@ -1283,6 +1291,184 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func checked(_ item: NSMenuItem, _ isOn: Bool) -> NSMenuItem {
         item.state = isOn ? .on : .off
         return item
+    }
+
+    // MARK: Deliveries (see DeliveryAlerts.swift and Deliveries.swift)
+
+    private func addDeliveries(to menu: NSMenu) {
+        let watcher = DeliveryWatcher.shared
+        menu.addItem(label("Deliveries"))
+        guard watcher.isOn else {
+            menu.addItem(hint("Get a notification when a package is delivered."))
+            menu.addItem(action("Set Up Delivery Alerts…", #selector(setUpDeliveries)))
+            return
+        }
+        if let problem = watcher.problem {
+            for line in Self.wrap(problem) { menu.addItem(hint(line)) }
+        }
+        if watcher.needsSetup {
+            menu.addItem(action("Set Up Gmail Again…", #selector(setUpDeliveries)))
+        }
+        if watcher.notificationsOff {
+            menu.addItem(hint("Notifications are off for Hammer, so alerts can't show."))
+            menu.addItem(action("Turn On Notifications…", #selector(openNotificationSettings)))
+        }
+        let recent = watcher.recent.prefix(3)
+        if recent.isEmpty {
+            menu.addItem(hint("No deliveries yet. Hammer checks Gmail every 3 minutes."))
+        }
+        for (index, delivery) in recent.enumerated() {
+            let item = NSMenuItem(title: deliveryTitle(delivery), action: #selector(openDelivery(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = index
+            item.toolTip = delivery.subject.isEmpty ? nil : DeliveryMail.tidy(delivery.subject)
+            menu.addItem(item)
+        }
+
+        let settings = NSMenu()
+        settings.addItem(hint(watcher.email ?? ""))
+        if watcher.isChecking {
+            settings.addItem(hint("Checking now…"))
+        } else if let last = watcher.lastChecked {
+            settings.addItem(hint("Last checked \(clockTime(last))"))
+        }
+        settings.addItem(action("Check Now", #selector(checkDeliveriesNow)))
+        settings.addItem(action("Send Test Notification", #selector(sendTestDelivery)))
+        settings.addItem(.separator())
+        settings.addItem(action("Change Gmail Account…", #selector(setUpDeliveries)))
+        settings.addItem(action("Turn Off Delivery Alerts", #selector(turnOffDeliveries)))
+        let item = NSMenuItem(title: "Delivery Alerts", action: nil, keyEquivalent: "")
+        item.submenu = settings
+        menu.addItem(item)
+    }
+
+    /// "eBay · Apple iPhone 15 Pro Max · 2:14 PM" (or the date, if not today).
+    private func deliveryTitle(_ delivery: Delivery) -> String {
+        var title = DeliveryMail.shorten("\(delivery.kind == .problem ? "⚠︎ " : "")\(delivery.store) · \(delivery.body)", to: 48)
+        if let date = delivery.date {
+            if Calendar.current.isDateInToday(date) {
+                title += " · " + clockTime(date)
+            } else {
+                let formatter = DateFormatter()
+                formatter.setLocalizedDateFormatFromTemplate("MMMd")
+                title += " · " + formatter.string(from: date)
+            }
+        }
+        return title
+    }
+
+    /// Splits a long note into menu-width lines.
+    private static func wrap(_ text: String, width: Int = 52) -> [String] {
+        var lines: [String] = []
+        var line = ""
+        for word in text.split(separator: " ") {
+            if !line.isEmpty && line.count + word.count + 1 > width {
+                lines.append(line)
+                line = ""
+            }
+            line += line.isEmpty ? String(word) : " " + word
+        }
+        if !line.isEmpty { lines.append(line) }
+        return lines
+    }
+
+    @objc private func setUpDeliveries() {
+        if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+        var email = DeliveryWatcher.shared.email ?? ""
+        var note: String?
+        while true {
+            let alert = NSAlert()
+            alert.messageText = "Delivery alerts from Gmail"
+            alert.informativeText = (note.map { "⚠︎ " + $0 + "\n\n" } ?? "") + """
+            Hammer looks at your Gmail every 3 minutes for "delivered" emails from eBay, \
+            Amazon, UPS, USPS, FedEx and other stores, and shows a notification. It reads \
+            only the sender and subject, and never marks anything as read.
+
+            It needs a Gmail app password, not your regular password:
+            1. Click Get App Password (2-Step Verification has to be on).
+            2. Type Hammer as the name and click Create.
+            3. Copy the 16 letters and paste them below.
+            """
+            let emailField = NSTextField(frame: NSRect(x: 0, y: 32, width: 300, height: 24))
+            emailField.placeholderString = "you@gmail.com"
+            emailField.stringValue = email
+            let passwordField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+            passwordField.placeholderString = "App password (16 letters)"
+            let fields = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 56))
+            fields.addSubview(emailField)
+            fields.addSubview(passwordField)
+            alert.accessoryView = fields
+            alert.addButton(withTitle: "Turn On")
+            alert.addButton(withTitle: "Get App Password")
+            alert.addButton(withTitle: "Cancel")
+            alert.window.initialFirstResponder = email.isEmpty ? emailField : passwordField
+            let choice = alert.runModal()
+            email = emailField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if choice == .alertSecondButtonReturn {
+                if let url = URL(string: "https://myaccount.google.com/apppasswords") { NSWorkspace.shared.open(url) }
+                note = nil
+                continue
+            }
+            guard choice == .alertFirstButtonReturn else { return }
+            guard DeliverySetup.isPlainEmail(email) else {
+                note = "That email address doesn't look right."
+                continue
+            }
+            guard let password = DeliverySetup.cleanPassword(passwordField.stringValue) else {
+                note = "That isn't an app password. It's 16 letters, shown in four groups of four."
+                continue
+            }
+            DeliveryWatcher.shared.turnOn(email: email, password: password) { [weak self] error in
+                guard let delegate = self else { return }
+                Task { @MainActor in delegate.deliverySetupFinished(error: error) }
+            }
+            return
+        }
+    }
+
+    private func deliverySetupFinished(error: String?) {
+        rebuildMenuSoon()
+        if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+        let alert = NSAlert()
+        if let error {
+            alert.messageText = "Couldn't turn on delivery alerts"
+            alert.informativeText = error
+            alert.addButton(withTitle: "Try Again")
+            alert.addButton(withTitle: "Cancel")
+            if alert.runModal() == .alertFirstButtonReturn { setUpDeliveries() }
+        } else {
+            alert.messageText = "Delivery alerts are on"
+            alert.informativeText = "Hammer will show a notification when a package is delivered. "
+                + "If macOS asks, allow notifications from Hammer."
+            alert.addButton(withTitle: "Done")
+            alert.addButton(withTitle: "Send Test Notification")
+            if alert.runModal() == .alertSecondButtonReturn { DeliveryWatcher.shared.sendTest() }
+        }
+    }
+
+    @objc private func openDelivery(_ sender: NSMenuItem) {
+        let recent = DeliveryWatcher.shared.recent
+        guard recent.indices.contains(sender.tag) else { return }
+        DeliveryWatcher.shared.open(recent[sender.tag])
+    }
+
+    @objc private func checkDeliveriesNow() {
+        DeliveryWatcher.shared.checkNow()
+        rebuildMenuSoon()
+    }
+
+    @objc private func sendTestDelivery() {
+        DeliveryWatcher.shared.sendTest()
+    }
+
+    @objc private func turnOffDeliveries() {
+        DeliveryWatcher.shared.turnOff()
+    }
+
+    @objc private func openNotificationSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // MARK: Light modes (for the checkmarks)
