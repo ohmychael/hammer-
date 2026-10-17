@@ -983,6 +983,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let percent = Int(slider.doubleValue.rounded())
         for light in lightsMatching(id) {
             schedule("brightness-\(light.id)", on: goveeQueue, after: delay(for: light)) {
+                Govee.setPower(light, on: true)          // moving the slider on a light that's off turns it on
                 Govee.setBrightness(light, percent)
             }
         }
@@ -993,7 +994,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func setWhite(_ sender: NSMenuItem, kelvin: Int) {
         let targets = targetLights(sender)
-        goveeQueue.async { targets.forEach { Govee.setWhite($0, kelvin: kelvin) } }
+        goveeQueue.async {
+            targets.forEach {
+                Govee.setPower($0, on: true)
+                Govee.setWhite($0, kelvin: kelvin)
+            }
+        }
     }
 
     @objc private func chooseColor(_ sender: NSMenuItem) {
@@ -1002,18 +1008,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.setTarget(self)
         panel.setAction(#selector(colorChanged(_:)))
         panel.isContinuous = true
+        panel.showsAlpha = false            // opacity means nothing for a bulb
         // A menu bar app has to bring itself forward before the panel will show.
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
         panel.makeKeyAndOrderFront(nil)
     }
 
+    /// The color is always sent at full strength, and the picker's brightness bar
+    /// sets the bulb's brightness separately. Sending a dark color instead (as
+    /// opacity 0 or the bottom of the brightness bar would) leaves a bulb dark in a
+    /// way that later colors don't undo.
     @objc private func colorChanged(_ panel: NSColorPanel) {
         guard let id = colorTargetID, let color = panel.color.usingColorSpace(.sRGB) else { return }
+        var hue: CGFloat = 0, saturation: CGFloat = 0, value: CGFloat = 0, alpha: CGFloat = 0
+        color.getHue(&hue, saturation: &saturation, brightness: &value, alpha: &alpha)
+        let vivid = NSColor(colorSpace: .sRGB, hue: hue, saturation: saturation, brightness: 1, alpha: 1)
+
         func byte(_ component: CGFloat) -> Int { min(max(Int((component * 255).rounded()), 0), 255) }
-        let red = byte(color.redComponent), green = byte(color.greenComponent), blue = byte(color.blueComponent)
+        let red = byte(vivid.redComponent), green = byte(vivid.greenComponent), blue = byte(vivid.blueComponent)
+        let percent = max(1, Int((value * 100).rounded()))
+
         for light in lightsMatching(id) {
             schedule("color-\(light.id)", on: goveeQueue, after: delay(for: light)) {
+                Govee.setPower(light, on: true)
                 Govee.setColor(light, red: red, green: green, blue: blue)
+                Govee.setBrightness(light, percent)
             }
         }
     }
