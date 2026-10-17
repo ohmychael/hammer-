@@ -237,6 +237,9 @@ final class FakeMonitor: DDCBus {
     var answerLimit = Int.max                      // goes quiet after this many answers
     var applyLimit = Int.max                       // takes this many sets, then ignores them
     var setSkew = 0                                // rounds what it's set to by this much
+    var edid: [UInt8]? = makeEDID("DELL U3818DW")  // what macOS has for it
+    var edidReadStatus: Int32 = 0                  // reading the EDID over I²C (0x50)
+    var oneRequestOnly = false                     // a second request before the read confuses it
     var supported: Set<UInt8> = [0x10, 0x12, 0x62]
     var values: [UInt8: (current: UInt16, max: UInt16)] = [0x10: (40, 100), 0x12: (75, 100), 0x62: (20, 100)]
 
@@ -244,6 +247,7 @@ final class FakeMonitor: DDCBus {
     var reads: [(chip: UInt32, offset: UInt32)] = []
     var sets: [(code: UInt8, value: UInt16)] = []
     private var pending: UInt8?
+    var requestsLost = 0
 
     func write(chip: UInt32, offset: UInt32, _ bytes: [UInt8]) -> Int32 {
         writes.append((chip, offset, bytes))
@@ -261,13 +265,20 @@ final class FakeMonitor: DDCBus {
             let seed = bytes[3] ^ DDCPacket.checksum(bytes[0..<3], seed: 0)
             guard acceptedReadSeeds.contains(seed) else { return 0 }
             if missFirst > 0 { missFirst -= 1; return 0 }
+            if oneRequestOnly, pending != nil { pending = nil; requestsLost += 1; return 0 }
             pending = bytes[2]
         }
         return 0
     }
 
+    func copyEDID() -> [UInt8]? { edid }
+
     func read(chip: UInt32, offset: UInt32, count: Int) -> (status: Int32, bytes: [UInt8]) {
         reads.append((chip, offset))
+        if chip == EDID.chip {
+            if edidReadStatus != 0 { return (edidReadStatus, []) }
+            return (0, Array(((edid ?? []) + [UInt8](repeating: 0, count: count)).prefix(count)))
+        }
         if readStatus != 0 { return (readStatus, []) }
         if chip != self.chip { return (wrongChipStatus, []) }
         let silence = [UInt8](repeating: 0, count: count)
@@ -285,6 +296,19 @@ final class FakeMonitor: DDCBus {
         reply[10] = DDCPacket.checksum(reply[0..<10], seed: 0x50) ^ (corruptReplies ? 0x01 : 0x00)
         return (0, Array((reply + silence).prefix(count)))
     }
+}
+
+/// A 128-byte EDID with a model name and a valid checksum.
+func makeEDID(_ name: String) -> [UInt8] {
+    var edid = [UInt8](repeating: 0, count: 128)
+    edid.replaceSubrange(0..<8, with: [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00])
+    edid[8] = 0x10; edid[9] = 0xAC                                    // "DEL"
+    let text = Array(name.utf8.prefix(13)) + (name.utf8.count < 13 ? [0x0A] : [])
+    edid.replaceSubrange(72..<77, with: [0x00, 0x00, 0x00, 0xFC, 0x00])  // second descriptor: the name
+    for (index, byte) in text.enumerated() { edid[77 + index] = byte }
+    for index in (77 + text.count)..<90 { edid[index] = 0x20 }
+    edid[127] = 0 &- edid[0..<127].reduce(UInt8(0), &+)
+    return edid
 }
 
 /// Counts the waiting a link does instead of doing it.
@@ -780,6 +804,54 @@ expect(state.sliders && state.hints == ["Can't find the Dell's port; trying the 
        "menu: only the default connection")
 state = MonitorMenu.make(connections: 0, hasDefault: true, attached: 0, screens: [builtIn, dellScreen], answers: true)
 expect(state.sliders && state.hints.isEmpty, "menu: the default connection works")
+
+
+// MARK: Monitor: reading the EDID, and the report from a MacBook Pro on macOS 26
+
+let dellEDID = makeEDID("DELL U3818DW")
+expect(EDID.isValid(dellEDID) && EDID.name(dellEDID) == "DELL U3818DW", "EDID: valid, with the model name")
+var badEDID = dellEDID; badEDID[20] ^= 1
+expect(!EDID.isValid(badEDID) && !EDID.isValid(Array(dellEDID.prefix(100))) && !EDID.isValid([UInt8](repeating: 0, count: 128)),
+       "EDID: wrong checksum, too short, or zeros")
+expect(EDID.name(makeEDID("LG HDR 4K")) == "LG HDR 4K" && EDID.name(makeEDID("ABCDEFGHIJKLMNOP")) == "ABCDEFGHIJKLM"
+       && EDID.name([UInt8](repeating: 0, count: 128)) == nil && EDID.name([]) == nil, "EDID: names, long names, none")
+
+// What the 16" MacBook Pro (M1 Pro, macOS 26) reported: sent fine, every read fails with e0114103.
+let avError = Int32(bitPattern: 0xE0114103)
+let proUSBC = [framebuffer(300, "DELL U3818DW", display: true, transport: "DP → DP"),
+               proxy(301, path: "IOService:/x/dcpext0@1/y")]
+let lidClosed = [MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 300, direct: true)]
+dell = FakeMonitor(); dell.readStatus = avError
+check = runCheck(proUSBC, lidClosed, [301: dell])
+expect(check.verdict == .noAnswer && check.wireReads == true, "DDC reads fail, the EDID reads fine")
+expect(check.text.contains("macOS's EDID for it: DELL U3818DW") && check.text.contains("Read errors: e0114103 ×6")
+       && check.text.contains("Its EDID over the same wire: read fine")
+       && check.text.contains("One slow try (one request, 150 ms wait): no answer after 2 tries, e0114103 ×2")
+       && check.advice.joined().contains("its control channel (DDC/CI) doesn't answer")
+       && check.advice.joined().contains("Unplug the monitor's power cord for 10 seconds"), "the report says so:\n\(check.text)")
+dell = FakeMonitor(); dell.readStatus = avError; dell.edidReadStatus = avError
+check = runCheck(proUSBC, lidClosed, [301: dell])
+expect(check.verdict == .noAnswer && check.wireReads == false
+       && check.text.contains("Its EDID over the same wire: failed (error e0114103)")
+       && check.advice.first == "Result: macOS can't read anything back over this connection, not even the monitor's EDID.",
+       "nothing can be read back at all")
+dell = FakeMonitor(); dell.readStatus = avError; dell.edid = nil
+check = runCheck(proUSBC, lidClosed, [301: dell])
+expect(!check.text.contains("macOS's EDID for it"), "no EDID from macOS: not mentioned")
+
+// A monitor confused by the request being sent twice: only the slow single request works.
+dell = FakeMonitor(); dell.oneRequestOnly = true
+check = runCheck(proUSBC, lidClosed, [301: dell])
+expect(check.verdict == .working && check.ports[0].slowRead?.answered == true && dell.requestsLost > 0
+       && check.text.contains("One slow try (one request, 150 ms wait): 40 of 100") && dell.values[0x10]?.current == 40,
+       "answers only a single request: found, tested and put back")
+dell = FakeMonitor()
+check = runCheck(proUSBC, lidClosed, [301: dell])
+expect(check.ports[0].slowRead == nil && check.ports[0].edidOverI2C == nil && check.wireReads == nil
+       && !dell.reads.contains { $0.chip == EDID.chip }, "a working monitor isn't probed further")
+dell = FakeMonitor(); dell.writeStatus = Int32(bitPattern: 0xE00002BC)
+check = runCheck(proUSBC, lidClosed, [301: dell])
+expect(check.ports[0].edidOverI2C == nil && check.ports[0].slowRead == nil, "nothing sent: no probing either")
 
 // MARK: Text
 

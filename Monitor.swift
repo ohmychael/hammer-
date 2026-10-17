@@ -103,6 +103,36 @@ enum DDCCode {
 protocol DDCBus: AnyObject {
     func write(chip: UInt32, offset: UInt32, _ bytes: [UInt8]) -> Int32
     func read(chip: UInt32, offset: UInt32, count: Int) -> (status: Int32, bytes: [UInt8])
+    /// The monitor's EDID as macOS keeps it for this connection, if it gives it.
+    func copyEDID() -> [UInt8]?
+}
+
+extension DDCBus {
+    func copyEDID() -> [UInt8]? { nil }
+}
+
+/// The monitor's identity block (EDID): 128 bytes every monitor has, readable at
+/// I²C address 0x50 on any display cable.
+enum EDID {
+    static let chip: UInt32 = 0x50
+    static let header: [UInt8] = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]
+
+    /// Right header, and the 128 bytes add up to 0.
+    static func isValid(_ bytes: [UInt8]) -> Bool {
+        bytes.count >= 128 && Array(bytes.prefix(8)) == header && bytes[0..<128].reduce(UInt8(0), &+) == 0
+    }
+
+    /// The model name it gives, e.g. "DELL U3818DW".
+    static func name(_ bytes: [UInt8]) -> String? {
+        guard bytes.count >= 128 else { return nil }
+        for start in stride(from: 54, through: 108, by: 18)
+        where bytes[start] == 0 && bytes[start + 1] == 0 && bytes[start + 3] == 0xFC {
+            let text = bytes[(start + 5)..<(start + 18)].prefix { $0 != 0x0A }
+            let name = String(decoding: text, as: UTF8.self).trimmingCharacters(in: .whitespaces)
+            return name.isEmpty ? nil : name
+        }
+        return nil
+    }
 }
 
 /// One combination of address and request details. Monitors and ports differ
@@ -150,6 +180,7 @@ struct DDCRead: Equatable {
     var sent = false                 // at least one request went out without an error
     var sendError: Int32?            // the last error sending, if any
     var readError: Int32?            // the last error reading, if any
+    var readErrors: [Int32: Int] = [:]   // every read error, and how many times
     var lastReply: [UInt8]?          // the last bytes read that weren't an answer
     var busy = false                 // the monitor said "nothing yet" at least once
     var interrupted = false          // stopped early (a slider moved), so this says nothing
@@ -237,7 +268,11 @@ final class DDCLink: @unchecked Sendable {
 
                 sleep(timing.beforeRead)
                 let (status, bytes) = bus.read(chip: way.chip, offset: way.readOffset, count: 11)
-                guard status == 0 else { result.readError = status; continue }
+                guard status == 0 else {
+                    result.readError = status
+                    result.readErrors[status, default: 0] += 1
+                    continue
+                }
                 switch DDCPacket.parseReply(bytes, code: code) {
                 case let .value(current, max):
                     result.answer = .value(current: current, max: max)
@@ -472,9 +507,19 @@ struct MonitorCheck {
         case noReadBack(from: UInt16, to: UInt16)                      // went quiet after the change
     }
 
+    /// Reading the monitor's EDID over the same wire (I²C address 0x50): if even
+    /// that fails, nothing can be read over this connection.
+    struct EDIDRead: Equatable {
+        var status: Int32
+        var valid: Bool
+    }
+
     struct PortResult {
         var port: MonitorPort
         var noService = false        // macOS gave no way to talk to it
+        var edidName: String?        // the monitor's name from the EDID macOS has for this connection
+        var edidOverI2C: EDIDRead?   // tried only if the monitor doesn't answer
+        var slowRead: DDCRead?       // a last slow try, only if it doesn't answer
         var brightness = DDCRead()
         var contrast: DDCRead?
         var change: Change?
@@ -525,8 +570,28 @@ struct MonitorCheck {
     private static func test(_ port: MonitorPort, bus: DDCBus, timing: DDCTiming,
                              sleep: @escaping (UInt32) -> Void) -> PortResult {
         var result = PortResult(port: port)
-        let link = DDCLink(bus: bus, ways: port.ways, timing: timing, sleep: sleep)
+        result.edidName = bus.copyEDID().flatMap(EDID.name)
+        var link = DDCLink(bus: bus, ways: port.ways, timing: timing, sleep: sleep)
         result.brightness = link.read(code: DDCCode.brightness)
+
+        if !result.brightness.answered && result.brightness.sent {
+            // Can anything be read over this connection? Every monitor answers at 0x50.
+            let (status, bytes) = bus.read(chip: EDID.chip, offset: 0, count: 128)
+            result.edidOverI2C = EDIDRead(status: status, valid: status == 0 && EDID.isValid(bytes))
+            // A last slow try: one request, a long wait.
+            var slow = timing
+            slow.writeCycles = 1
+            slow.beforeRead = 150_000
+            slow.triesPerWay = 2
+            slow.triesOnKnownWay = 2
+            let slowLink = DDCLink(bus: bus, ways: [port.ways[0]], timing: slow, sleep: sleep)
+            let slowRead = slowLink.read(code: DDCCode.brightness)
+            result.slowRead = slowRead
+            if slowRead.answered {
+                link = slowLink
+                result.brightness = slowRead
+            }
+        }
         guard result.brightness.answered else { return result }
         result.contrast = link.read(code: DDCCode.contrast)
 
@@ -599,6 +664,15 @@ struct MonitorCheck {
         return .noAnswer
     }
 
+    /// Whether anything can be read over the monitor's connection (its EDID at
+    /// 0x50 came back): nil if that wasn't tried.
+    var wireReads: Bool? {
+        let probes = ports.filter { $0.port.attached || ports.allSatisfy { !$0.port.attached } }
+            .compactMap { $0.edidOverI2C }
+        if probes.isEmpty { return nil }
+        return probes.contains { $0.valid }
+    }
+
     /// The monitor's name for messages: "the DELL U3818DW", or "the monitor".
     var monitorName: String {
         let name = answering?.port.name
@@ -647,6 +721,7 @@ struct MonitorCheck {
                 lines.append("  macOS gave Hammer no way to talk to it")
                 continue
             }
+            if let name = result.edidName { lines.append("  macOS's EDID for it: \(name)") }
             let b = result.brightness
             lines.append("  Sent: " + (b.sent ? "yes" : "no" + (b.sendError.map { " (error \(Self.hex($0)))" } ?? "")))
             lines.append("  Brightness: " + Self.describe(b))
@@ -671,7 +746,17 @@ struct MonitorCheck {
             if !b.answered, let reply = b.lastReply {
                 lines.append("  Last reply: " + reply.map { String(format: "%02X", $0) }.joined(separator: " "))
             }
-            if !b.answered, let error = b.readError { lines.append("  Read error: \(Self.hex(error))") }
+            if !b.answered, !b.readErrors.isEmpty {
+                lines.append("  Read errors: " + Self.describe(b.readErrors))
+            }
+            if let probe = result.edidOverI2C {
+                lines.append("  Its EDID over the same wire: " + (probe.valid ? "read fine"
+                    : probe.status != 0 ? "failed (error \(Self.hex(probe.status)))" : "came back, but not an EDID"))
+            }
+            if let slow = result.slowRead {
+                lines.append("  One slow try (one request, 150 ms wait): " + Self.describe(slow)
+                             + (slow.answered || slow.readErrors.isEmpty ? "" : ", " + Self.describe(slow.readErrors)))
+            }
         }
 
         lines.append("")
@@ -714,6 +799,22 @@ struct MonitorCheck {
             return ["Result: macOS wouldn't let Hammer send anything to \(name).",
                     hdmi ? "This Mac's HDMI port doesn't pass monitor control. Plug the monitor's USB-C (or DisplayPort) cable straight into the Mac instead."
                          : "Plug its USB-C cable straight into the Mac (not through a hub, dock or adapter), then check again."]
+        case .noAnswer where wireReads == true:
+            return ["Result: Hammer can read from \(name) over this cable (its EDID came back),",
+                    "but its control channel (DDC/CI) doesn't answer. Try these, checking again after each:",
+                    "  1. On the monitor: Menu → Others → DDC/CI → On.",
+                    "  2. Unplug the monitor's power cord for 10 seconds, plug it back in, and turn it on."]
+                + (hdmi ? ["  3. Use USB-C rather than HDMI: this Mac's HDMI port may not pass control."] : [])
+                + ["  \(hdmi ? 4 : 3). Move Hammer's Brightness slider and watch the screen: some monitors take changes without answering.",
+                   "If it still doesn't work, send this report along."]
+        case .noAnswer where wireReads == false:
+            return ["Result: macOS can't read anything back over this connection, not even the monitor's EDID.",
+                    "Messages go out, but nothing comes back. Try these, checking again after each:",
+                    "  1. Use a USB-C cable straight from the Mac to the monitor's USB-C port (no hub, dock or adapter),",
+                    "     and try another USB-C port on the Mac.",
+                    "  2. Unplug the monitor's power cord for 10 seconds, plug it back in, and turn it on.",
+                    "  3. Move Hammer's Brightness slider and watch the screen: changes may still get through.",
+                    "If it still doesn't work, send this report along."]
         case .noAnswer:
             return ["Result: Hammer sent messages to \(name), but it didn't answer.",
                     "Try these, checking again after each:",
@@ -744,6 +845,11 @@ struct MonitorCheck {
             if !read.sent { return "not asked (couldn't send)" }
             return "no answer after \(read.tries) tries" + (read.busy ? " (it said it was busy)" : "")
         }
+    }
+
+    /// [e0114103: 6] → "e0114103 ×6".
+    static func describe(_ errors: [Int32: Int]) -> String {
+        errors.sorted { $0.key < $1.key }.map { "\(hex($0.key)) ×\($0.value)" }.joined(separator: ", ")
     }
 
     static func hex(_ status: Int32) -> String { String(format: "%08x", UInt32(bitPattern: status)) }

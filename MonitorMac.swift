@@ -44,6 +44,22 @@ final class AVServiceBus: DDCBus {
         let status = IOAVServiceReadI2C(service, chip, offset, &buffer, UInt32(count))
         return (status, buffer)
     }
+
+    func copyEDID() -> [UInt8]? {
+        guard let copy = Self.copyEDIDFunction else { return nil }
+        var data: UnsafeRawPointer?
+        guard copy(Unmanaged.passUnretained(service).toOpaque(), &data) == 0, let data else { return nil }
+        let edid = Unmanaged<CFData>.fromOpaque(data).takeRetainedValue() as Data
+        return [UInt8](edid)
+    }
+
+    /// IOAVServiceCopyEDID(service, &data): private like the rest, looked up at run
+    /// time so a macOS without it still builds and runs Hammer.
+    private typealias CopyEDID = @convention(c) (UnsafeRawPointer, UnsafeMutablePointer<UnsafeRawPointer?>) -> Int32
+    private static let copyEDIDFunction: CopyEDID? = {
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "IOAVServiceCopyEDID") else { return nil }
+        return unsafeBitCast(symbol, to: CopyEDID.self)
+    }()
 }
 
 // MARK: - Finding the monitor
