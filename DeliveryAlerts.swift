@@ -149,7 +149,7 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
     /// How to reach Gmail with an app password (tests swap in a fake server).
     static var connect: () throws -> IMAPTransport = { try TLSTransport(host: "imap.gmail.com", port: 993) }
     /// How to ask the Google script; nil if it couldn't be reached (tests swap in a fake).
-    static var fetch: (URL) -> (status: Int, body: Data)? = { DeliveryWatcher.download($0) }
+    static var fetch: (URL) -> (status: Int, body: Data, finalURL: URL?)? = { DeliveryWatcher.download($0) }
 
     /// Called on the main thread when something the menu shows has changed.
     var onChange: (() -> Void)?
@@ -424,7 +424,7 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
             return .failure(CheckFailure(message: "That web app address doesn't look right.", needsSetup: true))
         }
         guard let answer = fetch(url) else { return .failure(.offline) }
-        return ScriptCheck.read(status: answer.status, body: answer.body)
+        return ScriptCheck.read(status: answer.status, body: answer.body, finalURL: answer.finalURL)
     }
 
     /// No disk cache or cookies: the request carries the script's key.
@@ -432,12 +432,12 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
 
     /// One HTTPS request, waiting for the answer (off the main thread). Google answers
     /// with a redirect to googleusercontent.com, which URLSession follows.
-    private static func download(_ url: URL) -> (status: Int, body: Data)? {
+    private static func download(_ url: URL) -> (status: Int, body: Data, finalURL: URL?)? {
         let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         let done = DispatchSemaphore(value: 0)
-        let result = Box<(status: Int, body: Data)?>(nil)
+        let result = Box<(status: Int, body: Data, finalURL: URL?)?>(nil)
         session.dataTask(with: request) { data, response, _ in
-            if let http = response as? HTTPURLResponse { result.value = (http.statusCode, data ?? Data()) }
+            if let http = response as? HTTPURLResponse { result.value = (http.statusCode, data ?? Data(), http.url) }
             done.signal()
         }.resume()
         _ = done.wait(timeout: .now() + 40)

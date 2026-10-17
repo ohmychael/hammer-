@@ -18,12 +18,15 @@ LOGIN="$WORK/home/Library/Keychains/login.keychain-db"
 OTHER="$WORK/home/Library/Keychains/My Work Certs.keychain-db"     # a path with spaces
 printf '%s\n%s\n' "$LOGIN" "$OTHER" > "$FAKE_STATE/search-list"
 KC="$HAMMER_SIGN_DIR/hammer-signing.keychain-db"
-sign() { ( source "$REPO/signing.sh"; sign_app "$WORK/Hammer.app" ) 2>&1; }
+# Like build.sh: strict mode, so a failing command would stop the "build".
+sign() { ( set -euo pipefail; source "$REPO/signing.sh"; sign_app "$WORK/Hammer.app"; echo "build continued" ) 2>&1; }
 
 echo "[first build]"
 out="$(sign)"
 check '[[ "$out" == "Signed with Hammer Local Signing"* ]]' "signed with the certificate: $out"
 check '[ "$(cat "$WORK/Hammer.app/signature")" = certificate ]' "the app carries the certificate signature"
+check '[ -f "$FAKE_STATE/signed-while-listed" ]' "codesign could find it (listed while signing)"
+check '[[ "$out" == *"build continued" ]]' "the build carries on"
 check '[ -f "$KC" ] && [ -s "$HAMMER_SIGN_DIR/password" ]' "keychain and password made"
 check '[ "$(stat -c %a "$HAMMER_SIGN_DIR" 2>/dev/null || stat -f %Lp "$HAMMER_SIGN_DIR")" = 700 ]' "folder only you can open"
 check '[ "$(stat -c %a "$HAMMER_SIGN_DIR/password" 2>/dev/null || stat -f %Lp "$HAMMER_SIGN_DIR/password")" = 600 ]' "password only you can read"
@@ -57,12 +60,31 @@ check '[ "$(cat "$FAKE_STATE/search-list")" = "$(printf "%s\n%s" "$LOGIN" "$OTHE
 
 echo "[codesign refuses the certificate]"
 out="$(FAKE_REFUSE=1 sign)"
-check '[[ "$out" == "Signed ad hoc"* ]] && [ "$(cat "$WORK/Hammer.app/signature")" = adhoc ]' "falls back to ad hoc: $out"
+check '[[ "$out" == "Signed ad hoc"* ]] && [ "$(cat "$WORK/Hammer.app/signature")" = adhoc ]' "falls back to ad hoc"
+check '[[ "$out" == *"build continued" ]]' "and the build carries on"
+check '[ "$(cat "$FAKE_STATE/search-list")" = "$(printf "%s\n%s" "$LOGIN" "$OTHER")" ]' "search list put back"
+
+echo "[the signature doesn't verify]"
+out="$(FAKE_VERIFY_FAIL=1 sign)"
+check '[[ "$out" == "Signed ad hoc"* ]] && [[ "$out" == *"build continued" ]]' "falls back to ad hoc, build carries on"
+check '[ "$(cat "$FAKE_STATE/search-list")" = "$(printf "%s\n%s" "$LOGIN" "$OTHER")" ]' "search list put back"
+
+echo "[the keychain no longer opens (e.g. restored from a backup)]"
+printf 'not-the-password' > "$HAMMER_SIGN_DIR/password"
+out="$(sign)"
+check '[[ "$out" == "Signed with Hammer Local Signing"* ]]' "made again and signed with the certificate"
+check '[ "$(cat "$FAKE_STATE/search-list")" = "$(printf "%s\n%s" "$LOGIN" "$OTHER")" ]' "search list untouched"
+
+echo "[the search list can't be read]"
+mv "$FAKE_STATE/search-list" "$FAKE_STATE/search-list.saved"
+out="$(sign)"
+check '[[ "$out" == "Signed ad hoc"* ]] && [[ "$out" == *"build continued" ]]' "doesn't touch it, signs ad hoc"
+mv "$FAKE_STATE/search-list.saved" "$FAKE_STATE/search-list"
 
 echo "[making the certificate fails]"
 rm -rf "$HAMMER_SIGN_DIR"
 out="$(HAMMER_OPENSSL=/bin/false sign)"
-check '[[ "$out" == "Signed ad hoc"* ]]' "falls back to ad hoc"
+check '[[ "$out" == "Signed ad hoc"* ]] && [[ "$out" == *"build continued" ]]' "falls back to ad hoc"
 check '[ ! -e "$KC" ] && [ ! -e "$HAMMER_SIGN_DIR/password" ]' "and leaves nothing half-made"
 check '[ "$(cat "$FAKE_STATE/search-list")" = "$(printf "%s\n%s" "$LOGIN" "$OTHER")" ]' "search list untouched"
 

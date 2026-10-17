@@ -798,7 +798,8 @@ enum ScriptCheck {
     }
 
     /// Reads the script's answer, or makes sense of the page Google sends instead.
-    static func read(status: Int, body: Data) -> Result<Reply, CheckFailure> {
+    /// `finalURL` is where the request ended up after Google's redirects.
+    static func read(status: Int, body: Data, finalURL: URL? = nil) -> Result<Reply, CheckFailure> {
         if status == 404 {
             return .failure(CheckFailure(message: "Hammer can't find the script at that address. "
                 + "Check the web app URL (it ends in /exec).", needsSetup: true))
@@ -819,7 +820,9 @@ enum ScriptCheck {
             }
             return .failure(CheckFailure(message: "The script couldn't read Gmail just now. Hammer will keep trying."))
         }
-        let page = String(decoding: body.prefix(200_000), as: UTF8.self).lowercased()
+        let html = String(decoding: body.prefix(200_000), as: UTF8.self)
+        let page = html.lowercased()
+        let title = pageTitle(html)
         if page.contains("script function not found") {
             return .failure(CheckFailure(message: "The script wasn't saved before it was deployed. Set up Gmail again.",
                                          needsSetup: true))
@@ -828,11 +831,34 @@ enum ScriptCheck {
             return .failure(CheckFailure(message: "The script needs your permission again: open it at "
                 + "script.google.com and click Run.", needsSetup: true))
         }
-        if status == 401 || status == 403 || page.contains("accounts.google.com") || page.contains("sign in") {
-            return .failure(CheckFailure(message: "Google asked for a sign-in instead of running the script. In the "
-                + "script, open Deploy → Manage deployments and set Who has access to Anyone.", needsSetup: true))
+        let signIn = finalURL?.host?.hasSuffix("accounts.google.com") == true
+            || title?.lowercased().contains("sign in") == true || status == 401 || status == 403
+        if signIn {
+            return .failure(CheckFailure(message: "Google asked for a sign-in instead of running the script, so it "
+                + "isn't open to Anyone. In the script: Deploy → Manage deployments → ✏️ → Who has access: Anyone, "
+                + "Version: New version → Deploy.", needsSetup: true))
         }
-        return .failure(CheckFailure(message: "The script sent an answer Hammer didn't understand. Hammer will keep trying."))
+        if page.contains("unable to open the file") || page.contains("page not found") {
+            return .failure(CheckFailure(message: "Google can't find a script at that address. Copy the Web app URL "
+                + "again from Deploy → Manage deployments.", needsSetup: true))
+        }
+        let said = title.map { " Google's page said: “\($0)”." } ?? ""
+        return .failure(CheckFailure(message: "The script sent back a page instead of its answer.\(said) "
+            + "Hammer will keep trying."))
+    }
+
+    /// The <title> of an HTML page, tidied up; nil if there isn't one.
+    static func pageTitle(_ html: String) -> String? {
+        guard let range = html.range(of: #"<title[^>]*>([\s\S]*?)</title>"#, options: [.regularExpression, .caseInsensitive])
+        else { return nil }
+        var title = String(html[range])
+            .replacingOccurrences(of: #"</?title[^>]*>"#, with: "", options: [.regularExpression, .caseInsensitive])
+        for (entity, text) in [("&amp;", "&"), ("&#39;", "'"), ("&quot;", "\""), ("&lt;", "<"), ("&gt;", ">"), ("&nbsp;", " ")] {
+            title = title.replacingOccurrences(of: entity, with: text)
+        }
+        title = title.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        return title.isEmpty ? nil : DeliveryMail.shorten(title, to: 80)
     }
 
     /// New deliveries in the script's answer, oldest first, and what to remember.

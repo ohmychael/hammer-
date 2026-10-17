@@ -629,8 +629,18 @@ expect(noPermission?.needsSetup == true && noPermission?.message.contains("Selec
        "Gmail access not granted: says how to grant it")
 let gmailBusy = failure(reply(#"{"ok":false,"error":"gmail","message":"Service invoked too many times"}"#))
 expect(gmailBusy?.needsSetup == false && gmailBusy?.message.contains("keep trying") == true, "Gmail error: retried")
-let signIn = failure(reply("<html><body>Sign in - Google Accounts <a href='https://accounts.google.com/'>", status: 200))
+let signIn = failure(reply("<html><head><title>Sign in - Google Accounts</title></head><body>…</body></html>"))
 expect(signIn?.needsSetup == true && signIn?.message.contains("Anyone") == true, "sign-in page: access must be Anyone")
+let redirected = failure(ScriptCheck.read(status: 200, body: Data("<html>…</html>".utf8),
+                                          finalURL: URL(string: "https://accounts.google.com/v3/signin/identifier?x=1")))
+expect(redirected?.message.contains("Anyone") == true, "sent to Google's sign-in: access must be Anyone")
+let otherPage = failure(reply("<html><head><title>Error &amp; stuff</title></head><body><a href='https://accounts.google.com/'>Sign in</a></body></html>"))
+expect(otherPage?.message.contains("“Error & stuff”") == true && otherPage?.needsSetup == false,
+       "any other Google page: says what it was, keeps trying: \(otherPage?.message ?? "-")")
+let missing = failure(reply("<html><title>Page Not Found</title>Sorry, unable to open the file at this time.</html>"))
+expect(missing?.needsSetup == true && missing?.message.contains("can't find") == true, "no script at that address")
+expect(ScriptCheck.pageTitle("<TITLE>\n  Sign in\n</TITLE>") == "Sign in" && ScriptCheck.pageTitle("no title") == nil
+       && ScriptCheck.pageTitle("<title></title>") == nil, "page titles")
 expect(failure(reply("<html>Script function not found: doGet</html>"))?.message.contains("saved") == true, "not saved")
 expect(failure(reply("<html>Authorization is required to perform that action.</html>"))?.message.contains("Run") == true,
        "needs permission again")

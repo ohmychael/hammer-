@@ -30,6 +30,12 @@ elif cmd == "create-keychain":
     json.dump({"password": opt("-p"), "imported": False, "partition": False}, open(path, "w"))
     entries = read_list() + [path]                                   # like macOS: added to the search list
     open(LIST, "w").write("\n".join(entries) + "\n")
+elif cmd == "delete-keychain":
+    path = args[-1]
+    if not os.path.exists(path): sys.exit(50)
+    os.remove(path)
+    remaining = [p for p in read_list() if p != path]               # read before rewriting
+    open(LIST, "w").write("".join(p + "\n" for p in remaining))
 elif cmd == "set-keychain-settings":
     sys.exit(0 if keychain(args[-1]) else 50)
 elif cmd == "unlock-keychain":
