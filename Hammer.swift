@@ -431,6 +431,9 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     private static let setupTimeout: TimeInterval = 10
     /// A bulb that connects without Govee's control channel is checked again this often.
     private static let incompatiblePause: TimeInterval = 300
+    /// macOS can take a few seconds to notice a link has died. Commands written that
+    /// recently, with no answer from the bulb since, are sent again after reconnecting.
+    private static let lostWindow: TimeInterval = 6
 
     /// Called on the main thread whenever the bulbs, their connections or their state change.
     var onChange: (() -> Void)?
@@ -448,6 +451,7 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     private var connectingSince: [UUID: Date] = [:]
     private var connectedAt: [UUID: Date] = [:]
     private var readyAt: [UUID: Date] = [:]                  // when the link could take commands
+    private var recentlyWritten: [UUID: [(item: CommandQueue.Item, at: Date)]] = [:]
     private var backoff = ConnectBackoff()                  // see HammerCore.swift
     private var retryAt: [UUID: Date] = [:]
     private var patienceCheck: Set<UUID> = []
@@ -510,7 +514,9 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     /// On or off, as the bulb itself reported over the current link; nil if it hasn't said.
     func isOn(_ id: UUID) -> Bool? { powerState[id] }
 
-    /// Whether the bulb has answered Hammer recently.
+    /// Whether the bulb has answered Hammer recently. Answers only feed the menu
+    /// (checkmarks, "responding"): a quiet bulb still takes commands, so Hammer
+    /// never drops a link for being quiet.
     func isAnswering(_ id: UUID) -> Bool {
         guard let heard = lastHeard[id] else { return false }
         return Date().timeIntervalSince(heard) < 60
@@ -674,7 +680,8 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
 
         var queue = outbox[id] ?? CommandQueue(freshFor: Self.freshFor)
         queue.dropStale()
-        while let next = queue.first {
+        while let item = queue.items.first {
+            let next = item.packet
             if control.properties.contains(.writeWithoutResponse) {
                 if !peripheral.canSendWriteWithoutResponse {
                     // macOS usually says when the link is ready again, but not always:
@@ -688,9 +695,11 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
                 }
                 waitingToWrite[id] = nil
                 peripheral.writeValue(Data(next), for: control, type: .withoutResponse)
+                noteWritten(item, to: id)
                 queue.removeFirst()
             } else {
                 peripheral.writeValue(Data(next), for: control, type: .withResponse)
+                noteWritten(item, to: id)
                 queue.removeFirst()
                 writeInFlight[id] = Date()                                     // resumes in didWriteValueFor
                 schedulePump(id, after: 2.05)
@@ -698,6 +707,14 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
             }
         }
         outbox[id] = queue
+    }
+
+    private func noteWritten(_ item: CommandQueue.Item, to id: UUID) {
+        guard GoveePacket.isCommand(item.packet) else { return }
+        let now = Date()
+        var recent = (recentlyWritten[id] ?? []).filter { now.timeIntervalSince($0.at) < Self.lostWindow }
+        recent.append((item: item, at: now))
+        recentlyWritten[id] = recent
     }
 
     /// One pending re-check per bulb.
@@ -747,6 +764,8 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     private func dropLink(_ peripheral: CBPeripheral, pause: TimeInterval? = nil) {
         let id = peripheral.identifier
         if let pause { backoff.pause(id, for: pause) } else { backoff.failed(id) }
+        connectedAt[id] = nil                                 // counted here, so didDisconnect doesn't count it again
+        readyAt[id] = nil
         guard let central, central.state == .poweredOn else { return }
         central.cancelPeripheralConnection(peripheral)        // didDisconnect follows, and waits out the backoff
     }
@@ -760,7 +779,10 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
             self.releaseTimers[id] = nil
             guard !self.held.contains(id) else { return }
             self.outbox[id] = nil
+            self.recentlyWritten[id] = nil
             self.connectingSince[id] = nil
+            self.connectedAt[id] = nil                        // letting go on purpose isn't a failure
+            self.readyAt[id] = nil
             if let central = self.central, central.state == .poweredOn, let current = self.peripherals[id],
                current.state != .disconnected {
                 central.cancelPeripheralConnection(current)
@@ -790,6 +812,7 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
             outbox.removeAll()
             powerState.removeAll()
             lastHeard.removeAll()
+            recentlyWritten.removeAll()
             retryAt.removeAll()
             setupRetries.removeAll()
             releaseTimers.values.forEach { $0.cancel() }
@@ -856,13 +879,24 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         writeInFlight[id] = nil
         waitingToWrite[id] = nil
         connectingSince[id] = nil
+        // Commands written since the bulb last answered may have gone nowhere: send them again.
+        let heard = lastHeard[id] ?? .distantPast
+        let lost = (recentlyWritten.removeValue(forKey: id) ?? [])
+            .filter { $0.at > heard && Date().timeIntervalSince($0.at) < Self.lostWindow }
+            .map { $0.item }
+        if !lost.isEmpty {
+            var queue = outbox[id] ?? CommandQueue(freshFor: Self.freshFor)
+            queue.restore(lost)
+            outbox[id] = queue
+        }
         powerState[id] = nil                              // it may change while someone else has it
         lastHeard[id] = nil
+        // Hammer's own disconnects (dropLink, releaseSoon) were already accounted for.
         let ready = readyAt.removeValue(forKey: id)
         if connectedAt.removeValue(forKey: id) != nil {
             if let ready, Date().timeIntervalSince(ready) >= Self.shortLink {
                 backoff.succeeded(id)                     // it was a good link: reconnect right away
-            } else if backoff.canTry(id) {
+            } else {
                 backoff.failed(id)                        // never got going, or dropped soon after: back off if it repeats
             }
         }

@@ -108,6 +108,26 @@ queue.add([0x33], at: at(0))
 queue.add([], at: at(0))
 expect(queue.isEmpty, "packets shorter than 2 bytes are ignored")
 
+// Restoring commands lost with a dying link.
+func item(_ payload: [UInt8], _ seconds: Double) -> CommandQueue.Item {
+    let packet = GoveePacket.make(payload)
+    return CommandQueue.Item(key: UInt16(packet[0]) << 8 | UInt16(packet[1]), packet: packet, at: at(seconds))
+}
+queue = CommandQueue()
+queue.add(GoveePacket.make([0x33, 0x04, 30]), at: at(5))                       // queued after the link died
+queue.restore([item([0x33, 0x01, 0x00], 1), item([0x33, 0x04, 90], 2), item([0x33, 0x05, 0x0D, 255, 0, 0], 3)])
+expect(kinds(queue) == ["off", "color", "brightness 30"],
+       "lost commands go first; a newer brightness wins over the lost one: \(kinds(queue))")
+queue = CommandQueue()
+queue.restore([item([0x33, 0x01, 0x00], 1), item([0x33, 0x01, 0x01], 2)])
+expect(kinds(queue) == ["on"], "only the last of each kind comes back: \(kinds(queue))")
+queue = CommandQueue(freshFor: 15)
+queue.restore([item([0x33, 0x01, 0x00], 0)])
+queue.dropStale(now: at(16))
+expect(queue.isEmpty, "restored commands still expire 15 s after they were asked for")
+queue.restore([])
+expect(queue.isEmpty, "restoring nothing is harmless")
+
 // MARK: Reconnect timing
 
 expect(ConnectBackoff.delay(afterFailures: 0) == 0, "no failures, no wait")

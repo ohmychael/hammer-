@@ -26,6 +26,8 @@ final class Bulb {
     var hasService = true
     var hasControl = true
     var echoesOnControl = false     // repeats every write back on the control channel
+    var silent = false              // takes commands but never answers
+    var deadLink = false            // macOS still says connected, but writes go nowhere
     var power = true
     var brightness = 100
     var pending = false
@@ -109,7 +111,7 @@ simOnDiscoverCharacteristics = { p, service in
     }
 }
 simOnWrite = { p, data, type in
-    guard let bulb = bulbs[p.identifier], p._state == .connected else { return }
+    guard let bulb = bulbs[p.identifier], p._state == .connected, !bulb.deadLink else { return }
     let bytes = [UInt8](data)
     if bytes.count >= 3, bytes[0] == 0x33, bytes[1] == 0x01 { bulb.power = bytes[2] != 0 }
     if bytes.count >= 3, bytes[0] == 0x33, bytes[1] == 0x04 { bulb.brightness = Int(bytes[2]) }
@@ -122,7 +124,7 @@ simOnWrite = { p, data, type in
             gb.peripheral(p, didUpdateValueFor: bulb.control, error: nil)
         }
     }
-    if bytes.count >= 2, bytes[0] == 0xAA, bytes[1] == 0x01, p._notifying.contains(bulb.rx.uuid.uuidString) {
+    if !bulb.silent, bytes.count >= 2, bytes[0] == 0xAA, bytes[1] == 0x01, p._notifying.contains(bulb.rx.uuid.uuidString) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             guard p._state == .connected else { return }
             bulb.rx._value = Data(GoveePacket.make([0xAA, 0x01, bulb.power ? 1 : 0]))
@@ -467,6 +469,68 @@ case "two-bulbs":   // both of your bulbs, one held by the phone
     phoneLetsGo(b)
     run(1)
     check(commands(to: b, since: tap) == ["off"], "the busy one catches up when free")
+
+case "silent":   // takes commands but never answers (replies are optional)
+    let bulb = addBulb()
+    bulb.silent = true
+    startHammer(holding: [bulb])
+    run(40)
+    check(gb.isConnected(bulb.id) && !gb.isAnswering(bulb.id), "keeps the link; menu just doesn't say 'responding'")
+    let tap = Date()
+    gb.send([0x33, 0x01, 0x00], to: bulb.id)
+    run(0.5)
+    check(commands(to: bulb, since: tap) == ["off"] && bulb.power == false, "commands still work")
+    check(connectCalls(bulb) == 1, "never dropped for being quiet: \(connectCalls(bulb)) connects")
+
+case "first-drop":   // setup stalls once, then works: the first failure is retried at once
+    let bulb = addBulb()
+    bulb.discoveryHangs = true
+    startHammer(holding: [bulb])
+    run(9.8)
+    bulb.discoveryHangs = false                                  // behaves from the next link on
+    check(connectCalls(bulb) == 1, "still waiting on the first link")
+    run(1.0)                                                     // the 10 s setup limit passes
+    check(connectCalls(bulb) == 2 && gb.isConnected(bulb.id), "dropped the stuck link and retried at once: \(connectCalls(bulb)) connects")
+
+case "dying-link":   // a tap lands on a link that has died but macOS hasn't noticed yet
+    let bulb = addBulb()
+    startHammer(holding: [bulb])
+    run(3)
+    bulb.deadLink = true
+    gb.send([0x33, 0x01, 0x00], to: bulb.id)
+    run(1)
+    bulb.peripheral._state = .disconnected
+    gb.centralManager(simCentral!, didDisconnectPeripheral: bulb.peripheral, error: NSError(domain: "CBErrorDomain", code: 6))
+    bulb.deadLink = false
+    run(3)
+    check(gb.isConnected(bulb.id), "reconnected")
+    check(bulb.power == false, "the Turn Off is sent again after reconnecting")
+
+case "delivered-then-drop":   // a tap that did arrive isn't repeated when the phone takes the bulb later
+    let bulb = addBulb()
+    startHammer(holding: [bulb])
+    run(3)
+    gb.send([0x33, 0x01, 0x00], to: bulb.id)                     // arrives; the bulb answers "off"
+    run(1)
+    phoneTakes(bulb)
+    bulb.power = true                                            // you turn it back on with the phone
+    run(1)
+    phoneLetsGo(bulb)
+    run(2)
+    check(gb.isConnected(bulb.id), "reconnected")
+    check(bulb.power == true, "Hammer doesn't undo what you did on the phone")
+
+case "blink-thrice":   // Blink to Identify the same neighbor's bulb three times
+    let bulb = addBulb()
+    startHammer(holding: [])
+    run(0.5)
+    for round in 1...3 {
+        let tap = Date()
+        gb.send([0x33, 0x01, 0x01], to: bulb.id)
+        run(0.6)
+        check(commands(to: bulb, since: tap) == ["on"], "round \(round) goes out at once")
+        run(11)                                                  // released after 10 s each time
+    }
 
 default:
     print("unknown scenario"); exit(2)

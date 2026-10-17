@@ -41,7 +41,8 @@ PY
   "$REPO/HammerCore.swift" "$WORK/GB.swift" "$HERE/main.swift" -o "$WORK/scenarios" || exit 1
 ALL="phone phone-long restart-busy first-run storm short-links discovery-once discovery-always
      discovery-hangs incompatible no-service busy-link slider reset bluetooth-off remove
-     remove-connected neighbor blink echo steady two-bulbs"
+     remove-connected neighbor blink echo steady two-bulbs silent first-drop dying-link
+     delivered-then-drop blink-thrice"
 LIST="${*:-$ALL}"
 mkdir -p "$WORK/out"
 for s in $LIST; do

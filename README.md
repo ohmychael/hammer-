@@ -77,7 +77,7 @@ cd ~/Hammer/repo
 swiftc HammerCore.swift Tests/main.swift -o /tmp/hammer-tests && /tmp/hammer-tests
 ```
 
-The Bluetooth scenarios play out 22 situations in real time, such as your phone taking a bulb and letting it go, connections that fail or hang, Bluetooth resetting, and a neighbor's bulb nearby. They check what Hammer does in each one. They need Linux with Swift 5.9+, because the real CoreBluetooth on a Mac gets in the way of the stand-in:
+The Bluetooth scenarios play out 27 situations in real time, such as your phone taking a bulb and letting it go, connections that fail or hang, Bluetooth resetting, and a neighbor's bulb nearby. They check what Hammer does in each one. They need Linux with Swift 5.9+, because the real CoreBluetooth on a Mac gets in the way of the stand-in:
 
 ```
 Tests/Bluetooth/run.sh              # about 2 minutes

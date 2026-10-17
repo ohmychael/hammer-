@@ -68,6 +68,19 @@ struct CommandQueue {
     mutating func removeFirst() {
         if !items.isEmpty { items.removeFirst() }
     }
+
+    /// Puts back commands that were written but may not have arrived (the link died
+    /// under them), ahead of anything queued since. A kind that has a newer command
+    /// waiting stays with the newer one. They keep their original times, so they
+    /// still expire `freshFor` after you asked.
+    mutating func restore(_ lost: [Item]) {
+        var latest: [UInt16: Item] = [:]
+        for item in lost { latest[item.key] = item }               // only the last of each kind
+        let back = lost.filter { item in
+            latest[item.key] == item && !items.contains { $0.key == item.key }
+        }
+        items.insert(contentsOf: back, at: 0)
+    }
 }
 
 // MARK: - Reconnect timing
