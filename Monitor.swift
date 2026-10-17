@@ -336,7 +336,13 @@ enum MonitorDiscovery {
     /// as in m1ddc. Only if it links none does the EDID left on a framebuffer count
     /// (it may still be there after the monitor is unplugged).
     static func ports(in entries: [RegistryEntry], screens: [MonitorScreen]) -> [MonitorPort] {
-        let linked = screens.contains { !$0.builtIn && $0.framebuffer != nil }
+        let framebuffers = Set(entries.filter { $0.isFramebuffer }.map { $0.id })
+        let external = screens.filter { !$0.builtIn }
+        let linked = external.filter { $0.framebuffer.map(framebuffers.contains) ?? false }
+        // The EDID counts only if Hammer can't tell otherwise: no screen list, or an
+        // external screen (not a DisplayLink-style one) that isn't linked to a framebuffer.
+        let trustEDID = screens.isEmpty
+            || (linked.isEmpty && external.contains { $0.direct != false })
         var ports: [MonitorPort] = []
         var framebuffer: RegistryEntry?
         for entry in entries {
@@ -354,13 +360,19 @@ enum MonitorDiscovery {
                 connection: entry.id,
                 framebuffer: framebuffer?.id,
                 name: screen?.name ?? framebuffer?.productName,
-                attached: screen != nil || (!linked && (framebuffer?.hasDisplay ?? false)),
+                attached: screen != nil || (trustEDID && (framebuffer?.hasDisplay ?? false)),
                 throughHDMIConverter: entry.provider == "AppleDCPMCDP29XX",
                 transport: framebuffer?.transport,
                 label: shortLabel(entry.path)))
             framebuffer = nil                // one connection per framebuffer
         }
         return ports.filter { $0.attached } + ports.filter { !$0.attached }
+    }
+
+    /// Whether to also try macOS's default connection: only when a monitor seems
+    /// to be plugged in, since without one it may be the built-in screen's.
+    static func useDefault(ports: [MonitorPort], screens: [MonitorScreen]) -> Bool {
+        ports.contains { $0.attached } || screens.contains { !$0.builtIn && $0.direct != false }
     }
 
     /// "IOService:/AppleARMPE/arm-io@10F00000/AppleT600xIO/dcpext0@…/…" → "dcpext0".
@@ -385,6 +397,7 @@ final class MonitorSet: @unchecked Sendable {
 
     let members: [Member]
     private(set) var lastReadInterrupted = false
+    private(set) var lastReadUnsupported = false   // a monitor said it has no such setting
     init(_ members: [Member]) { self.members = members }
 
     /// Likeliest first: those that answer, then ports with a monitor, the rest,
@@ -398,17 +411,19 @@ final class MonitorSet: @unchecked Sendable {
             + others.filter { $0.port.isDefault }
     }
 
-    /// Where settings go: the monitors that answer. Until one does, every
+    /// Where settings go: the monitors that answer, plus ports where a monitor is
+    /// seen (it may take settings without answering). Until one answers, every
     /// connection, as Hammer always did (a connection without a monitor ignores it).
     var targets: [Member] {
-        let answering = members.filter { $0.answers == true }
-        return answering.isEmpty ? ordered : answering
+        guard members.contains(where: { $0.answers == true }) else { return ordered }
+        return ordered.filter { $0.answers == true || ($0.port.attached && !$0.port.isDefault) }
     }
 
     /// Asks each connection in turn until one gives a value.
     func read(code: UInt8, stop: () -> Bool = { false })
         -> (reading: (current: UInt16, max: UInt16), member: Member)? {
         lastReadInterrupted = false
+        lastReadUnsupported = false
         for (index, member) in ordered.enumerated() {
             if index > 0 && stop() {
                 lastReadInterrupted = true
@@ -420,6 +435,7 @@ final class MonitorSet: @unchecked Sendable {
                 return nil
             }
             member.answers = read.reading != nil
+            if read.answer == .unsupported { lastReadUnsupported = true }
             if let reading = read.reading { return (reading, member) }
         }
         return nil
@@ -467,6 +483,7 @@ struct MonitorCheck {
 
     enum Verdict: Equatable {
         case working
+        case untested                // answers, but a change couldn't be tested
         case unsure                  // answered, then went quiet after the change
         case ignoresChanges          // answers, but brightness didn't move
         case noBrightness            // answers, but says it has no brightness setting
@@ -498,7 +515,8 @@ struct MonitorCheck {
             }
             check.ports.append(test(port, bus: bus, timing: timing, sleep: sleep))
         }
-        if let defaultBus, !check.ports.contains(where: { $0.brightness.reading != nil }) {
+        if let defaultBus, !check.ports.contains(where: { $0.brightness.reading != nil }),
+           MonitorDiscovery.useDefault(ports: check.ports.map { $0.port }, screens: screens) {
             check.ports.append(test(.macDefault, bus: defaultBus, timing: timing, sleep: sleep))
         }
         return check
@@ -527,11 +545,11 @@ struct MonitorCheck {
             link.write(code: DDCCode.brightness, value: current)
             sleep(300_000)
             let now = link.read(code: DDCCode.brightness).reading?.current
-            result.restored = now.map { $0 == current }      // nil: it didn't say
-            if now == current || now == nil { break }
+            result.restored = now.map { close($0, current) }      // nil: it didn't say
+            if result.restored != false { break }
         }
         if let readBack {
-            result.change = readBack.distance(to: target).magnitude <= 2
+            result.change = close(readBack, target)
                 ? .confirmed(from: current, to: target)
                 : .unconfirmed(from: current, to: target, readBack: readBack)
         } else {
@@ -540,19 +558,35 @@ struct MonitorCheck {
         return result
     }
 
+    /// Within 2: some monitors round.
+    private static func close(_ a: UInt16, _ b: UInt16) -> Bool { a.distance(to: b).magnitude <= 2 }
+
     var externalScreens: [MonitorScreen] { screens.filter { !$0.builtIn } }
 
-    var verdict: Verdict {
-        let valued = ports.filter { $0.brightness.reading != nil }
-        if !valued.isEmpty {
-            func has(_ test: (Change) -> Bool) -> Bool { valued.contains { $0.change.map(test) ?? false } }
-            if has({ if case .confirmed = $0 { return true }; return false }) { return .working }
-            if valued.contains(where: { $0.change == nil }) { return .working }    // nothing to test with
-            if has({ if case .noReadBack = $0 { return true }; return false }) { return .unsure }
-            return .ignoresChanges
+    /// The connection the result is about: the best one that answered.
+    var answering: PortResult? {
+        func rank(_ result: PortResult) -> Int {
+            switch result.change {
+            case .confirmed?: return 0
+            case nil: return 1
+            case .noReadBack?: return 2
+            case .unconfirmed?: return 3
+            }
         }
-        if ports.contains(where: { $0.brightness.answer == .unsupported }) { return .noBrightness }
+        return ports.filter { $0.brightness.reading != nil }.min { rank($0) < rank($1) }
+            ?? ports.first { $0.brightness.answer == .unsupported }
+    }
 
+    var verdict: Verdict {
+        if let best = answering {
+            if best.brightness.answer == .unsupported { return .noBrightness }
+            switch best.change {
+            case .confirmed?: return .working
+            case nil: return .untested
+            case .noReadBack?: return .unsure
+            case .unconfirmed?: return .ignoresChanges
+            }
+        }
         let attached = ports.filter { $0.port.attached }
         if attached.isEmpty {
             if externalScreens.isEmpty { return .noMonitor }
@@ -560,17 +594,32 @@ struct MonitorCheck {
         }
         // Nothing known to have a monitor: every connection is a candidate.
         let candidates = attached.isEmpty ? ports : attached
-        if candidates.isEmpty { return .notFound }
+        if candidates.allSatisfy({ $0.port.isDefault }) { return .notFound }   // only macOS's guess was left
         if candidates.allSatisfy({ $0.noService || !$0.brightness.sent }) { return .cantSend }
         return .noAnswer
     }
 
     /// The monitor's name for messages: "the DELL U3818DW", or "the monitor".
     var monitorName: String {
-        let name = ports.first(where: { $0.port.attached && $0.port.name != nil })?.port.name
+        let name = answering?.port.name
+            ?? ports.first(where: { $0.port.attached && $0.port.name != nil })?.port.name
             ?? externalScreens.first(where: { $0.direct != false })?.name
             ?? externalScreens.first?.name
         return name.map { "the \($0)" } ?? "the monitor"
+    }
+
+    /// For the window after the check: what the change test did to the screen.
+    var testNote: String? {
+        let tested = ports.filter {
+            if case .unconfirmed? = $0.change { return false }
+            return $0.change != nil
+        }
+        guard !tested.isEmpty else { return nil }
+        if tested.contains(where: { $0.restored == false }) {
+            return "Hammer changed the brightness for a moment to test it, but it didn't go back exactly. "
+                + "Set it with Hammer's Brightness slider."
+        }
+        return "Hammer changed the brightness for a moment to test it, and put it back."
     }
 
     var text: String {
@@ -638,16 +687,19 @@ struct MonitorCheck {
         switch verdict {
         case .working:
             return ["Result: Working. Hammer can read and change \(name)'s brightness."]
+        case .untested:
+            return ["Result: \(Name) answers Hammer: it can read its brightness, but couldn't test changing it.",
+                    "Move Hammer's Brightness slider and watch the screen."]
         case .unsure:
             return ["Result: \(Name) answered Hammer, but went quiet after Hammer changed its brightness.",
                     "Did the screen get brighter or dimmer for a moment during the check? If so, it works:",
                     "Hammer's sliders will change it, they just may not always start at the right place."]
         case .ignoresChanges:
             return ["Result: \(Name) answers Hammer, but its brightness didn't change.",
-                    "On the monitor, choose Menu → Preset Modes → Standard (some modes lock brightness), then check again."]
+                    "The monitor has probably locked it. On the Dell, in its own menu:"] + Self.unlock
         case .noBrightness:
             return ["Result: \(Name) answers Hammer, but says it has no brightness setting the Mac can change.",
-                    "On the monitor, choose Menu → Preset Modes → Standard, then check again."]
+                    "The monitor has probably locked it. On the Dell, in its own menu:"] + Self.unlock
         case .noMonitor:
             return ["Result: macOS doesn't see an external monitor.",
                     "Check the cable at both ends, and that the monitor is on the right input (Menu → Input Source)."]
@@ -673,6 +725,15 @@ struct MonitorCheck {
         }
     }
 
+    /// What locks brightness on the U3818DW (Dell's user's guide): Uniformity
+    /// Compensation in Standard and Color Temp., Dynamic Contrast in Game and Movie.
+    static let unlock = [
+        "  1. Display → Uniformity Compensation → Off",
+        "  2. Display → Dynamic Contrast → Off",
+        "  3. Color → Preset Modes → Standard",
+        "If the Dell's own Brightness/Contrast setting was grayed out, that was it. Then check again.",
+    ]
+
     static func describe(_ read: DDCRead) -> String {
         switch read.answer {
         case let .value(current, max):
@@ -696,9 +757,11 @@ struct MonitorMenu: Equatable {
     var hints: [String] = []
     var offerCheck = false
 
-    /// `connections`: external DDC connections found; `attached`: of those, with a
-    /// monitor seen; `answers`: whether one gave a value when last asked.
-    static func make(connections: Int, attached: Int, screens: [MonitorScreen], answers: Bool?) -> MonitorMenu {
+    /// `connections`: external DDC connections found (not counting macOS's default);
+    /// `hasDefault`: macOS's default connection is being tried too; `attached`: ports
+    /// with a monitor seen; `answers`: whether one gave a value when last asked.
+    static func make(connections: Int, hasDefault: Bool = false, attached: Int, screens: [MonitorScreen],
+                     answers: Bool?) -> MonitorMenu {
         let external = screens.filter { !$0.builtIn }
         let virtualOnly = !external.isEmpty && external.allSatisfy { $0.direct == false }
         if attached == 0 && external.isEmpty {
@@ -713,11 +776,15 @@ struct MonitorMenu: Equatable {
                                        "USB-C or DisplayPort straight into the Mac."],
                                offerCheck: true)
         }
-        if connections == 0 {
+        if connections == 0 && !hasDefault {
             return MonitorMenu(title: "Can't find the Dell's connection", offerCheck: true)
         }
         var menu = MonitorMenu(sliders: true, offerCheck: true)
-        if answers == false { menu.hints.append("The Dell isn't answering Hammer.") }
+        if connections == 0 && answers != true {
+            menu.hints.append("Can't find the Dell's port; trying the Mac's default.")
+        } else if answers == false {
+            menu.hints.append("The Dell isn't answering Hammer.")
+        }
         if attached == 0 && virtualOnly {
             menu.hints.append("It may be on DisplayLink or AirPlay, which block control.")
         }

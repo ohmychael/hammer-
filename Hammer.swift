@@ -926,6 +926,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var monitors = MonitorSet([])
     private var monitorCount = 0                     // connections found, for the menu
     private var monitorAttached = 0                  // ...with a monitor plugged in
+    private var monitorHasDefault = false            // macOS's default connection is tried too
+    private var monitorMisses = 0                    // reads in a row with no answer
     private var monitorScreens: [MonitorScreen] = []
     private var monitorAnswers: Bool?                // nil until asked
     private var monitorValues: [UInt8: (current: UInt16, max: UInt16)] = [:]
@@ -1173,7 +1175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Catches changes made with the monitor's own buttons, and a monitor that
         // starts answering (e.g. DDC/CI switched on). Asking a silent one is slow,
         // so that's at most once a minute.
-        readMonitor(ifOlderThan: monitorAnswers == false ? 60 : 5)
+        readMonitor(ifOlderThan: monitorMisses >= 2 ? 60 : 5)
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -1617,19 +1619,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func findMonitors() {
         let scan = MacMonitors.scan()
         monitors = scan.monitors
-        monitorCount = monitors.members.count
+        monitorCount = monitors.members.filter { !$0.port.isDefault }.count
+        monitorHasDefault = monitors.members.contains { $0.port.isDefault }
         monitorAttached = monitors.members.filter { $0.port.attached }.count
         monitorScreens = scan.screens
         monitorGeneration += 1
         monitorAnswers = nil
-        monitorReadAt = nil
-        readMonitor(ifOlderThan: 0)
+        monitorMisses = 0
+        monitorReadAt = Date()               // not straight away: just after waking, monitors need a moment
+        let generation = monitorGeneration
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard self.monitorGeneration == generation else { return }
+            self.readMonitor(ifOlderThan: 0)
+        }
     }
 
     /// Reads brightness and contrast in the background and moves the sliders to
     /// match, unless you've just moved one yourself.
     private func readMonitor(ifOlderThan seconds: TimeInterval) {
-        guard monitorCount > 0 else { return }
+        guard monitorCount > 0 || monitorHasDefault else { return }
         if let last = monitorReadAt, Date().timeIntervalSince(last) < seconds { return }
         let started = Date()
         monitorReadAt = started
@@ -1661,6 +1670,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let before = monitorAnswers
         monitorAnswers = answers
+        monitorMisses = answers ? 0 : monitorMisses + 1
         for (code, value) in values {
             if let moved = monitorMoved[code], moved >= started { continue }   // you moved it since: yours wins
             monitorValues[code] = value
@@ -1671,8 +1681,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func addMonitor(to menu: NSMenu) {
         monitorSliders = [:]
-        let state = MonitorMenu.make(connections: monitorCount, attached: monitorAttached,
-                                     screens: monitorScreens, answers: monitorAnswers)
+        let state = MonitorMenu.make(connections: monitorCount, hasDefault: monitorHasDefault,
+                                     attached: monitorAttached, screens: monitorScreens, answers: monitorAnswers)
         if let title = state.title { menu.addItem(label(title)) }
         if state.sliders {
             menu.addItem(monitorSlider("Brightness", code: DDCCode.brightness))
@@ -1733,8 +1743,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let alert = NSAlert()
         alert.messageText = check.verdict == .working ? "The monitor works with Hammer" : "Monitor check"
         alert.informativeText = check.advice.joined(separator: "\n")
-            + (check.ports.contains(where: { $0.change != nil })
-               ? "\n\nHammer changed the brightness for a moment to test it, and put it back." : "")
+            + (check.testNote.map { "\n\n" + $0 } ?? "")
 
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 480, height: 220))
         scroll.hasVerticalScroller = true
@@ -2409,7 +2418,9 @@ enum Hammer {
 
         if args[0] == "get" {
             guard let found = monitors.read(code: code) else {
-                print("The monitor didn't answer. Run: ~/Hammer/Hammer monitor check")
+                print(monitors.lastReadUnsupported
+                      ? "The monitor says it has no such setting."
+                      : "The monitor didn't answer. Run: ~/Hammer/Hammer monitor check")
                 return 1
             }
             print("\(found.reading.current) (max \(found.reading.max))")

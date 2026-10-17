@@ -76,7 +76,9 @@ signing_forget() {
 signing_make() {
   local kc="$1" pwfile="$SIGN_DIR/password" pw tmp ok
   signing_forget "$kc"
-  pw="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)"
+  # 16 random bytes as 32 hex digits. (Not `tr </dev/urandom | head`: where SIGPIPE
+  # is ignored, as under some CI runners, that tr never stops.)
+  pw="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
   [ "${#pw}" = 32 ] || return 1
   ( umask 077; printf '%s' "$pw" > "$pwfile" ) || return 1
   tmp="$(mktemp -d)" || return 1

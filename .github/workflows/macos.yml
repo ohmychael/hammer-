@@ -36,8 +36,9 @@ jobs:
           # Every minute, note what's running, so a step that hangs shows why.
           (while sleep 60; do
              echo "--- $(date +%T)"
-             ps -ax -o etime=,command= | grep -E "swift-frontend|codesign|security|openssl|SecurityAgent|Hammer" \
-               | grep -v grep | cut -c1-160
+             ps -ax -o etime=,command= \
+               | grep -E "swift-frontend|codesign|/security|openssl|SecurityAgent|Hammer|build.sh| tr | od |head|PlistBuddy" \
+               | grep -v grep | cut -c1-160 || true
            done) > /tmp/ps.log 2>&1 &
 
       - name: Tests
@@ -97,7 +98,7 @@ jobs:
           # Compiler errors and the logs, as annotations (readable without the full logs).
           for log in /tmp/tests-build.log /tmp/app-build.log; do
             [ -f "$log" ] || continue
-            grep -E "error:" "$log" | head -10 | while IFS= read -r line; do echo "::error::$line"; done
+            { grep -E "error:" "$log" || true; } | head -10 | while IFS= read -r line; do echo "::error::$line"; done
           done
           for file in /tmp/check.txt /tmp/install1.log /tmp/req1.txt /tmp/sign2.log /tmp/req2.txt /tmp/ps.log; do
             [ -f "$file" ] || continue

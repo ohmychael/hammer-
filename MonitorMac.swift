@@ -62,16 +62,14 @@ enum MacMonitors {
                     MonitorSet.Member(port: port, link: DDCLink(bus: AVServiceBus($0), ways: port.ways))
                 }
             }
-            // Only with an external monitor around: otherwise it can be the built-in screen's.
-            if hasExternal, let service = defaultService {
+            // Only with a monitor around: otherwise it can be the built-in screen's.
+            if let service = defaultService,
+               MonitorDiscovery.useDefault(ports: members.map { $0.port }, screens: screens) {
                 let port = MonitorPort.macDefault
                 members.append(MonitorSet.Member(port: port, link: DDCLink(bus: AVServiceBus(service), ways: port.ways)))
             }
             return MonitorSet(members)
         }
-
-        /// An external connection was found, or macOS shows an external screen.
-        var hasExternal: Bool { !services.isEmpty || screens.contains { !$0.builtIn } }
     }
 
     /// Reads the registry and the screen list. Call on the main thread (it asks NSScreen).
@@ -220,6 +218,6 @@ enum MacMonitors {
     static func check(_ scan: Scan) -> MonitorCheck {
         MonitorCheck.run(mac: mac(), screens: scan.screens, entries: scan.entries,
                          bus: { id in scan.services[id].map { AVServiceBus($0) } },
-                         defaultBus: scan.hasExternal ? scan.defaultService.map { AVServiceBus($0) } : nil)
+                         defaultBus: scan.defaultService.map { AVServiceBus($0) })    // run() decides whether to use it
     }
 }
