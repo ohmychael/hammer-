@@ -55,7 +55,7 @@ cat > "$AGENTS/local.hammer.plist" <<PLIST
 </plist>
 PLIST
 
-# 5. Check for updates at login and every hour.
+# 5. Check for updates at login and every few minutes (Hammer also asks every 2 minutes).
 step "Turning on automatic updates"
 cat > "$AGENTS/local.hammer.updater.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -66,7 +66,7 @@ cat > "$AGENTS/local.hammer.updater.plist" <<PLIST
   <key>ProgramArguments</key>
   <array><string>/bin/bash</string><string>$DIR/update.sh</string></array>
   <key>RunAtLoad</key><true/>
-  <key>StartInterval</key><integer>3600</integer>
+  <key>StartInterval</key><integer>300</integer>
   <key>StandardOutPath</key><string>$HOME/Hammer/update.log</string>
   <key>StandardErrorPath</key><string>$HOME/Hammer/update.log</string>
 </dict>

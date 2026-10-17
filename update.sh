@@ -46,7 +46,7 @@ if [ "$installed" = "$latest" ]; then
   exit 0
 fi
 
-# Don't retry a version that already failed to build every hour; wait for a fix
+# Don't keep retrying a version that already failed to build; wait for a fix
 # (or a manual check).
 if ! $MANUAL && [ "$(cat "$FAILED" 2>/dev/null)" = "$latest" ]; then
   echo "$(date): $latest failed to build before; waiting for a newer version"

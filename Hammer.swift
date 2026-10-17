@@ -678,6 +678,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Task { @MainActor in delegate.bluetoothChanged() }
         }
         GoveeBluetooth.shared.start()        // first time: macOS asks to allow Bluetooth
+        scheduleUpdateChecks()
         rescanLights()                       // also builds the menu
 
         // Pick up a sleep timer set before Hammer restarted (e.g. for an update),
@@ -794,7 +795,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(hint("Open this menu anywhere: Control-Option-H"))
         menu.addItem(action("Check for Updates", #selector(checkForUpdates)))
-        menu.addItem(hint("Version \(Self.version)"))
+        menu.addItem(hint("Version \(Self.version) · updates automatically"))
         menu.addItem(NSMenuItem(title: "Quit Hammer", action: #selector(NSApplication.terminate(_:)),
                                 keyEquivalent: "q"))
         menu.delegate = self
@@ -818,6 +819,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var menuIsOpen = false
     private var menuNeedsRebuild = false
+    private var updateTimer: Timer?
+
+    /// Asks the background updater to look for a new version every 2 minutes.
+    /// It's quiet unless it installs something, then shows "Hammer updated".
+    private func scheduleUpdateChecks() {
+        let timer = Timer(timeInterval: 120, repeats: true) { _ in
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            task.arguments = ["kickstart", "gui/\(getuid())/local.hammer.updater"]
+            try? task.run()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        updateTimer = timer
+    }
 
     /// Rebuilds now, or once the menu closes if it's open (so it doesn't change under the pointer).
     private func rebuildMenuSoon() {

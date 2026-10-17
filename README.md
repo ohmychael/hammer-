@@ -25,7 +25,7 @@ This builds Hammer on your Mac (it installs Apple's command-line developer tools
 
 ## Updates
 
-Hammer checks this repo at login and every hour. When there's a new commit it rebuilds and restarts itself. If a new version fails to build, the current one keeps running. You can also choose **Check for Updates** in the menu. The log is at `~/Hammer/update.log`.
+Hammer checks this repo at login and every 2 minutes. When there's a new commit it rebuilds and restarts itself. If a new version fails to build, the current one keeps running. You can also choose **Check for Updates** in the menu. The log is at `~/Hammer/update.log`.
 
 ## Terminal commands
 
