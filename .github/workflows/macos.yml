@@ -3,7 +3,8 @@
 # it reaches your Mac. Your Mac still runs the tests itself before installing.
 #
 # The runner has no monitor or bulbs: this checks that everything builds, the
-# tests pass, the monitor check runs without crashing, and signing works.
+# tests pass, the monitor check runs without crashing, and signing works (and
+# gives the same signature the second time, so macOS keeps permissions).
 # Results also show as annotations on the commit.
 
 name: macOS build
@@ -18,60 +19,84 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 50
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Tools
         run: |
           sw_vers
           uname -m
           swiftc --version
+          sysctl -n hw.ncpu
+          # Every minute, note what's running, so a step that hangs shows why.
+          (while sleep 60; do
+             echo "--- $(date +%T)"
+             ps -ax -o etime=,command= | grep -E "swift-frontend|codesign|security|openssl|SecurityAgent|Hammer" \
+               | grep -v grep | cut -c1-160
+           done) > /tmp/ps.log 2>&1 &
 
       - name: Tests
+        timeout-minutes: 10
         run: |
+          start=$(date +%s)
           swiftc -O HammerCore.swift Monitor.swift Deliveries.swift Tests/main.swift \
             -o /tmp/hammer-tests 2>&1 | tee /tmp/tests-build.log
           /tmp/hammer-tests | tee /tmp/tests.log
-          echo "::notice title=Tests::$(tail -1 /tmp/tests.log)"
+          echo "::notice title=Tests::$(tail -1 /tmp/tests.log) (built and run in $(( $(date +%s) - start )) s)"
 
       - name: Build the app
+        timeout-minutes: 15
         run: |
+          start=$(date +%s)
           swiftc -parse-as-library -O Hammer.swift HammerCore.swift Monitor.swift MonitorMac.swift \
             Deliveries.swift DeliveryAlerts.swift -o /tmp/Hammer 2>&1 | tee /tmp/app-build.log
+          echo "::notice title=App::built in $(( $(date +%s) - start )) s"
 
       - name: Monitor commands (there's no monitor here)
+        timeout-minutes: 3
         run: |
           set +e
-          /tmp/Hammer monitor check > /tmp/check.txt 2>&1; echo "exit $?" >> /tmp/check.txt
-          /tmp/Hammer get brightness >> /tmp/check.txt 2>&1; echo "exit $?" >> /tmp/check.txt
-          /tmp/Hammer set brightness 40 >> /tmp/check.txt 2>&1; echo "exit $?" >> /tmp/check.txt
+          limit() { perl -e 'alarm shift; exec @ARGV' "$@"; }     # a hang counts as a failure (exit 142)
+          limit 60 /tmp/Hammer monitor check > /tmp/check.txt 2>&1; echo "exit $?" >> /tmp/check.txt
+          limit 30 /tmp/Hammer get brightness >> /tmp/check.txt 2>&1; echo "exit $?" >> /tmp/check.txt
+          limit 30 /tmp/Hammer set brightness 40 >> /tmp/check.txt 2>&1; echo "exit $?" >> /tmp/check.txt
           cat /tmp/check.txt
-          # Exit 1 means "no working monitor" (expected here); a crash gives 134 or 139.
-          if grep -qE "^exit (13[0-9]|1[4-9][0-9]|2[0-9][0-9])$" /tmp/check.txt; then exit 1; fi
+          # Exit 1 means "no working monitor" (expected here); a crash or hang gives 128 or more.
+          if grep -qE "^exit (1[2-9][0-9]|2[0-9][0-9])$" /tmp/check.txt; then exit 1; fi
 
-      - name: Full install with signing, twice
+      - name: Install with signing
+        timeout-minutes: 20
         run: |
-          bash build.sh 2>&1 | tee /tmp/install1.log
-          codesign -d -r- ~/Applications/Hammer.app 2>&1 | grep designated > /tmp/req1.txt
-          bash build.sh 2>&1 | tee /tmp/install2.log
-          codesign -d -r- ~/Applications/Hammer.app 2>&1 | grep designated > /tmp/req2.txt
-          cat /tmp/req1.txt /tmp/req2.txt
+          set -o pipefail
+          perl -e 'alarm shift; exec @ARGV' 1100 bash build.sh 2>&1 \
+            | while IFS= read -r line; do echo "$(date +%T) $line"; done | tee /tmp/install1.log
           grep -q "Signed with Hammer Local Signing" /tmp/install1.log
-          grep -q "Signed with Hammer Local Signing" /tmp/install2.log
-          cmp /tmp/req1.txt /tmp/req2.txt
+          codesign -d -r- ~/Applications/Hammer.app 2>&1 | grep designated | tee /tmp/req1.txt
           pkill -x Hammer || true
+
+      - name: Sign again (the way the next update does)
+        timeout-minutes: 5
+        run: |
+          rm -rf /tmp/Hammer2.app && cp -R ~/Applications/Hammer.app /tmp/Hammer2.app
+          perl -e 'alarm shift; exec @ARGV' 240 bash -c 'source ./signing.sh && sign_app /tmp/Hammer2.app' \
+            | tee /tmp/sign2.log
+          grep -q "Signed with Hammer Local Signing" /tmp/sign2.log
+          codesign -d -r- /tmp/Hammer2.app 2>&1 | grep designated | tee /tmp/req2.txt
+          cmp /tmp/req1.txt /tmp/req2.txt
+          # The signing keychain must not be left on the search list.
+          ! security list-keychains -d user | grep -q hammer-signing
 
       - name: Report
         if: always()
         run: |
-          # Compiler errors and the monitor check, as annotations (readable without the logs).
+          # Compiler errors and the logs, as annotations (readable without the full logs).
           for log in /tmp/tests-build.log /tmp/app-build.log; do
             [ -f "$log" ] || continue
             grep -E "error:" "$log" | head -10 | while IFS= read -r line; do echo "::error::$line"; done
           done
-          for file in /tmp/check.txt /tmp/req1.txt /tmp/install1.log; do
+          for file in /tmp/check.txt /tmp/install1.log /tmp/req1.txt /tmp/sign2.log /tmp/req2.txt /tmp/ps.log; do
             [ -f "$file" ] || continue
-            body="$(tail -60 "$file" | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            body="$(tail -40 "$file" | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
             echo "::notice title=$(basename "$file")::$body"
           done
