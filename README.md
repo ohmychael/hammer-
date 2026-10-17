@@ -2,7 +2,7 @@
 
 A small Mac menu bar app for the desk:
 
-- **Dell monitor** — real brightness and contrast over DDC/CI (like MonitorControl), for Apple Silicon Macs.
+- **Dell monitor** — real brightness and contrast over DDC/CI (like MonitorControl), for Apple Silicon Macs. See [Monitor](#monitor).
 - **Govee lights** — on/off, brightness, color and white presets, one at a time or all together. Reaches each light the best way available:
   - **Wi-Fi** for lights with LAN Control turned on in the Govee Home app
   - **Bluetooth** for nearby bulbs without LAN Control (H6004/H6006/H6008/H6009 family)
@@ -14,6 +14,17 @@ A small Mac menu bar app for the desk:
 - **Sleep timer** (in All Lights) — pick 5 minutes to 8 hours on a slider and all your lights turn off then. The Mac stays awake until the timer runs out (closing the lid still puts it to sleep), and the timer survives Hammer restarting.
 
 Open the menu from the hammer icon in the menu bar, by pressing **Control-Option-H**, or by opening Hammer from Apps or Spotlight.
+
+## Monitor
+
+Hammer finds which of the Mac's display connections the monitor is actually on (a 14" or 16" MacBook Pro has several), the same way m1ddc and MonitorControl do. The Brightness and Contrast sliders start at the monitor's real values and follow changes made with its own buttons each time you open the menu.
+
+- **USB-C or DisplayPort, straight into the Mac**, works best.
+- **HDMI** works on most Macs. On M1-era Macs the HDMI port goes through a converter chip, and Hammer talks through it the way m1ddc does.
+- **DisplayLink docks, AirPlay and Sidecar** can't carry brightness control. Hammer says so in the menu.
+- **DDC/CI** has to be on in the monitor's own menu. On the Dell U3818DW: Menu → Others → DDC/CI → On.
+
+If the monitor doesn't answer, the menu says so and offers **Check Monitor Connection…**. It tests each step: whether macOS sees the monitor, which connection it's on, whether Hammer's messages go out, whether the monitor answers, and whether a change actually takes effect. It moves the brightness for a moment and puts it back. Then it tells you what to fix, and **Copy Report** copies the details. The same check runs in Terminal with `~/Hammer/Hammer monitor check`.
 
 ## Bluetooth bulbs and your phone
 
@@ -70,6 +81,7 @@ Hammer checks this repo at login and every 2 minutes. When there's a new commit 
 ```
 ~/Hammer/Hammer get brightness          read a monitor setting
 ~/Hammer/Hammer set brightness 40       change it (brightness, contrast, volume, or a hex VCP code)
+~/Hammer/Hammer monitor check           if the monitor doesn't respond: tests each step and says why
 ~/Hammer/Hammer govee list              find Wi-Fi and cloud lights
 ~/Hammer/Hammer govee on | off          all Wi-Fi and cloud lights
 ~/Hammer/Hammer govee key <API key>     save a Govee cloud API key
@@ -83,9 +95,11 @@ Bluetooth bulbs are controlled from the menu bar app only.
 |---|---|
 | `Hammer.swift` | The app: menu, monitor, Govee Wi-Fi/cloud/Bluetooth |
 | `HammerCore.swift` | Logic that needs only Foundation: packets, the Bluetooth command queue, name parsing |
+| `Monitor.swift` | Monitor control logic (Foundation only): DDC/CI messages, finding the monitor's connection, the monitor check |
+| `MonitorMac.swift` | Monitor control on the Mac: reads IOKit's display registry and sends the bytes |
 | `Deliveries.swift` | Delivery alerts logic (Foundation only): which emails are deliveries, reading Gmail over IMAP |
 | `DeliveryAlerts.swift` | Delivery alerts on the Mac: secure connection to Gmail, Keychain, notifications |
-| `Tests/main.swift` | Tests for `HammerCore.swift`, run before every install |
+| `Tests/main.swift` | Tests for `HammerCore.swift`, `Monitor.swift` and `Deliveries.swift`, run before every install. The monitor tests use stand-in monitors and Macs: picky, silent, locked and broken monitors, empty ports, the M1 HDMI converter, DisplayLink |
 | `Tests/Deliveries/` | Delivery alerts end to end: fake Gmail and Google script servers, and the script itself in node |
 | `Tests/Bluetooth/` | Bluetooth scenarios (phone grabs the bulb, failures, resets…) against a stand-in CoreBluetooth; run on Linux |
 | `build.sh` | Compiles and installs `~/Applications/Hammer.app` |
@@ -93,6 +107,7 @@ Bluetooth bulbs are controlled from the menu bar app only.
 | `Tests/Signing/` | Tests for `signing.sh` with stand-ins for macOS's `security` and `codesign` |
 | `update.sh` | Pulls the latest commit and rebuilds |
 | `install-hammer.sh` | One-time setup |
+| `.github/workflows/macos.yml` | Builds Hammer on a real Apple Silicon Mac for every push: tests, the app, the monitor check, and signing twice to confirm it stays the same |
 
 ## Uninstall
 
@@ -107,7 +122,7 @@ security delete-generic-password -s local.hammer.gmail   # delivery alerts' key 
 
 ```
 cd ~/Hammer/repo
-swiftc HammerCore.swift Deliveries.swift Tests/main.swift -o /tmp/hammer-tests && /tmp/hammer-tests
+swiftc HammerCore.swift Monitor.swift Deliveries.swift Tests/main.swift -o /tmp/hammer-tests && /tmp/hammer-tests
 ```
 
 The Bluetooth scenarios play out 27 situations in real time, such as your phone taking a bulb and letting it go, connections that fail or hang, Bluetooth resetting, and a neighbor's bulb nearby. They check what Hammer does in each one. They need Linux with Swift 5.9+, because the real CoreBluetooth on a Mac gets in the way of the stand-in:

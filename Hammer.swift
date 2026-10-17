@@ -1636,8 +1636,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     values[DDCCode.contrast] = contrast
                 }
             }
-            let answers = set.anyAnswers
-            Task { @MainActor in self.monitorWasRead(values, answers: answers, generation: generation) }
+            let found = values, answers = set.anyAnswers
+            Task { @MainActor in self.monitorWasRead(found, answers: answers, generation: generation) }
         }
     }
 
@@ -1729,7 +1729,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let alert = NSAlert()
         alert.messageText = check.verdict == .working ? "The monitor works with Hammer" : "Monitor check"
         alert.informativeText = check.advice.joined(separator: "\n")
-            + (check.ports.contains { $0.change != nil }
+            + (check.ports.contains(where: { $0.change != nil })
                ? "\n\nHammer changed the brightness for a moment to test it, and put it back." : "")
 
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 480, height: 220))
