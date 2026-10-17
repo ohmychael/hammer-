@@ -775,7 +775,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if lights.count > 1 { menu.addItem(lightItem(nil)) }    // "All Lights"
             for light in lights { menu.addItem(lightItem(light)) }
         }
-        if !lights.isEmpty { menu.addItem(sleepTimerItem()) }
         if !others.isEmpty { menu.addItem(otherLightsItem(others)) }
         menu.addItem(action("Rescan Lights", #selector(rescanLights)))
 
@@ -940,12 +939,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             submenu.addItem(action("Remove from My Lights", #selector(removeFromMyLights(_:)), lightID: id))
         }
 
-        let title: String
+        // The sleep timer turns off all your lights, so it lives in All Lights —
+        // or in the one light's menu when there's only one (and no All Lights).
+        let hasTimer = light == nil || lights.count == 1
+        if hasTimer { addSleepTimer(to: submenu) }
+
+        var title: String
         if let light {
             title = light.routeLabel.isEmpty ? light.name : "\(light.name) · \(light.routeLabel)"
         } else {
             title = "All Lights (\(lights.count))"
         }
+        if hasTimer, let end = timerEnd { title += " · off at \(clockTime(end))" }
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.submenu = submenu
         return item
@@ -1041,23 +1046,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return formatter.string(from: date)
     }
 
-    private func sleepTimerItem() -> NSMenuItem {
-        let submenu = NSMenu()
+    /// The sleep timer section at the bottom of All Lights.
+    private func addSleepTimer(to submenu: NSMenu) {
+        submenu.addItem(.separator())
+        submenu.addItem(label("Sleep Timer"))
         if let end = timerEnd {
-            submenu.addItem(label("Your lights go off at \(clockTime(end))"))
+            submenu.addItem(hint("Your lights go off at \(clockTime(end))."))
             submenu.addItem(action("Cancel Timer", #selector(cancelTimer)))
-            submenu.addItem(.separator())
         }
         submenu.addItem(timerPicker())
         submenu.addItem(action(timerEnd == nil ? "Start Timer" : "Restart Timer", #selector(startTimer)))
-        submenu.addItem(.separator())
-        submenu.addItem(hint("Turns off all your lights. The Mac stays awake"))
-        submenu.addItem(hint("until then, but closing the lid still sleeps it."))
-
-        let title = timerEnd.map { "Sleep Timer · off at \(clockTime($0))" } ?? "Sleep Timer"
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.submenu = submenu
-        return item
+        submenu.addItem(hint("The Mac stays awake until then, but"))
+        submenu.addItem(hint("closing the lid still puts it to sleep."))
     }
 
     /// A slider that snaps to the times in `timerSteps`, with the choice shown above it.
