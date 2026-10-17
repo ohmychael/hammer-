@@ -58,6 +58,9 @@ enum DeliveryMail {
         let subject = headers["subject"] ?? ""
         let from = headers["from"] ?? ""
         guard !isBounce(from: from), let kind = kind(ofSubject: subject) else { return nil }
+        // "Your message was delivered", "Your report has been delivered": the wording alone
+        // isn't enough. It has to come from a known store or carrier, or be about a package.
+        if kind == .delivered && knownShipper(from: from) == nil && !mentionsAPackage(subject) { return nil }
         return Delivery(kind: kind, store: store(from: from), item: kind == .delivered ? item(in: subject) : nil,
                         subject: subject, messageID: headers["message-id"],
                         date: headers["date"].flatMap(parseDate), uid: uid)
@@ -137,7 +140,17 @@ enum DeliveryMail {
     }
 
     /// The store or carrier, from the sender.
-    static func store(from raw: String) -> String {
+    /// Stores and carriers whose "delivered" emails need no package word.
+    static let knownShippers: [String: String] = [
+        "amazon": "Amazon", "ebay": "eBay", "ups": "UPS", "usps": "USPS", "fedex": "FedEx", "dhl": "DHL",
+        "ontrac": "OnTrac", "lasership": "LaserShip", "walmart": "Walmart", "target": "Target",
+        "bestbuy": "Best Buy", "apple": "Apple", "etsy": "Etsy", "shopify": "Shop", "costco": "Costco",
+        "homedepot": "Home Depot", "lowes": "Lowe's", "wayfair": "Wayfair", "chewy": "Chewy", "temu": "Temu",
+        "shein": "SHEIN", "aliexpress": "AliExpress", "backmarket": "Back Market", "nike": "Nike",
+    ]
+
+    /// The sender's email domain, lowercased: "Amazon.com <a@email.amazon.com>" → "email.amazon.com".
+    private static func domain(of raw: String) -> String {
         let from = HeaderText.decode(raw)
         let address: String
         if let lt = from.lastIndex(of: "<"), let gt = from.lastIndex(of: ">"), lt < gt {
@@ -145,20 +158,32 @@ enum DeliveryMail {
         } else {
             address = from.trimmingCharacters(in: .whitespaces)
         }
-        let domain = address.split(separator: "@").last.map { $0.lowercased() } ?? ""
-        // A brand counts when it's a whole part of the domain: "email.ups.com" is UPS, "groups.com" isn't.
-        let labels = domain.split(separator: ".").dropLast().map(String.init)
-        let known: [String: String] = [
-            "amazon": "Amazon", "ebay": "eBay", "ups": "UPS", "usps": "USPS", "fedex": "FedEx", "dhl": "DHL",
-            "ontrac": "OnTrac", "lasership": "LaserShip", "walmart": "Walmart", "target": "Target",
-            "bestbuy": "Best Buy", "apple": "Apple", "etsy": "Etsy", "shopify": "Shop", "costco": "Costco",
-            "homedepot": "Home Depot", "lowes": "Lowe's", "wayfair": "Wayfair", "chewy": "Chewy", "temu": "Temu",
-            "shein": "SHEIN", "aliexpress": "AliExpress", "backmarket": "Back Market", "nike": "Nike",
-        ]
+        guard address.contains("@") else { return "" }
+        return address.split(separator: "@").last.map { $0.lowercased() } ?? ""
+    }
+
+    /// The store or carrier's name if the email comes from one Hammer knows, by its
+    /// domain ("email.ups.com" is UPS, "groups.com" isn't). Display names don't count:
+    /// anyone can call themselves "Amazon".
+    static func knownShipper(from raw: String) -> String? {
+        let domain = domain(of: raw)
         if domain == "shop.app" || domain.hasSuffix(".shop.app") { return "Shop" }
-        if let brand = labels.reversed().first(where: { known[$0] != nil }), let name = known[brand] {
-            return name
-        }
+        let labels = domain.split(separator: ".").dropLast().map(String.init)
+        return labels.reversed().first(where: { knownShippers[$0] != nil }).flatMap { knownShippers[$0] }
+    }
+
+    /// Whether the subject is about a package rather than, say, a message or report.
+    static func mentionsAPackage(_ subject: String) -> Bool {
+        let words = Set(tidy(subject).lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init))
+        return !words.isDisjoint(with: ["package", "packages", "parcel", "parcels", "order", "orders", "shipment",
+                                        "shipments", "item", "items", "purchase", "purchases", "delivery", "box"])
+    }
+
+    static func store(from raw: String) -> String {
+        if let known = knownShipper(from: raw) { return known }
+        let from = HeaderText.decode(raw)
+        let domain = domain(of: raw)
+        let labels = domain.split(separator: ".").dropLast().map(String.init)
         // Otherwise the sender's name, or failing that the domain.
         if let lt = from.lastIndex(of: "<") {
             let name = from[..<lt].trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))

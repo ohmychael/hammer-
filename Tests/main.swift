@@ -336,6 +336,31 @@ expect(DeliveryMail.classify(headers: ["subject": "Undeliverable: Your order #12
        "a bounce of your own email isn't a delivery problem")
 expect(DeliveryMail.classify(headers: ["subject": "Undeliverable: Re: your order",
                                        "from": "postmaster@outlook.com"], uid: 1) == nil, "Outlook bounce")
+// "Delivered" wording that isn't about a package: needs a known store/carrier or a package word.
+func classified(_ subject: String, from: String) -> Delivery.Kind? {
+    DeliveryMail.classify(headers: ["subject": subject, "from": from], uid: 1)?.kind
+}
+expect(classified("Your message was delivered", from: "Slack <no-reply@slack.com>") == nil, "a message, not a package")
+expect(classified("Your report has been delivered", from: "Reports <reports@analytics.example.com>") == nil, "a report")
+expect(classified("Delivered: Q3 results deck", from: "Sam <sam@company.com>") == nil, "a colleague's 'Delivered:'")
+expect(classified("Your flowers were delivered", from: "Amazon <x@evil.example.com>") == nil,
+       "calling yourself Amazon isn't enough; the domain counts")
+expect(classified(#"Delivered: "Lamp""#, from: "Target <orders@target.com>") == .delivered, "known store, no package word")
+expect(classified(#"Delivered: "Anker 735""#, from: "Amazon.com <shipment-tracking@amazon.com>") == .delivered, "Amazon")
+expect(classified("Your package was delivered", from: "Tiny Shop <hello@tinyshop.co>") == .delivered,
+       "unknown shop, but about a package")
+expect(classified("Your order has been delivered", from: "orders@someshop.com") == .delivered, "unknown shop, an order")
+expect(classified("USPS® Item Delivered, In/At Mailbox", from: "USPS <auto-reply@usps.com>") == .delivered, "USPS")
+expect(classified(#"Delivered: "Lamp""#, from: "Tiny Shop <hello@tinyshop.co>") == nil,
+       "trade-off: an unknown shop's 'Delivered: \"Lamp\"' is skipped")
+expect(classified("UPS Update: Delivery Attempted", from: "someone@example.com") == .problem,
+       "delivery problems already need delivery wording")
+expect(DeliveryMail.knownShipper(from: "\"eBay\" <ebay@ebay.com>") == "eBay"
+       && DeliveryMail.knownShipper(from: "Google Groups <noreply@groups.com>") == nil
+       && DeliveryMail.knownShipper(from: "ups") == nil, "known shippers by domain")
+expect(DeliveryMail.mentionsAPackage("📦 Your package was delivered") && !DeliveryMail.mentionsAPackage("Your message was delivered")
+       && !DeliveryMail.mentionsAPackage("Boxing day sale"), "package words, whole words only")
+
 let problem = DeliveryMail.classify(headers: ["subject": "UPS Update: Delivery Attempted", "from": "UPS <mcinfo@ups.com>"], uid: 1)
 expect(problem?.title == "Delivery problem · UPS" && problem?.item == nil, "problem text")
 
