@@ -667,6 +667,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         GoveeBluetooth.shared.start()        // first time: macOS asks to allow Bluetooth
         rescanLights()                       // also builds the menu
 
+        // Pick up a sleep timer set before Hammer restarted (e.g. for an update),
+        // unless it ran out more than an hour ago.
+        if let end = timerEnd, Date().timeIntervalSince(end) > 3600 { timerEnd = nil }
+        armTimer()
+
         // Pick up the monitor automatically when it's plugged in or unplugged.
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
                                                name: NSApplication.didChangeScreenParametersNotification,
@@ -765,15 +770,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(hint("when nearby. Close the Govee app on your phone first,"))
             menu.addItem(hint("since a bulb talks to one device at a time."))
             menu.addItem(hint("Wi-Fi lights: turn on LAN Control in the Govee app,"))
-            menu.addItem(hint("then choose Rescan Lights. Or add a cloud key below."))
+            menu.addItem(hint("then choose Rescan Lights."))
         } else {
             if lights.count > 1 { menu.addItem(lightItem(nil)) }    // "All Lights"
             for light in lights { menu.addItem(lightItem(light)) }
         }
+        if !lights.isEmpty { menu.addItem(sleepTimerItem()) }
         if !others.isEmpty { menu.addItem(otherLightsItem(others)) }
         menu.addItem(action("Rescan Lights", #selector(rescanLights)))
-        menu.addItem(action(Govee.apiKey == nil ? "Add Govee Cloud Key…" : "Change Govee Cloud Key…",
-                            #selector(addCloudKey)))
 
         menu.addItem(.separator())
         menu.addItem(hint("Open this menu anywhere: Control-Option-H"))
@@ -1007,6 +1011,127 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 Govee.setColor(light, red: red, green: green, blue: blue)
             }
         }
+    }
+
+    // MARK: Sleep timer
+
+    /// Times on the timer slider, in minutes.
+    private static let timerSteps = [5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 360, 480]
+    private var timerChoice = 30                      // what the slider is set to
+    private var timerChoiceLabel: NSTextField?
+    private var timerCheck: Timer?
+    private var stayAwake: NSObjectProtocol?
+
+    /// When your lights go off. Saved so a restart (like an update) keeps it.
+    private var timerEnd: Date? {
+        get { UserDefaults.standard.object(forKey: "lightsOffAt") as? Date }
+        set { UserDefaults.standard.set(newValue, forKey: "lightsOffAt") }
+    }
+
+    static func describe(minutes: Int) -> String {
+        if minutes < 60 { return "\(minutes) min" }
+        let hours = minutes / 60, rest = minutes % 60
+        return rest == 0 ? "\(hours) hr" : "\(hours) hr \(rest) min"
+    }
+
+    private func clockTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
+    private func sleepTimerItem() -> NSMenuItem {
+        let submenu = NSMenu()
+        if let end = timerEnd {
+            submenu.addItem(label("Your lights go off at \(clockTime(end))"))
+            submenu.addItem(action("Cancel Timer", #selector(cancelTimer)))
+            submenu.addItem(.separator())
+        }
+        submenu.addItem(timerPicker())
+        submenu.addItem(action(timerEnd == nil ? "Start Timer" : "Restart Timer", #selector(startTimer)))
+        submenu.addItem(.separator())
+        submenu.addItem(hint("Turns off all your lights. The Mac stays awake"))
+        submenu.addItem(hint("until then, but closing the lid still sleeps it."))
+
+        let title = timerEnd.map { "Sleep Timer · off at \(clockTime($0))" } ?? "Sleep Timer"
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.submenu = submenu
+        return item
+    }
+
+    /// A slider that snaps to the times in `timerSteps`, with the choice shown above it.
+    private func timerPicker() -> NSMenuItem {
+        let steps = Self.timerSteps
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 54))
+
+        let text = NSTextField(labelWithString: "Turn off in \(Self.describe(minutes: timerChoice))")
+        text.frame = NSRect(x: 16, y: 32, width: 228, height: 16)
+        timerChoiceLabel = text
+
+        let slider = NSSlider(value: Double(steps.firstIndex(of: timerChoice) ?? 4),
+                              minValue: 0, maxValue: Double(steps.count - 1),
+                              target: self, action: #selector(timerSliderMoved(_:)))
+        slider.numberOfTickMarks = steps.count
+        slider.allowsTickMarkValuesOnly = true
+        slider.isContinuous = true
+        slider.frame = NSRect(x: 16, y: 4, width: 228, height: 26)
+
+        view.addSubview(text)
+        view.addSubview(slider)
+        let item = NSMenuItem()
+        item.view = view
+        return item
+    }
+
+    @objc private func timerSliderMoved(_ slider: NSSlider) {
+        let index = min(max(Int(slider.doubleValue.rounded()), 0), Self.timerSteps.count - 1)
+        timerChoice = Self.timerSteps[index]
+        timerChoiceLabel?.stringValue = "Turn off in \(Self.describe(minutes: timerChoice))"
+    }
+
+    @objc private func startTimer() {
+        timerEnd = Date().addingTimeInterval(TimeInterval(timerChoice * 60))
+        armTimer()
+        rebuildMenu()
+    }
+
+    @objc private func cancelTimer() {
+        timerEnd = nil
+        armTimer()
+        rebuildMenu()
+    }
+
+    /// Checks the clock every 20 seconds rather than setting one long timer,
+    /// because a long timer can fire late if the Mac sleeps. While a timer is
+    /// set, idle sleep is held off so the Mac is awake to send the command.
+    private func armTimer() {
+        timerCheck?.invalidate()
+        timerCheck = nil
+        if let activity = stayAwake {
+            ProcessInfo.processInfo.endActivity(activity)
+            stayAwake = nil
+        }
+        guard timerEnd != nil else { return }
+
+        stayAwake = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled],
+                                                           reason: "Hammer sleep timer")
+        let check = Timer(timeInterval: 20, repeats: true) { [weak self] _ in
+            guard let delegate = self else { return }
+            Task { @MainActor in delegate.checkTimer() }
+        }
+        RunLoop.main.add(check, forMode: .common)     // keeps ticking while the menu is open
+        timerCheck = check
+        checkTimer()
+    }
+
+    func checkTimer() {
+        guard let end = timerEnd, Date() >= end else { return }
+        let targets = lights
+        goveeQueue.async { targets.forEach { Govee.setPower($0, on: false) } }
+        timerEnd = nil
+        armTimer()
+        rebuildMenu()
     }
 
     // MARK: Telling lights apart

@@ -6,9 +6,10 @@ A small Mac menu bar app for the desk:
 - **Govee lights** — on/off, brightness, color and white presets, one at a time or all together. Reaches each light the best way available:
   - **Wi-Fi** for lights with LAN Control turned on in the Govee Home app
   - **Bluetooth** for nearby bulbs without LAN Control (H6004/H6006/H6008/H6009 family)
-  - **Govee cloud** with an API key, for everything else
+  - **Govee cloud** with an API key, for everything else (set from Terminal: `~/Hammer/Hammer govee key <API key>`)
 
   Bluetooth reaches through walls, so a bulb found only over Bluetooth could be a neighbor's. Those start under **Other Lights**, where Hammer never controls them (not even with All Lights), until you choose **Add to My Lights**. Each shows roughly how far away it is, and **Blink to Identify** helps you tell which is which.
+- **Sleep timer** — pick 5 minutes to 8 hours on a slider and all your lights turn off then. The Mac stays awake until the timer runs out (closing the lid still puts it to sleep), and the timer survives Hammer restarting.
 
 Open the menu from the hammer icon in the menu bar, by pressing **Control-Option-H**, or by opening Hammer from Apps or Spotlight.
 
