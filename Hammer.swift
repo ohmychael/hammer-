@@ -1104,11 +1104,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Updates
 
-    /// Runs the updater now. If there's a new version, Hammer rebuilds and
-    /// restarts itself; otherwise a notification says it's up to date.
+    /// Asks the background updater to run now. If there's a new version, it
+    /// rebuilds and restarts Hammer; otherwise a notification says it's up to date.
+    /// The updater must run as its own job, not as part of Hammer, or it would be
+    /// stopped along with the old Hammer halfway through the update.
     @objc private func checkForUpdates() {
-        let script = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Hammer/repo/update.sh").path
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let script = home.appendingPathComponent("Hammer/repo/update.sh").path
         guard FileManager.default.fileExists(atPath: script) else {
             if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
             let alert = NSAlert()
@@ -1118,9 +1120,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.runModal()
             return
         }
+        // Tell the updater this check was asked for, so it reports "up to date" too.
+        FileManager.default.createFile(atPath: home.appendingPathComponent("Hammer/.manual-check").path,
+                                       contents: nil)
+
+        let job = "gui/\(getuid())/local.hammer.updater"
+        let plist = home.appendingPathComponent("Library/LaunchAgents/local.hammer.updater.plist").path
         let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/bash")
-        task.arguments = [script, "--manual"]
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        // Start the job; if it isn't loaded yet, load it first (loading also starts it).
+        task.arguments = ["-c", "launchctl kickstart '\(job)' || launchctl bootstrap 'gui/\(getuid())' '\(plist)'"]
         try? task.run()
     }
 }

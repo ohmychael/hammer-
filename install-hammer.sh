@@ -72,6 +72,7 @@ cat > "$AGENTS/local.hammer.updater.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+rm -rf /tmp/hammer-update.lock        # clear anything left by an interrupted update
 launchctl bootout "gui/$UID_NUM/local.hammer.updater" 2>/dev/null || true
 launchctl bootstrap "gui/$UID_NUM" "$AGENTS/local.hammer.updater.plist" 2>/dev/null || true
 
