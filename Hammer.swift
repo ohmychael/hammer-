@@ -804,7 +804,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Look for Bluetooth bulbs again every time the menu opens, so a bulb that
     /// was busy with your phone shows up without a manual rescan.
     func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
         GoveeBluetooth.shared.rescan()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
+        if menuNeedsRebuild {
+            menuNeedsRebuild = false
+            rebuildMenu()
+        }
+    }
+
+    private var menuIsOpen = false
+    private var menuNeedsRebuild = false
+
+    /// Rebuilds now, or once the menu closes if it's open (so it doesn't change under the pointer).
+    private func rebuildMenuSoon() {
+        if menuIsOpen { menuNeedsRebuild = true } else { rebuildMenu() }
+    }
+
+    private func checked(_ item: NSMenuItem, _ isOn: Bool) -> NSMenuItem {
+        item.state = isOn ? .on : .off
+        return item
+    }
+
+    // MARK: Light modes (for the checkmarks)
+
+    private enum LightMode: String { case warmWhite, daylight, nightLight, color }
+
+    /// What each light is set to. Saved so restarts and updates keep the checkmarks.
+    private var modes: [String: LightMode] {
+        get {
+            let saved = UserDefaults.standard.dictionary(forKey: "lightModes") as? [String: String] ?? [:]
+            return saved.compactMapValues { LightMode(rawValue: $0) }
+        }
+        set { UserDefaults.standard.set(newValue.mapValues { $0.rawValue }, forKey: "lightModes") }
+    }
+
+    private func setMode(_ mode: LightMode, for targets: [GoveeLight]) {
+        var all = modes
+        var changed = false
+        for light in targets where all[light.id] != mode {
+            all[light.id] = mode
+            changed = true
+        }
+        if changed {
+            modes = all
+            rebuildMenuSoon()
+        }
+    }
+
+    /// The mode to check: a light's own, or for All Lights the one they all share.
+    private func mode(forID id: String) -> LightMode? {
+        let current = modes
+        let shown = lightsMatching(id).map { current[$0.id] }
+        guard let first = shown.first, let mode = first, shown.allSatisfy({ $0 == mode }) else { return nil }
+        return mode
     }
 
     private func label(_ title: String) -> NSMenuItem {
@@ -942,10 +998,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             slider.identifier = NSUserInterfaceItemIdentifier(id)
         })
         submenu.addItem(.separator())
-        submenu.addItem(action("Choose Color…", #selector(chooseColor(_:)), lightID: id))
-        submenu.addItem(action("Warm White", #selector(warmWhite(_:)), lightID: id))
-        submenu.addItem(action("Daylight", #selector(daylight(_:)), lightID: id))
-        submenu.addItem(action("Night Light", #selector(nightLight(_:)), lightID: id))
+        let current = mode(forID: id)                  // ✓ next to what the light is set to
+        submenu.addItem(checked(action("Choose Color…", #selector(chooseColor(_:)), lightID: id), current == .color))
+        submenu.addItem(checked(action("Warm White", #selector(warmWhite(_:)), lightID: id), current == .warmWhite))
+        submenu.addItem(checked(action("Daylight", #selector(daylight(_:)), lightID: id), current == .daylight))
+        submenu.addItem(checked(action("Night Light", #selector(nightLight(_:)), lightID: id), current == .nightLight))
         if light != nil {
             submenu.addItem(.separator())
             submenu.addItem(action("Blink to Identify", #selector(blink(_:)), lightID: id))
@@ -1005,6 +1062,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let level = slider.doubleValue
         levels[id] = level
         for light in lightsMatching(id) { applyLevel(level, to: light) }
+        // Brightening a Night Light makes it plain Warm White.
+        if level >= 2 {
+            let current = modes
+            let raised = lightsMatching(id).filter { current[$0.id] == .nightLight }
+            if !raised.isEmpty { setMode(.warmWhite, for: raised) }
+        }
     }
 
     private func applyLevel(_ level: Double, to light: GoveeLight) {
@@ -1026,8 +1089,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func warmWhite(_ sender: NSMenuItem) { setLook(.white(2700), for: targetLights(sender)) }
-    @objc private func daylight(_ sender: NSMenuItem) { setLook(.white(6500), for: targetLights(sender)) }
+    @objc private func warmWhite(_ sender: NSMenuItem) {
+        setLook(.white(2700), for: targetLights(sender))
+        setMode(.warmWhite, for: targetLights(sender))
+    }
+
+    @objc private func daylight(_ sender: NSMenuItem) {
+        setLook(.white(6500), for: targetLights(sender))
+        setMode(.daylight, for: targetLights(sender))
+    }
 
     /// The dimmest the bulb goes without changing color: warm white at 1%.
     @objc private func nightLight(_ sender: NSMenuItem) {
@@ -1035,6 +1105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let id = sender.representedObject as? String { levels[id] = 0 }
         setLook(.white(2700), for: targets)
         for light in targets { applyLevel(0, to: light) }
+        setMode(.nightLight, for: targets)
         rebuildMenu()                                  // move the sliders to the far left
     }
 
@@ -1061,6 +1132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         func byte(_ component: CGFloat) -> Int { min(max(Int((component * 255).rounded()), 0), 255) }
         setLook(.color(byte(vivid.redComponent), byte(vivid.greenComponent), byte(vivid.blueComponent)),
                 for: lightsMatching(id))
+        setMode(.color, for: lightsMatching(id))
     }
 
     // MARK: Sleep timer
