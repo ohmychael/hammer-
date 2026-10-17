@@ -932,6 +932,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         submenu.addItem(action("Choose Color…", #selector(chooseColor(_:)), lightID: id))
         submenu.addItem(action("Warm White", #selector(warmWhite(_:)), lightID: id))
         submenu.addItem(action("Daylight", #selector(daylight(_:)), lightID: id))
+        submenu.addItem(action("Night Light", #selector(nightLight(_:)), lightID: id))
         if light != nil {
             submenu.addItem(.separator())
             submenu.addItem(action("Blink to Identify", #selector(blink(_:)), lightID: id))
@@ -991,6 +992,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func warmWhite(_ sender: NSMenuItem) { setWhite(sender, kelvin: 2700) }
     @objc private func daylight(_ sender: NSMenuItem) { setWhite(sender, kelvin: 6500) }
+
+    /// Dimmer than the lowest brightness: 1% brightness plus a very dark warm
+    /// color, since the color scales the light down further. Kept above pure
+    /// black, which bulbs treat as "dark" and then stop responding to colors.
+    @objc private func nightLight(_ sender: NSMenuItem) {
+        let targets = targetLights(sender)
+        goveeQueue.async {
+            targets.forEach {
+                Govee.setPower($0, on: true)
+                Govee.setBrightness($0, 1)
+                Govee.setColor($0, red: 20, green: 8, blue: 1)
+            }
+        }
+    }
 
     private func setWhite(_ sender: NSMenuItem, kelvin: Int) {
         let targets = targetLights(sender)
