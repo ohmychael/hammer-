@@ -2,10 +2,10 @@
 // tested anywhere (Tests/main.swift, Tests/Deliveries/run.sh); Hammer.swift adds
 // the menu, the Keychain and the notifications.
 //
-// Every few minutes Hammer asks Gmail (over IMAP, with your app password) for new
-// inbox mail whose subject says "delivered" or "arrived". It opens the inbox
-// read-only and reads just the From/Subject/Date/Message-ID headers of those, so
-// nothing is marked as read, and decides which are real delivery notices: "Delivered: …" from Amazon, eBay's
+// Every few minutes Hammer looks at new inbox mail in Gmail (over IMAP, with your
+// app password). It opens the inbox read-only and reads just the From/Subject/Date/
+// Message-ID headers of new emails, so nothing is marked as read, and decides which
+// are real delivery notices: "Delivered: …" from Amazon, eBay's
 // "Your package was delivered", UPS/USPS/FedEx updates and the like. Mail that was
 // already there when you turned this on is never announced.
 
@@ -23,6 +23,8 @@ struct Delivery: Codable, Equatable {
     let date: Date?
     let uid: Int
 
+    /// Identifies this delivery in the menu.
+    var key: String { messageID ?? "uid:\(uid)" }
     var title: String { kind == .delivered ? "Delivered · \(store)" : "Delivery problem · \(store)" }
     var body: String { item ?? DeliveryMail.tidy(subject) }
 
@@ -41,8 +43,8 @@ enum DeliveryMail {
     /// Reads one email's headers and says whether it's a delivery notice.
     static func classify(headers: [String: String], uid: Int) -> Delivery? {
         let subject = headers["subject"] ?? ""
-        guard let kind = kind(ofSubject: subject) else { return nil }
         let from = headers["from"] ?? ""
+        guard !isBounce(from: from), let kind = kind(ofSubject: subject) else { return nil }
         return Delivery(kind: kind, store: store(from: from), item: kind == .delivered ? item(in: subject) : nil,
                         subject: subject, messageID: headers["message-id"],
                         date: headers["date"].flatMap(parseDate), uid: uid)
@@ -54,30 +56,47 @@ enum DeliveryMail {
         let s = " " + normalized(raw) + " "
         let trimmed = s.trimmingCharacters(in: .whitespaces)
         if trimmed.hasPrefix("re:") || trimmed.hasPrefix("re :") { return nil }      // a conversation, not a notice
+        let aboutAPackage = ["package", "parcel", "shipment", "order"].contains { s.contains($0) }
 
-        let aboutShipping = ["deliver", "package", "parcel", "shipment", "order", "item"].contains { s.contains($0) }
-        let problems = ["not delivered", "not been delivered", "couldn't be delivered", "could not be delivered",
-                        "wasn't delivered", "unable to deliver", "undeliverable", "delivery attempt",
-                        "attempted delivery", "delivery was attempted", "delivery exception", "delivery failed",
-                        "failed delivery", "missed delivery", "returned to sender", "return to sender"]
-        if aboutShipping, problems.contains(where: { s.contains($0) }) { return .problem }
+        // Failed or attempted deliveries. Some phrases only ever mean a package; the rest
+        // also turn up in bounced email ("Undeliverable: …"), so they need a package word.
+        let alwaysProblem = ["delivery attempt", "attempted delivery", "delivery was attempted",
+                             "delivery exception", "missed delivery"]
+        let problemWithPackage = ["not delivered", "not been delivered", "couldn't be delivered",
+                                  "could not be delivered", "wasn't delivered", "unable to deliver", "undeliverable",
+                                  "delivery failed", "failed delivery", "returned to sender", "return to sender",
+                                  "being returned"]
+        if alwaysProblem.contains(where: { s.contains($0) })
+            || (aboutAPackage && problemWithPackage.contains(where: { s.contains($0) })) {
+            return .problem
+        }
 
         // Plainly past tense: delivered, whatever else the subject says.
         let delivered = ["was delivered", "were delivered", "has been delivered", "have been delivered",
                          "got delivered", "item delivered", "items delivered", "package delivered",
-                         "parcel delivered", "order delivered", "shipment delivered", "delivered today",
-                         "has arrived", "have arrived", "was dropped off", "been dropped off"]
+                         "parcel delivered", "order delivered", "shipment delivered", "was dropped off",
+                         "been dropped off"]
         if delivered.contains(where: { s.contains($0) }) && !s.contains("will have been") { return .delivered }
+        // "Your order has arrived", "Your package from Target has arrived", but not "Fall has arrived".
+        let arrived = #"\b(package|parcel|order|shipment|items?|delivery|purchase)s?\b[^.!?:]{0,40}\b(has|have) arrived"#
+        if s.range(of: arrived, options: .regularExpression) != nil { return .delivered }
 
         let notYet = ["will be delivered", "to be delivered", "out for delivery", "expected", "estimated",
                       "scheduled", "arriving", "on its way", "on the way", "get it delivered",
                       "get them delivered", "have it delivered", "free delivery", "% off"]
         if notYet.contains(where: { s.contains($0) }) { return nil }
 
-        // "Delivered: …" and "… Shipment 1Z… Delivered".
+        // "Delivered: …" (Amazon) and "FedEx Shipment 7712… Delivered".
+        if trimmed.range(of: #"^delivered\s*[:\-–—|]"#, options: .regularExpression) != nil { return .delivered }
         let words = trimmed.split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" })
-        if words.first == "delivered" || words.last == "delivered" { return .delivered }
+        if words.last == "delivered" && aboutAPackage { return .delivered }
         return nil
+    }
+
+    /// Bounced email ("Undeliverable", "Mail delivery failed") comes from the mail system, not a store.
+    static func isBounce(from raw: String) -> Bool {
+        let from = HeaderText.decode(raw).lowercased()
+        return ["mailer-daemon", "postmaster", "mail delivery", "microsoftexchange"].contains { from.contains($0) }
     }
 
     /// What was delivered, if the subject names it.
@@ -330,7 +349,11 @@ final class IMAPConnection {
 
     func login(email: String, password: String) throws {
         let reply = try run("LOGIN \(IMAPConnection.quoted(email)) \(IMAPConnection.quoted(password))")
-        guard reply.status == "OK" else { throw IMAPError.badLogin(reply.text) }
+        guard reply.status == "OK" else {
+            if IMAPConnection.isRefusedLogin(reply.text) { throw IMAPError.badLogin(reply.text) }
+            // e.g. "[UNAVAILABLE] Temporary System Problem", "Too many simultaneous connections"
+            throw IMAPError.failed("Gmail is having trouble right now. Hammer will keep trying.")
+        }
     }
 
     /// Sends one command and returns its answer.
@@ -403,6 +426,13 @@ final class IMAPConnection {
         let bytes = Array(buffer[position..<(position + count)])
         position += count
         return bytes
+    }
+
+    /// Gmail turned the password down (as opposed to a passing problem on Gmail's side).
+    static func isRefusedLogin(_ text: String) -> Bool {
+        let t = text.lowercased()
+        return t.contains("authenticationfailed") || t.contains("invalid credentials")
+            || t.contains("application-specific password") || t.contains("webalert")
     }
 
     /// "… {123}" → 123 (also "{123+}").
@@ -493,8 +523,11 @@ struct DeliveryState: Codable, Equatable {
 }
 
 enum DeliveryCheck {
-    /// Gmail search for candidate subjects; DeliveryMail.kind makes the final call.
-    static let gmailSearch = #"X-GM-RAW "subject:(delivered OR delivery OR arrived OR undeliverable OR \"returned to sender\")""#
+    /// At most this many new emails are looked at in one check: after a long time
+    /// offline, older ones would be too old to announce anyway.
+    static let maxPerCheck = 500
+    /// Headers are fetched this many emails at a time.
+    static let batch = 100
     /// Deliveries older than this aren't announced (e.g. an old email moved back to the inbox).
     static let tooOld: TimeInterval = 3 * 24 * 3600
 
@@ -519,18 +552,24 @@ enum DeliveryCheck {
         }
         guard newest > last else { return ([], next) }
 
-        let search = try command("UID SEARCH UID \(last + 1):* \(gmailSearch)")
+        // Every new email, not a Gmail search: search results can lag behind new mail,
+        // and the decision is made here anyway, from the subject and sender.
+        let search = try command("UID SEARCH UID \(last + 1):*")
         guard search.status == "OK", let uids = IMAPReply.search(search.untagged) else {
-            throw IMAPError.failed("Gmail search failed (\(search.text)).")
+            throw IMAPError.failed("Couldn't list new mail (\(search.text)).")
         }
-        let found = uids.filter { $0 > last }.sorted()
+        let new = uids.filter { $0 > last }.sorted()
+        let found = Array(new.suffix(maxPerCheck))
 
         var deliveries: [Delivery] = []
         if !found.isEmpty {
-            let list = found.map(String.init).joined(separator: ",")
-            let fetch = try command("UID FETCH \(list) (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])")
-            guard fetch.status == "OK" else { throw IMAPError.failed("Couldn't read the emails (\(fetch.text)).") }
-            let headers = IMAPReply.fetchedHeaders(fetch.untagged)
+            var headers: [Int: [String: String]] = [:]
+            for start in stride(from: 0, to: found.count, by: batch) {
+                let list = found[start..<min(start + batch, found.count)].map(String.init).joined(separator: ",")
+                let fetch = try command("UID FETCH \(list) (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])")
+                guard fetch.status == "OK" else { throw IMAPError.failed("Couldn't read new mail (\(fetch.text)).") }
+                headers.merge(IMAPReply.fetchedHeaders(fetch.untagged)) { _, newer in newer }
+            }
             for uid in found {
                 guard let fields = headers[uid], let delivery = DeliveryMail.classify(headers: fields, uid: uid)
                 else { continue }
@@ -542,7 +581,7 @@ enum DeliveryCheck {
             }
             next.announced = Array(next.announced.suffix(200))
         }
-        next.lastUID = max(newest, found.max() ?? newest)
+        next.lastUID = max(newest, new.max() ?? newest)
         return (deliveries, next)
     }
 
@@ -568,6 +607,9 @@ enum DeliveryCheck {
         case .badLogin(let text):
             if text.localizedCaseInsensitiveContains("application-specific") {
                 return "Gmail needs an app password, not your regular one."
+            }
+            if text.localizedCaseInsensitiveContains("webalert") {
+                return "Google blocked the sign-in as unusual. Open Gmail in your browser once, then set up Gmail again."
             }
             return "Gmail didn't accept the app password."
         case .offline: return "Can't reach Gmail right now. Hammer will keep trying."

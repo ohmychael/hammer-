@@ -65,7 +65,8 @@ class NSWorkspace {
     static let shared = NSWorkspace()
     let notificationCenter = NotificationCenter.default
     static let didWakeNotification = Notification.Name("NSWorkspaceDidWakeNotification")
-    @discardableResult func open(_ url: URL) -> Bool { true }
+    static let willSleepNotification = Notification.Name("NSWorkspaceWillSleepNotification")
+    @discardableResult func open(_ url: URL) -> Bool { simOpened.append(url); return true }
 }
 extension NotificationCenter {
     func addObserver(_ observer: Any, selector: Selector, name: Notification.Name?, object: Any?) {}
@@ -89,6 +90,7 @@ let NSApp = NSApplication()
 class NSMenu { func addItem(_ item: NSMenuItem) {} }
 class NSMenuItem {
     var title: String; var target: AnyObject?; var tag = 0; var toolTip: String?; var submenu: NSMenu?; var isEnabled = true
+    var representedObject: Any?
     init(title: String, action: Selector?, keyEquivalent: String) { self.title = title }
     static func separator() -> NSMenuItem { NSMenuItem(title: "", action: nil, keyEquivalent: "") }
 }
@@ -99,3 +101,4 @@ final class Box<Value> {
     var value: Value
     init(_ value: Value) { self.value = value }
 }
+var simOpened: [URL] = []

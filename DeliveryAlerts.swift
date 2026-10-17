@@ -149,11 +149,16 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
 
     var isOn: Bool { email != nil }
 
-    /// At launch: listen for notification clicks, and start checking if it's set up.
+    /// macOS only lets an app bundle (Hammer.app) use Notification Center; the bare
+    /// binary falls back to plain notifications. Tests turn this on to use stand-ins.
+    static var useNotificationCenter = Bundle.main.bundleIdentifier != nil
+
+    /// At launch: listen for notification clicks and sleep/wake, and start checking if it's set up.
     func start() {
-        UNUserNotificationCenter.current().delegate = self
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(macWoke),
-                                                          name: NSWorkspace.didWakeNotification, object: nil)
+        if Self.useNotificationCenter { UNUserNotificationCenter.current().delegate = self }
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.addObserver(self, selector: #selector(macWillSleep), name: NSWorkspace.willSleepNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(macWoke), name: NSWorkspace.didWakeNotification, object: nil)
         guard isOn else { return }
         refreshNotificationSetting()
         scheduleChecks()
@@ -161,39 +166,47 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
     }
 
     /// Tries the email and app password; if Gmail accepts them, saves them and starts.
-    /// Calls back on the main thread with nil, or with what went wrong.
+    /// Calls back on the main thread with nil, or with what went wrong. The Keychain is
+    /// only touched off the main thread (it can stop to ask for your Mac password).
     func turnOn(email: String, password: String, done: @escaping (String?) -> Void) {
+        let previous = self.email
         queue.async {
             let result = DeliveryCheck.run(state: DeliveryState(), email: email, password: password,
                                            transport: Self.connect)
-            DispatchQueue.main.async {
-                switch result {
-                case .failure(let error):
-                    done(DeliveryCheck.explain(error))
-                case .success(let outcome):
-                    guard GmailKeychain.save(email: email, password: password) else {
-                        done("Gmail accepted it, but Hammer couldn't save it to your Keychain.")
-                        return
-                    }
-                    if let old = self.email, old != email { GmailKeychain.delete(email: old) }
-                    self.email = email
-                    self.password = password
-                    self.state = outcome.state                 // starts from the newest email: old mail isn't announced
-                    self.recent = []
-                    self.problem = nil
-                    self.needsSetup = false
-                    self.lastChecked = Date()
-                    self.scheduleChecks()
-                    self.askForNotifications()
-                    self.onChange?()
-                    done(nil)
+            let answer: (failure: String?, start: DeliveryState?)
+            switch result {
+            case .failure(let error):
+                answer = (DeliveryCheck.explain(error), nil)
+            case .success(let outcome):
+                if GmailKeychain.save(email: email, password: password) {
+                    if let previous, previous != email { GmailKeychain.delete(email: previous) }
+                    answer = (nil, outcome.state)          // starts from the newest email: old mail isn't announced
+                } else {
+                    answer = ("Gmail accepted it, but Hammer couldn't save it to your Keychain.", nil)
                 }
+            }
+            DispatchQueue.main.async {
+                guard let startState = answer.start else {
+                    done(answer.failure)
+                    return
+                }
+                self.email = email
+                self.password = password
+                self.state = startState
+                self.recent = []
+                self.problem = nil
+                self.needsSetup = false
+                self.lastChecked = Date()
+                self.scheduleChecks()
+                self.askForNotifications()
+                self.onChange?()
+                done(nil)
             }
         }
     }
 
     func turnOff() {
-        if let email { GmailKeychain.delete(email: email) }
+        let old = email
         timer?.invalidate()
         timer = nil
         email = nil
@@ -203,23 +216,32 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         lastChecked = nil
         UserDefaults.standard.removeObject(forKey: "deliveryState")
         UserDefaults.standard.removeObject(forKey: "recentDeliveries")
+        if let old { queue.async { GmailKeychain.delete(email: old) } }
         onChange?()
     }
 
     func checkNow() {
         guard let email, !isChecking else { return }
-        guard let password = password ?? GmailKeychain.password(for: email) else {
-            problem = "Hammer can't find your app password in the Keychain."
-            needsSetup = true
-            onChange?()
-            return
-        }
-        self.password = password
         isChecking = true
-        let saved = state
+        let cached = password, saved = state
         queue.async {
+            guard let password = cached ?? GmailKeychain.password(for: email) else {
+                DispatchQueue.main.async {
+                    self.isChecking = false
+                    guard self.email == email else { return }
+                    self.problem = "Hammer can't find your app password in the Keychain."
+                    self.needsSetup = true
+                    self.timer?.invalidate()               // don't ask the Keychain again every 3 minutes
+                    self.timer = nil
+                    self.onChange?()
+                }
+                return
+            }
             let result = DeliveryCheck.run(state: saved, email: email, password: password, transport: Self.connect)
-            DispatchQueue.main.async { self.finish(result, for: email) }
+            DispatchQueue.main.async {
+                if self.email == email { self.password = password }
+                self.finish(result, for: email)
+            }
         }
     }
 
@@ -231,6 +253,8 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
             state = outcome.state
             lastChecked = Date()
             problem = nil
+            needsSetup = false
+            if timer == nil { scheduleChecks() }               // back to normal after a Check Now
             for delivery in outcome.deliveries { post(delivery) }
             if !outcome.deliveries.isEmpty { recent = outcome.deliveries.reversed() + recent }
         case .failure(let error):
@@ -255,31 +279,39 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         self.timer = timer
     }
 
-    @objc private func macWoke() {
-        // Give the network a moment to come back.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
-            guard let self, self.isOn, self.timer != nil else { return }
-            self.checkNow()
-        }
-    }
+    // No checks while asleep; the first one comes 10 seconds after waking, once the
+    // network is back, then every 3 minutes as usual.
+    @objc private func macWillSleep() { timer?.fireDate = .distantFuture }
+    @objc private func macWoke() { timer?.fireDate = Date().addingTimeInterval(10) }
 
     // MARK: Notifications
 
     func askForNotifications() {
+        guard Self.useNotificationCenter else { return }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in
-            DispatchQueue.main.async { self.refreshNotificationSetting() }
+            DispatchQueue.main.async {
+                UserDefaults.standard.set(true, forKey: "askedForNotifications")
+                self.refreshNotificationSetting()
+            }
         }
     }
 
     private func refreshNotificationSetting() {
+        guard Self.useNotificationCenter else { return }
         UNUserNotificationCenter.current().getNotificationSettings { settings in
-            let off = settings.authorizationStatus == .denied
+            let status = settings.authorizationStatus
             DispatchQueue.main.async {
-                guard off != self.notificationsOff else { return }
-                self.notificationsOff = off
-                self.onChange?()
+                // Off: turned off in System Settings, or Hammer asked and macOS never let it.
+                let asked = UserDefaults.standard.bool(forKey: "askedForNotifications")
+                self.setNotificationsOff(status == .denied || (status == .notDetermined && asked))
             }
         }
+    }
+
+    private func setNotificationsOff(_ off: Bool) {
+        guard off != notificationsOff else { return }
+        notificationsOff = off
+        onChange?()
     }
 
     func sendTest() {
@@ -288,6 +320,10 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
     }
 
     private func post(_ delivery: Delivery) {
+        guard Self.useNotificationCenter else {
+            Self.plainNotification(title: delivery.title, body: delivery.body)
+            return
+        }
         let content = UNMutableNotificationContent()
         content.title = delivery.title
         content.body = delivery.body
@@ -300,8 +336,9 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request) { error in
             guard error != nil else { return }
-            // Notifications not allowed for Hammer: fall back to a plain one so nothing is missed.
-            DispatchQueue.main.async { Self.plainNotification(title: delivery.title, body: delivery.body) }
+            // macOS wouldn't show it: notifications are off for Hammer. Say so in the menu
+            // (the delivery is still listed there).
+            DispatchQueue.main.async { self.setNotificationsOff(true) }
         }
     }
 
@@ -330,8 +367,10 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         completionHandler()
     }
 
-    func open(_ delivery: Delivery) {
-        guard let email, let url = delivery.gmailLink(account: email) else { return }
+    /// Opens one of the recent deliveries (by Delivery.key) in Gmail.
+    func open(key: String) {
+        guard let email, let delivery = recent.first(where: { $0.key == key }),
+              let url = delivery.gmailLink(account: email) else { return }
         NSWorkspace.shared.open(url)
     }
 

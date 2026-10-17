@@ -8,7 +8,8 @@ X-GM-RAW "subject:(...)"), UID FETCH of header fields, NOOP and LOGOUT.
     fake_gmail.py PORT MAILBOX.json LOG.txt
 
 MAILBOX.json: {"password": "...", "uidvalidity": 1, "messages": [{"uid": 5,
-"headers": "From: ...\\r\\nSubject: ...\\r\\n"}]}. It is re-read on every
+"headers": "From: ...\\r\\nSubject: ...\\r\\n"}]}, plus "login_error" to refuse
+every login with that text. It is re-read on every
 connection, so a test can add mail between checks. Every command is appended to
 LOG.txt, and any fetch that would mark a message as read is logged as "SEEN-SET".
 """
@@ -81,6 +82,8 @@ async def handle(reader, writer):
 
         if cmd == "CAPABILITY":
             await send(f"* CAPABILITY {CAPS}\r\n{tag} OK Thats all she wrote!\r\n")
+        elif cmd == "LOGIN" and box.get("login_error"):
+            await send(f"{tag} NO {box['login_error']}\r\n")          # e.g. a temporary Gmail problem
         elif cmd == "LOGIN":
             m = re.match(r'"?([^" ]+)"? "?([^"]*)"?', rest)
             ok = m and m.group(2) == box["password"]

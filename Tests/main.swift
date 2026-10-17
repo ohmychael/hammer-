@@ -233,6 +233,9 @@ let deliveredSubjects = [
     "=?utf-8?Q?Your_package_was_delivered_=E2=9C=85?=",
     "Your package was delivered earlier than expected",
     "DELIVERED: \"Phone case\"",
+    "Your package has been dropped off",
+    "Your order from Target has arrived",
+    "Your items have arrived",
 ]
 for subject in deliveredSubjects {
     expect(DeliveryMail.kind(ofSubject: subject) == .delivered, "delivered: \(subject)")
@@ -243,6 +246,7 @@ let problemSubjects = [
     "Your package couldn't be delivered",
     "Action needed: delivery exception for your order",
     "Your parcel is being returned to sender",
+    "We were unable to deliver your package",
 ]
 for subject in problemSubjects {
     expect(DeliveryMail.kind(ofSubject: subject) == .problem, "problem: \(subject)")
@@ -264,6 +268,15 @@ let otherSubjects = [
     "lunch?",
     "",
     "=?UTF-8?B?invalid!!?=",
+    // Marketing and bounces that look a bit like deliveries (found in review):
+    "Your statement has arrived",
+    "Fall has arrived: 30% off everything",
+    "The new iPhone has arrived. Order now",
+    "Delivered to your door in 30 minutes",
+    "Undelivered Mail Returned to Sender",
+    "Undeliverable: Lunch on Friday?",
+    "Mail delivery failed: returning message to sender",
+    "Fresh flowers delivered today",
 ]
 for subject in otherSubjects {
     expect(DeliveryMail.kind(ofSubject: subject) == nil, "not a delivery: \(subject)")
@@ -318,6 +331,11 @@ let sample = DeliveryMail.classify(headers: parsedHeaders, uid: 9)
 expect(sample?.title == "Delivered · eBay" && sample?.body == "Your package was delivered", "notification text")
 expect(sample?.gmailLink(account: "you@gmail.com")?.absoluteString
        == "https://mail.google.com/mail/?authuser=you@gmail.com#search/rfc822msgid%3Aa@b", "link to the email")
+expect(DeliveryMail.classify(headers: ["subject": "Undeliverable: Your order #123 update",
+                                       "from": "Mail Delivery Subsystem <mailer-daemon@googlemail.com>"], uid: 1) == nil,
+       "a bounce of your own email isn't a delivery problem")
+expect(DeliveryMail.classify(headers: ["subject": "Undeliverable: Re: your order",
+                                       "from": "postmaster@outlook.com"], uid: 1) == nil, "Outlook bounce")
 let problem = DeliveryMail.classify(headers: ["subject": "UPS Update: Delivery Attempted", "from": "UPS <mcinfo@ups.com>"], uid: 1)
 expect(problem?.title == "Delivery problem · UPS" && problem?.item == nil, "problem text")
 
@@ -376,6 +394,23 @@ do {
 } catch {
     expect(false, "wrong error for a refused login: \(error)")
 }
+
+let busy = IMAPConnection(transport: ScriptedTransport("* OK hi\r\nH001 NO [UNAVAILABLE] Temporary System Problem. Try again later (Failure)\r\n"))
+do {
+    try busy.start()
+    try busy.login(email: "a", password: "b")
+    expect(false, "a refused login throws")
+} catch IMAPError.failed {
+    expect(true, "a passing Gmail problem isn't treated as a wrong password")
+} catch {
+    expect(false, "wrong error for a temporary problem: \(error)")
+}
+expect(IMAPConnection.isRefusedLogin("[AUTHENTICATIONFAILED] Invalid credentials (Failure)"), "refused: wrong password")
+expect(IMAPConnection.isRefusedLogin("[ALERT] Application-specific password required: https://…"), "refused: needs an app password")
+expect(IMAPConnection.isRefusedLogin("[WEBALERT https://…] Web login required."), "refused: Google wants a browser sign-in")
+expect(!IMAPConnection.isRefusedLogin("[UNAVAILABLE] Temporary System Problem"), "not refused: temporary")
+expect(!IMAPConnection.isRefusedLogin("[ALERT] Too many simultaneous connections. (Failure)"), "not refused: too many connections")
+expect(DeliveryCheck.explain(.badLogin("[WEBALERT x] Web login required")).contains("browser"), "browser sign-in message")
 
 let hungUp = IMAPConnection(transport: ScriptedTransport("* OK hi\r\nH001 OK\r\n* 1 FETCH (UID 1 BODY[] {500}\r\nshort"))
 do {
@@ -437,7 +472,7 @@ final class FakeInbox {
         }
         if command.hasPrefix("UID SEARCH UID ") {
             let from = Int(command.dropFirst(15).prefix { $0 != ":" }) ?? 0
-            var hits = messages.filter { $0.uid >= from && ($0.headers.lowercased().contains("deliver") || $0.headers.lowercased().contains("arrived")) }.map(\.uid)
+            var hits = messages.filter { $0.uid >= from }.map(\.uid)
             if hits.isEmpty, let last = messages.last, from > last.uid { hits = [last.uid] }   // IMAP: n:* always includes the newest
             return IMAPResponse(status: "OK", text: "", untagged: Array("* SEARCH \(hits.map(String.init).joined(separator: " "))\r\n".utf8))
         }
@@ -492,8 +527,10 @@ do {
     inbox.add("lunch?", from: "Friend <f@gmail.com>")
     inbox.log = []
     result = try DeliveryCheck.run(state: deliveryState, now: now, command: inbox.answer)
-    expect(result.deliveries.isEmpty && !inbox.log.contains { $0.hasPrefix("UID FETCH") },
-           "the IMAP quirk (n:* returns the newest) doesn't re-read old mail")
+    let newest = inbox.messages.map(\.uid).max() ?? 0
+    expect(result.deliveries.isEmpty && inbox.log.filter { $0.hasPrefix("UID FETCH") }
+               == ["UID FETCH \(newest) (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])"],
+           "only the one new email is read, nothing older: \(inbox.log)")
     deliveryState = result.state
 
     inbox.add("Delivered: \"Lamp\"", from: "Target <orders@target.com>")
@@ -530,6 +567,22 @@ if let result = try? DeliveryCheck.run(state: bigState, now: now, command: bigIn
     expect(false, "big inbox check failed")
 }
 expect(Date().timeIntervalSince(started) < 5, "and quickly: \(Date().timeIntervalSince(started)) s")
+expect(bigInbox.log.filter { $0.hasPrefix("UID FETCH") }.count >= 4, "headers fetched in batches")
+
+// After a long time offline: only the newest 500 are looked at, but all are passed.
+let backlog = FakeInbox()
+backlog.add("old")
+var backlogState = (try? DeliveryCheck.run(state: DeliveryState(), now: now, command: backlog.answer).state) ?? DeliveryState()
+backlog.add(#"Delivered: "Early""#)
+for i in 0..<700 { backlog.add("newsletter \(i)", from: "x@y.com") }
+backlog.add(#"Delivered: "Late""#)
+if let result = try? DeliveryCheck.run(state: backlogState, now: now, command: backlog.answer) {
+    expect(result.deliveries.map(\.body) == ["Late"], "only the newest 500 checked: \(result.deliveries.map(\.body))")
+    expect(result.state.lastUID == backlog.messages.map(\.uid).max(), "and none of the rest are looked at again")
+    backlogState = result.state
+} else {
+    expect(false, "backlog check failed")
+}
 
 print("\(checks) checks, \(failures) failed")
 exit(failures == 0 ? 0 : 1)

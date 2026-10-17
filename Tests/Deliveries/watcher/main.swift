@@ -18,6 +18,7 @@ func addMail(_ subject: String, from: String = "\"eBay\" <ebay@ebay.com>") {
 func setPassword(_ p: String) { box["password"] = p; try! JSONSerialization.data(withJSONObject: box).write(to: URL(fileURLWithPath: boxPath)) }
 
 DeliveryWatcher.connect = { try SocketTransport(port: port) }
+DeliveryWatcher.useNotificationCenter = true        // the stand-in Notification Center records what's shown
 GmailKeychain.tool = CommandLine.arguments[3]
 let watcher = DeliveryWatcher.shared
 var changes = 0
@@ -65,6 +66,33 @@ wait(2)
 check(simPosted.suffix(2).map(\.1) == ["Cable", "Lamp"], "both announced")
 check(watcher.recent.map(\.body) == ["Lamp", "Cable", "Apple iPhone 15 Pro Max"], "newest first: \(watcher.recent.map(\.body))")
 
+print("[opening a delivery from the menu]")
+if let first = watcher.recent.last {
+    watcher.open(key: first.key)
+    check(simOpened.last?.absoluteString.hasSuffix("rfc822msgid%3A\(first.messageID!.dropFirst().dropLast())") == true,
+          "opens that email: \(simOpened.last?.absoluteString ?? "-")")
+}
+
+print("[a passing Gmail problem]")
+box["login_error"] = "[UNAVAILABLE] Temporary System Problem. Try again later (Failure)"
+try! JSONSerialization.data(withJSONObject: box).write(to: URL(fileURLWithPath: boxPath))
+watcher.checkNow()
+wait(2)
+check(watcher.problem?.contains("keep trying") == true && !watcher.needsSetup, "shown, but not treated as a wrong password")
+box["login_error"] = nil
+addMail(#"Delivered: "Mug""#)
+watcher.checkNow()
+wait(2)
+check(watcher.problem == nil && simPosted.last?.1 == "Mug", "and the next check works normally")
+
+print("[Keychain entry missing]")
+let fresh = DeliveryWatcher()                                  // like the next launch
+GmailKeychain.delete(email: "you@gmail.com")
+fresh.checkNow()
+wait(1)
+check(fresh.needsSetup && fresh.problem?.contains("Keychain") == true, "says so and offers setup")
+GmailKeychain.save(email: "you@gmail.com", password: "abcdefghijklmnop")
+
 print("[app password revoked]")
 setPassword("somethingelseeee")
 watcher.checkNow()
@@ -82,6 +110,7 @@ check(simPosted.last?.0 == "Delivered · Hammer" && simPosted.last?.2 == nil, "t
 
 print("[turn off]")
 watcher.turnOff()
+wait(0.5)                                                       // the Keychain item is deleted in the background
 check(!watcher.isOn && watcher.recent.isEmpty && GmailKeychain.password(for: "you@gmail.com") == nil,
       "off: account, list and Keychain item gone")
 check(!watcher.needsSetup && watcher.problem == nil, "and no leftover warnings")

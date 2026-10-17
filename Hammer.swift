@@ -1317,10 +1317,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if recent.isEmpty {
             menu.addItem(hint("No deliveries yet. Hammer checks Gmail every 3 minutes."))
         }
-        for (index, delivery) in recent.enumerated() {
+        for delivery in recent {
             let item = NSMenuItem(title: deliveryTitle(delivery), action: #selector(openDelivery(_:)), keyEquivalent: "")
             item.target = self
-            item.tag = index
+            item.representedObject = delivery.key
             item.toolTip = delivery.subject.isEmpty ? nil : DeliveryMail.tidy(delivery.subject)
             menu.addItem(item)
         }
@@ -1447,9 +1447,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openDelivery(_ sender: NSMenuItem) {
-        let recent = DeliveryWatcher.shared.recent
-        guard recent.indices.contains(sender.tag) else { return }
-        DeliveryWatcher.shared.open(recent[sender.tag])
+        guard let key = sender.representedObject as? String else { return }
+        DeliveryWatcher.shared.open(key: key)
     }
 
     @objc private func checkDeliveriesNow() {
