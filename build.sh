@@ -14,8 +14,11 @@ VERSION="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo dev)"
 
 mkdir -p "$BUILD"
 
-# 1. Compile. A failure stops here, before anything is replaced.
-swiftc -parse-as-library -O "$REPO/Hammer.swift" -o "$BUILD/Hammer"
+# 1. Run the tests, then compile. Any failure stops here, before anything is replaced.
+echo "Running tests..."
+swiftc -O "$REPO/HammerCore.swift" "$REPO/Tests/main.swift" -o "$BUILD/hammer-tests"
+"$BUILD/hammer-tests"
+swiftc -parse-as-library -O "$REPO/Hammer.swift" "$REPO/HammerCore.swift" -o "$BUILD/Hammer"
 
 # 2. Assemble the app next to the build, then swap it in.
 STAGE="$BUILD/Hammer.app"

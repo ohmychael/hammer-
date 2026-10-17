@@ -14,6 +14,14 @@ A small Mac menu bar app for the desk:
 
 Open the menu from the hammer icon in the menu bar, by pressing **Control-Option-H**, or by opening Hammer from Apps or Spotlight.
 
+## Bluetooth bulbs and your phone
+
+A bulb talks to one device at a time over Bluetooth, and the Govee app on a phone keeps trying to connect in the background. So Hammer keeps a standing connection to your bulbs (only yours, never Other Lights), reconnects by itself whenever the link drops, and finds them again after a restart even while they're busy. Your phone's Govee app keeps working over Wi-Fi.
+
+If a bulb shows **can't reach**, something else has it: usually the Govee app on your phone. Force-quit the app and Hammer connects within seconds. To stop it happening at all, turn off Bluetooth for Govee Home on the phone (iPhone: Settings → Privacy & Security → Bluetooth → Govee Home); the app still controls your Wi-Fi bulbs. Taps made while a bulb can't be reached are dropped after 15 seconds rather than firing later.
+
+Each bulb's menu shows its link status at the top, and **Turn On** / **Turn Off** are checked from what the bulb itself reports.
+
 ## Install
 
 Paste into Terminal:
@@ -26,7 +34,7 @@ This builds Hammer on your Mac (it installs Apple's command-line developer tools
 
 ## Updates
 
-Hammer checks this repo at login and every 2 minutes. When there's a new commit it rebuilds and restarts itself. If a new version fails to build, the current one keeps running. You can also choose **Check for Updates** in the menu. The log is at `~/Hammer/update.log`.
+Hammer checks this repo at login and every 2 minutes. When there's a new commit it rebuilds and restarts itself. Every update first runs the tests in `Tests/main.swift`; if a test fails or the new version doesn't build, the update stops and the current one keeps running. You can also choose **Check for Updates** in the menu. The log is at `~/Hammer/update.log`.
 
 ## Terminal commands
 
@@ -44,7 +52,9 @@ Bluetooth bulbs are controlled from the menu bar app only.
 
 | File | What it does |
 |---|---|
-| `Hammer.swift` | The whole app |
+| `Hammer.swift` | The app: menu, monitor, Govee Wi-Fi/cloud/Bluetooth |
+| `HammerCore.swift` | Logic that needs only Foundation: packets, the Bluetooth command queue, name parsing |
+| `Tests/main.swift` | Tests for `HammerCore.swift`, run before every install |
 | `build.sh` | Compiles and installs `~/Applications/Hammer.app` |
 | `update.sh` | Pulls the latest commit and rebuilds |
 | `install-hammer.sh` | One-time setup |
@@ -55,4 +65,11 @@ Bluetooth bulbs are controlled from the menu bar app only.
 launchctl bootout gui/$(id -u)/local.hammer.updater
 rm ~/Library/LaunchAgents/local.hammer.plist ~/Library/LaunchAgents/local.hammer.updater.plist
 pkill -x Hammer; rm -rf ~/Applications/Hammer.app ~/Hammer ~/.config/hammer
+```
+
+## Running the tests by hand
+
+```
+cd ~/Hammer/repo
+swiftc HammerCore.swift Tests/main.swift -o /tmp/hammer-tests && /tmp/hammer-tests
 ```
