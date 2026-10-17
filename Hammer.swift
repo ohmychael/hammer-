@@ -153,28 +153,11 @@ struct GoveeLight {
     var routeLabel: String { lanIP != nil ? "" : bluetoothID != nil ? "Bluetooth" : "cloud" }
 }
 
-/// What color a light is showing, so Hammer can darken it and put it back.
+/// A color for a light: a mix of its color LEDs, or white from its white LEDs.
 enum LightLook {
     case color(Int, Int, Int)
     case white(Int)                 // color temperature in kelvin
 
-    /// The same color at `strength` (0–1), never all the way to black. Only colors
-    /// can be darkened like this: whites come from separate white LEDs that can't
-    /// go below 1%, and faking them with the color LEDs would change the shade.
-    func shaded(_ strength: Double) -> (Int, Int, Int)? {
-        guard case .color(let red, let green, let blue) = self else { return nil }
-        func scale(_ value: Int) -> Int { min(255, Int((Double(value) * strength).rounded())) }
-        var result = (scale(red), scale(green), scale(blue))
-        if max(result.0, result.1, result.2) < 2 { result.0 = max(result.0, 2) }   // stay above black
-        return result
-    }
-
-    var isColor: Bool {
-        if case .color = self { return true }
-        return false
-    }
-
-    /// Sends the look at full strength.
     func apply(to light: GoveeLight) {
         switch self {
         case .color(let r, let g, let b): Govee.setColor(light, red: r, green: g, blue: b)
@@ -958,8 +941,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                    action: #selector(lightSliderMoved(_:))) { slider in
             slider.identifier = NSUserInterfaceItemIdentifier(id)
         })
-        submenu.addItem(hint("Far left: extra dim for colors picked here."))
-        submenu.addItem(hint("Whites stop at 1%. The color never changes."))
         submenu.addItem(.separator())
         submenu.addItem(action("Choose Color…", #selector(chooseColor(_:)), lightID: id))
         submenu.addItem(action("Warm White", #selector(warmWhite(_:)), lightID: id))
@@ -1013,20 +994,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Brightness and color
     //
-    // One brightness scale, 0–100, for the menu slider:
-    //   20–100  the bulb's own brightness, 1–100%
-    //    0–20   the bulb stays at 1% and its color is darkened instead, the only
-    //           way to go dimmer. Never all the way to black: bulbs treat black
-    //           as "dark" and then stop responding to colors.
-    // Hammer remembers each light's color ("look") so it can darken it and
-    // put it back.
-
-    private static let dimZoneTop = 20.0
-    private static let darkestShade = 0.04          // color strength at the far left
+    // The Brightness slider is the bulb's own brightness, 1–100%, and nothing
+    // else: it never sends a color. (Faking "dimmer than 1%" by darkening the
+    // color shifts it toward red, because the green and blue LEDs cut out first.)
 
     private var levels: [String: Double] = [:]      // slider position per light (and for All Lights)
-    private var looks: [String: LightLook] = [:]    // each light's current color
-    private var darkened: Set<String> = []          // lights currently showing a darkened color
 
     @objc private func lightSliderMoved(_ slider: NSSlider) {
         guard let id = slider.identifier?.rawValue else { return }
@@ -1035,61 +1007,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for light in lightsMatching(id) { applyLevel(level, to: light) }
     }
 
-    /// Sends a light to a point on the 0–100 scale.
     private func applyLevel(_ level: Double, to light: GoveeLight) {
         levels[light.id] = level
-        let look = looks[light.id]                         // nil: Hammer doesn't know the color
-        let dimTop = Self.dimZoneTop, darkest = Self.darkestShade
-        // Only a color picked in Hammer can go below 1%; anything else stops at 1%
-        // and its color is never touched.
-        let darken = level < dimTop && look?.isColor == true
-        let restoreColor = darkened.contains(light.id) && !darken   // coming back up from darkened
-        if darken { darkened.insert(light.id) } else { darkened.remove(light.id) }
-
+        let percent = max(1, Int(level.rounded()))
         schedule("level-\(light.id)", on: goveeQueue, after: delay(for: light)) {
             Govee.setPower(light, on: true)        // adjusting a light that's off turns it on
-            if darken, let look {
-                // Squared so the dimmest end changes gently; eyes notice small changes most there.
-                let t = level / dimTop
-                if let shade = look.shaded(darkest + t * t * (1 - darkest)) {
-                    Govee.setBrightness(light, 1)
-                    Govee.setColor(light, red: shade.0, green: shade.1, blue: shade.2)
-                }
-            } else {
-                if restoreColor, let look { look.apply(to: light) }
-                let percent = level < dimTop ? 1 : Int((1 + (level - dimTop) / (100 - dimTop) * 99).rounded())
-                Govee.setBrightness(light, percent)
-            }
+            Govee.setBrightness(light, percent)
         }
     }
 
-    /// Changes the lights' color and keeps each one's place on the brightness scale.
+    /// Changes the lights' color; brightness stays where it is.
     private func setLook(_ look: LightLook, for targets: [GoveeLight]) {
         for light in targets {
-            looks[light.id] = look
-            let level = levels[light.id] ?? 100
-            if level >= Self.dimZoneTop || !look.isColor {
-                // Send the color as is; a color in the dim zone is sent darkened by the level step instead.
-                schedule("look-\(light.id)", on: goveeQueue, after: delay(for: light)) {
-                    Govee.setPower(light, on: true)
-                    look.apply(to: light)
-                }
+            schedule("look-\(light.id)", on: goveeQueue, after: delay(for: light)) {
+                Govee.setPower(light, on: true)
+                look.apply(to: light)
             }
-            applyLevel(level, to: light)
         }
     }
 
     @objc private func warmWhite(_ sender: NSMenuItem) { setLook(.white(2700), for: targetLights(sender)) }
     @objc private func daylight(_ sender: NSMenuItem) { setLook(.white(6500), for: targetLights(sender)) }
 
-    /// The far left of the brightness scale, in warm amber.
+    /// The dimmest the bulb goes without changing color: warm white at 1%.
     @objc private func nightLight(_ sender: NSMenuItem) {
         let targets = targetLights(sender)
         if let id = sender.representedObject as? String { levels[id] = 0 }
-        for light in targets {
-            looks[light.id] = .color(255, 100, 20)
-            applyLevel(0, to: light)
-        }
+        setLook(.white(2700), for: targets)
+        for light in targets { applyLevel(0, to: light) }
         rebuildMenu()                                  // move the sliders to the far left
     }
 
