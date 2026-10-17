@@ -46,7 +46,10 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-codesign --force --sign - "$STAGE" >/dev/null 2>&1 || true   # local signature so macOS will run it
+# Sign with the same local certificate every time, so macOS keeps Hammer's
+# permissions (Bluetooth etc.) across updates; falls back to ad hoc (signing.sh).
+source "$REPO/signing.sh"
+sign_app "$STAGE"
 
 if [ -d "$APP" ]; then
   existing_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" 2>/dev/null || true)"

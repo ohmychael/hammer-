@@ -60,6 +60,8 @@ This builds Hammer on your Mac (it installs Apple's command-line developer tools
 
 ## Updates
 
+Each build is signed with a certificate made once on your Mac (in `~/Hammer/signing`, its own keychain, not your login keychain), so macOS recognizes every update as the same Hammer and doesn't ask for Bluetooth and other permissions again. You'll be asked one last time after the first build that uses it. If that certificate can't be made or used, the build is signed ad hoc as before, and the update log says which happened.
+
 Hammer checks this repo at login and every 2 minutes. When there's a new commit it rebuilds and restarts itself. Every update first runs the tests in `Tests/main.swift`; if a test fails or the new version doesn't build, the update stops and the current one keeps running. You can also choose **Check for Updates** in the menu. The log is at `~/Hammer/update.log`.
 
 ## Terminal commands
@@ -86,6 +88,8 @@ Bluetooth bulbs are controlled from the menu bar app only.
 | `Tests/Deliveries/` | Delivery alerts end to end: fake Gmail and Google script servers, and the script itself in node |
 | `Tests/Bluetooth/` | Bluetooth scenarios (phone grabs the bulb, failures, resets…) against a stand-in CoreBluetooth; run on Linux |
 | `build.sh` | Compiles and installs `~/Applications/Hammer.app` |
+| `signing.sh` | Signs every build with the same local certificate, so macOS remembers Hammer's permissions across updates |
+| `Tests/Signing/` | Tests for `signing.sh` with stand-ins for macOS's `security` and `codesign` |
 | `update.sh` | Pulls the latest commit and rebuilds |
 | `install-hammer.sh` | One-time setup |
 
