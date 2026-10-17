@@ -239,6 +239,7 @@ final class FakeMonitor: DDCBus {
     var setSkew = 0                                // rounds what it's set to by this much
     var edid: [UInt8]? = makeEDID("DELL U3818DW")  // what macOS has for it
     var edidReadStatus: Int32 = 0                  // reading the EDID over I²C (0x50)
+    var edidReadGarbage = false                    // ...gives back something else
     var oneRequestOnly = false                     // a second request before the read confuses it
     var supported: Set<UInt8> = [0x10, 0x12, 0x62]
     var values: [UInt8: (current: UInt16, max: UInt16)] = [0x10: (40, 100), 0x12: (75, 100), 0x62: (20, 100)]
@@ -277,6 +278,7 @@ final class FakeMonitor: DDCBus {
         reads.append((chip, offset))
         if chip == EDID.chip {
             if edidReadStatus != 0 { return (edidReadStatus, []) }
+            if edidReadGarbage || offset != 0 { return (0, [UInt8](repeating: 0x5A, count: count)) }
             return (0, Array(((edid ?? []) + [UInt8](repeating: 0, count: count)).prefix(count)))
         }
         if readStatus != 0 { return (readStatus, []) }
@@ -298,8 +300,9 @@ final class FakeMonitor: DDCBus {
     }
 }
 
-/// A 128-byte EDID with a model name and a valid checksum.
-func makeEDID(_ name: String) -> [UInt8] {
+/// An EDID with a model name and valid checksums: base block only, or with a
+/// CTA-861 extension listing HDMI's vendor block (what a monitor's HDMI input gives).
+func makeEDID(_ name: String, hdmi: Bool = false, hdmiForum: Bool = false, interface: UInt8? = nil) -> [UInt8] {
     var edid = [UInt8](repeating: 0, count: 128)
     edid.replaceSubrange(0..<8, with: [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00])
     edid[8] = 0x10; edid[9] = 0xAC                                    // "DEL"
@@ -307,8 +310,19 @@ func makeEDID(_ name: String) -> [UInt8] {
     edid.replaceSubrange(72..<77, with: [0x00, 0x00, 0x00, 0xFC, 0x00])  // second descriptor: the name
     for (index, byte) in text.enumerated() { edid[77 + index] = byte }
     for index in (77 + text.count)..<90 { edid[index] = 0x20 }
+    if let interface {                                                // EDID 1.4 names the input
+        edid[18] = 1; edid[19] = 4; edid[20] = 0x80 | 0x20 | interface
+    }
+    if hdmi || hdmiForum { edid[126] = 1 }
     edid[127] = 0 &- edid[0..<127].reduce(UInt8(0), &+)
-    return edid
+    guard hdmi || hdmiForum else { return edid }
+    var cta = [UInt8](repeating: 0, count: 128)
+    let oui: [UInt8] = hdmiForum ? [0xD8, 0x5D, 0xC4] : [0x03, 0x0C, 0x00]
+    let blocks: [UInt8] = [0x42, 0x10, 0x04] + [0x65] + oui + [0x10, 0x00]   // a video block, then the vendor block
+    cta.replaceSubrange(0..<4, with: [0x02, 0x03, UInt8(4 + blocks.count), 0x00])
+    cta.replaceSubrange(4..<(4 + blocks.count), with: blocks)
+    cta[127] = 0 &- cta[0..<127].reduce(UInt8(0), &+)
+    return edid + cta
 }
 
 /// Counts the waiting a link does instead of doing it.
@@ -388,9 +402,9 @@ monitor = FakeMonitor(); monitor.ddcOn = false
 clock = Clock()
 link = fastLink(monitor, usbC, clock)
 read = link.read(code: 0x10)
-expect(!read.answered && read.sent && read.tries == 6 && read.lastReply == [UInt8](repeating: 0, count: 11),
-       "no answer after trying every way twice")
-expect(clock.slept < 700_000, "gives up within 0.7 s (\(clock.slept) µs)")
+expect(!read.answered && read.sent && read.tries == 7 && read.lastReply == [UInt8](repeating: 0, count: 11),
+       "no answer after trying every way twice, and once slowly")
+expect(clock.slept < 800_000, "gives up within 0.8 s (\(clock.slept) µs)")
 expect(link.knownWay == nil, "nothing learned")
 expect(link.write(code: 0x10, value: 50) == 0 && monitor.values[0x10]?.current == 40,
        "a set still goes out (it can't be confirmed)")
@@ -676,7 +690,7 @@ set = MonitorSet([MonitorSet.Member(port: dellPort, link: fastLink(silent[0], de
                   MonitorSet.Member(port: emptyPort, link: fastLink(silent[1], emptyPort.ways, clock)),
                   MonitorSet.Member(port: viaConverterPort(), link: fastLink(silent[2], viaConverter, clock))])
 expect(set.read(code: 0x10) == nil && !set.lastReadInterrupted, "three silent connections")
-expect(clock.slept < 2_500_000, "asked in under 2.5 s of waiting (\(clock.slept) µs)")
+expect(clock.slept < 3_200_000, "asked in under 3.2 s of waiting (\(clock.slept) µs)")
 clock.slept = 0
 var stopChecks = 0
 set = MonitorSet([MonitorSet.Member(port: dellPort, link: fastLink(silent[0], dellPort.ways, clock)),
@@ -824,34 +838,110 @@ let lidClosed = [MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, fram
 dell = FakeMonitor(); dell.readStatus = avError
 check = runCheck(proUSBC, lidClosed, [301: dell])
 expect(check.verdict == .noAnswer && check.wireReads == true, "DDC reads fail, the EDID reads fine")
-expect(check.text.contains("macOS's EDID for it: DELL U3818DW") && check.text.contains("Read errors: e0114103 ×6")
-       && check.text.contains("Its EDID over the same wire: read fine")
-       && check.text.contains("One slow try (one request, 150 ms wait): no answer after 2 tries, e0114103 ×2")
+expect(check.text.contains("Its ID info (EDID), from macOS: DELL U3818DW") && check.text.contains("Read errors: e0114103 ×7")
+       && check.text.contains("Brightness: no answer after 7 tries")
+       && check.text.contains("Its ID info (EDID) over the same wire: read fine")
        && check.advice.joined().contains("its control channel (DDC/CI) doesn't answer")
+       && check.advice.joined().contains("not through a hub, dock or adapter")
        && check.advice.joined().contains("Unplug the monitor's power cord for 10 seconds"), "the report says so:\n\(check.text)")
 dell = FakeMonitor(); dell.readStatus = avError; dell.edidReadStatus = avError
 check = runCheck(proUSBC, lidClosed, [301: dell])
 expect(check.verdict == .noAnswer && check.wireReads == false
-       && check.text.contains("Its EDID over the same wire: failed (error e0114103)")
-       && check.advice.first == "Result: macOS can't read anything back over this connection, not even the monitor's EDID.",
+       && check.text.contains("Its ID info (EDID) over the same wire: failed (error e0114103)")
+       && check.advice.first == "Result: Nothing comes back from the DELL U3818DW over this connection, not even its ID info (EDID)."
+       && check.advice.joined().contains("Menu → Others → DDC/CI → On"),
        "nothing can be read back at all")
 dell = FakeMonitor(); dell.readStatus = avError; dell.edid = nil
 check = runCheck(proUSBC, lidClosed, [301: dell])
-expect(!check.text.contains("macOS's EDID for it"), "no EDID from macOS: not mentioned")
+expect(!check.text.contains("from macOS"), "no EDID from macOS: not mentioned")
+expect(!dell.writes.contains { $0.chip == EDID.chip } && dell.reads.contains { $0.chip == EDID.chip && $0.offset == 0 },
+       "the EDID is only ever read, from the start, never written")
+dell = FakeMonitor(); dell.readStatus = avError; dell.edidReadGarbage = true
+check = runCheck(proUSBC, lidClosed, [301: dell])
+expect(check.wireReads == nil && check.text.contains("over the same wire: came back, but not as expected")
+       && check.advice.first == "Result: Hammer sent messages to the DELL U3818DW, but it didn't answer.",
+       "something that isn't an EDID: inconclusive, the general advice")
+let convEntries = [framebuffer(400, "DELL U3818DW", display: true, transport: "DP → HDMI"),
+                   proxy(401, provider: "AppleDCPMCDP29XX")]
+dell = FakeMonitor(); dell.chip = 0xB7; dell.readStatus = avError
+check = runCheck(convEntries, [MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 400, direct: true)], [401: dell])
+expect(check.ports[0].edidOverI2C == nil && check.verdict == .noAnswer && check.advice.joined().contains("1. On the monitor")
+       && check.advice.joined().contains("Use USB-C rather than HDMI"), "through the M1 HDMI converter: no EDID probe")
+expect(check.ports[0].brightness.tries == 9,
+       "converter: 3 ways × 2 on 0xB7, 0x37 refused after 2, one slow try on 0xB7")
 
 // A monitor confused by the request being sent twice: only the slow single request works.
 dell = FakeMonitor(); dell.oneRequestOnly = true
 check = runCheck(proUSBC, lidClosed, [301: dell])
-expect(check.verdict == .working && check.ports[0].slowRead?.answered == true && dell.requestsLost > 0
-       && check.text.contains("One slow try (one request, 150 ms wait): 40 of 100") && dell.values[0x10]?.current == 40,
-       "answers only a single request: found, tested and put back")
+expect(check.verdict == .working && check.ports[0].brightness.slow && dell.requestsLost > 0
+       && check.text.contains("only when asked slowly (one request, 150 ms wait)") && dell.values[0x10]?.current == 40
+       && check.ports[0].restored == true, "answers only a single request: found, tested and put back")
+dell = FakeMonitor(); dell.oneRequestOnly = true
+set = MonitorSet([member(dellPort, dell)])
+expect(set.read(code: 0x10)?.reading.current == 40 && set.members[0].link.slow, "the app learns it too")
+read = set.members[0].link.read(code: 0x12)
+expect(read.reading?.current == 75 && read.tries == 1, "and asks slowly straight away next time")
 dell = FakeMonitor()
 check = runCheck(proUSBC, lidClosed, [301: dell])
-expect(check.ports[0].slowRead == nil && check.ports[0].edidOverI2C == nil && check.wireReads == nil
+expect(check.ports[0].edidOverI2C == nil && check.wireReads == nil && !check.ports[0].brightness.slow
        && !dell.reads.contains { $0.chip == EDID.chip }, "a working monitor isn't probed further")
 dell = FakeMonitor(); dell.writeStatus = Int32(bitPattern: 0xE00002BC)
 check = runCheck(proUSBC, lidClosed, [301: dell])
-expect(check.ports[0].edidOverI2C == nil && check.ports[0].slowRead == nil, "nothing sent: no probing either")
+expect(check.ports[0].edidOverI2C == nil && check.ports[0].brightness.tries == 2, "nothing sent: no probing, no slow try")
+
+// A real-looking EDID: timing first, then serial, the name padded with zeros, then range limits.
+var realEDID = makeEDID("X")
+realEDID.replaceSubrange(54..<72, with: [0x56, 0x5E] + [UInt8](repeating: 0x11, count: 16))      // a timing
+realEDID.replaceSubrange(72..<90, with: [0, 0, 0, 0xFF, 0] + Array("ABC123".utf8) + [0x0A] + [UInt8](repeating: 0x20, count: 6))
+realEDID.replaceSubrange(90..<108, with: [0, 0, 0, 0xFC, 0] + Array("DELL U3818DW".utf8) + [0x00])
+realEDID.replaceSubrange(108..<126, with: [0, 0, 0, 0xFD, 0] + [UInt8](repeating: 0x30, count: 13))
+realEDID[127] = 0 &- realEDID[0..<127].reduce(UInt8(0), &+)
+expect(EDID.isValid(realEDID) && EDID.name(realEDID) == "DELL U3818DW", "EDID laid out like a real one, zero padding")
+var twoNames = realEDID
+twoNames.replaceSubrange(72..<90, with: [0, 0, 0, 0xFC, 0] + [UInt8](repeating: 0x20, count: 13))
+expect(EDID.name(twoNames) == "DELL U3818DW", "an empty name descriptor is skipped")
+
+// Which probes count: the port with the monitor.
+dell = FakeMonitor(); dell.readStatus = avError
+let deadEmpty = FakeMonitor(); deadEmpty.readStatus = avError; deadEmpty.edidReadStatus = avError
+let mixEntries = [framebuffer(300, "DELL U3818DW", display: true), proxy(301), framebuffer(500), proxy(501)]
+check = runCheck(mixEntries, [MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 300, direct: true)],
+                 [301: dell, 501: deadEmpty])
+expect(check.wireReads == true, "the empty port's failed probe doesn't count against the Dell's")
+
+
+// MARK: Monitor: a USB-C to HDMI cable (what the user had)
+
+expect(EDID.input(makeEDID("DELL U3818DW", hdmi: true)) == .hdmi, "EDID: HDMI vendor block → HDMI input")
+expect(EDID.input(makeEDID("DELL U3818DW", hdmiForum: true)) == .hdmi, "EDID: HDMI Forum block → HDMI input")
+expect(EDID.input(makeEDID("DELL U3818DW", interface: 0x5)) == .displayPort, "EDID 1.4: DisplayPort")
+expect(EDID.input(makeEDID("DELL U3818DW", interface: 0x2)) == .hdmi, "EDID 1.4: HDMI-a")
+expect(EDID.input(makeEDID("DELL U3818DW")) == nil, "plain EDID: can't tell")
+var brokenCTA = makeEDID("DELL U3818DW", hdmi: true); brokenCTA[128 + 2] = 200
+expect(EDID.input(brokenCTA) == nil || EDID.input(brokenCTA) == .hdmi, "a nonsense extension doesn't crash")
+expect(EDID.input(Array(makeEDID("DELL U3818DW", hdmi: true).prefix(128))) == nil, "extension missing: can't tell")
+expect(EDID.name(makeEDID("DELL U3818DW", hdmi: true)) == "DELL U3818DW", "name still found with an extension")
+
+dell = FakeMonitor(); dell.readStatus = avError; dell.edid = makeEDID("DELL U3818DW", hdmi: true)
+check = runCheck(proUSBC, lidClosed, [301: dell])
+expect(check.verdict == .hdmiAdapter && check.ports[0].port.throughHDMIAdapter
+       && check.text.contains("Its ID info (EDID), from macOS: DELL U3818DW, on its HDMI input")
+       && check.advice.joined(separator: " ").contains("USB-C to USB-C cable from the Mac to the monitor's USB-C port")
+       && check.advice.joined(separator: " ").contains("Input Source → USB Type-C"), "USB-C to HDMI cable:\n\(check.text)")
+dell = FakeMonitor(); dell.edid = makeEDID("DELL U3818DW", hdmi: true)
+check = runCheck(proUSBC, lidClosed, [301: dell])
+expect(check.verdict == .working, "an adapter that does pass DDC: working")
+dell = FakeMonitor(); dell.readStatus = avError; dell.edid = makeEDID("DELL U3818DW", interface: 0x5)
+check = runCheck(proUSBC, lidClosed, [301: dell])
+expect(check.verdict == .noAnswer && check.text.contains("on its DisplayPort/USB-C input"), "on DisplayPort: not the adapter")
+dell = FakeMonitor(); dell.chip = 0xB7; dell.ddcOn = false; dell.edid = makeEDID("DELL U3818DW", hdmi: true)
+empty = FakeMonitor(); empty.writeStatus = Int32(bitPattern: 0xE00002C0)
+check = runCheck(proEntries, proScreens, [301: empty, 401: dell])
+expect(check.verdict == .noAnswer && !check.ports[0].port.throughHDMIAdapter, "the Mac's own HDMI port isn't \"an adapter\"")
+state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, hdmiAdapter: true)
+expect(state.sliders && state.hints.first == "The Dell is on HDMI through a USB-C adapter or cable,", "menu: names the adapter")
+state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: true, hdmiAdapter: true)
+expect(state.hints.isEmpty, "menu: an adapter that works isn't mentioned")
 
 // MARK: Text
 

@@ -21,11 +21,12 @@ Hammer finds which of the Mac's display connections the monitor is actually on (
 
 - **USB-C or DisplayPort, straight into the Mac**, works best.
 - **HDMI** works on most Macs. On M1-era Macs the HDMI port goes through a converter chip, and Hammer talks through it the way m1ddc does.
+- **USB-C to HDMI cables, adapters and hubs** usually don't pass brightness control: the converter inside drops it. Hammer spots this from the monitor's ID info (EDID) and says so. Use a USB-C to USB-C cable into the monitor's USB-C port instead (the U3818DW comes with one), then choose Menu → Input Source → USB Type-C on the Dell.
 - **DisplayLink docks, AirPlay and Sidecar** can't carry brightness control. Hammer says so in the menu.
 - **DDC/CI** has to be on in the monitor's own menu. On the Dell U3818DW: Menu → Others → DDC/CI → On.
 - **Locked brightness:** on the U3818DW, Uniformity Compensation (Menu → Display) locks Brightness and Contrast in the Standard and Color Temp. modes, and Dynamic Contrast locks Brightness in Game and Movie. The monitor then ignores Hammer as it does its own buttons (its Brightness/Contrast item is grayed out). Turn them off.
 
-The menu always offers **Check Monitor Connection…**, and says so if the monitor doesn't answer. It tests each step: whether macOS sees the monitor, which connection it's on, whether Hammer's messages go out, whether the monitor answers, and whether a change actually takes effect. It moves the brightness for a moment and puts it back. Then it tells you what to fix, and **Copy Report** copies the details. The same check runs in Terminal with `~/Hammer/Hammer monitor check`.
+The menu always offers **Check Monitor Connection…**, and says so if the monitor doesn't answer. It tests each step: whether macOS sees the monitor, which connection and which of the monitor's inputs it's on, whether Hammer's messages go out, whether anything can be read back over the cable (the monitor's ID info), whether the monitor answers, and whether a change actually takes effect. It moves the brightness for a moment and puts it back. Then it tells you what to fix, and **Copy Report** copies the details. The same check runs in Terminal with `~/Hammer/Hammer monitor check`.
 
 ## Bluetooth bulbs and your phone
 

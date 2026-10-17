@@ -927,6 +927,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var monitorCount = 0                     // connections found, for the menu
     private var monitorAttached = 0                  // ...with a monitor plugged in
     private var monitorHasDefault = false            // macOS's default connection is tried too
+    private var monitorViaHDMIAdapter = false        // on HDMI through a USB-C adapter (blocks control)
     private var monitorMisses = 0                    // reads in a row with no answer
     private var monitorScreens: [MonitorScreen] = []
     private var monitorAnswers: Bool?                // nil until asked
@@ -1622,6 +1623,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         monitorCount = monitors.members.filter { !$0.port.isDefault }.count
         monitorHasDefault = monitors.members.contains { $0.port.isDefault }
         monitorAttached = monitors.members.filter { $0.port.attached }.count
+        monitorViaHDMIAdapter = monitors.members.contains { $0.port.attached && $0.port.throughHDMIAdapter }
         monitorScreens = scan.screens
         monitorGeneration += 1
         monitorAnswers = nil
@@ -1682,7 +1684,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func addMonitor(to menu: NSMenu) {
         monitorSliders = [:]
         let state = MonitorMenu.make(connections: monitorCount, hasDefault: monitorHasDefault,
-                                     attached: monitorAttached, screens: monitorScreens, answers: monitorAnswers)
+                                     attached: monitorAttached, screens: monitorScreens, answers: monitorAnswers,
+                                     hdmiAdapter: monitorViaHDMIAdapter)
         if let title = state.title { menu.addItem(label(title)) }
         if state.sliders {
             menu.addItem(monitorSlider("Brightness", code: DDCCode.brightness))

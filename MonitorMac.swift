@@ -48,9 +48,10 @@ final class AVServiceBus: DDCBus {
     func copyEDID() -> [UInt8]? {
         guard let copy = Self.copyEDIDFunction else { return nil }
         var data: UnsafeRawPointer?
-        guard copy(Unmanaged.passUnretained(service).toOpaque(), &data) == 0, let data else { return nil }
-        let edid = Unmanaged<CFData>.fromOpaque(data).takeRetainedValue() as Data
-        return [UInt8](edid)
+        let status = copy(Unmanaged.passUnretained(service).toOpaque(), &data)
+        guard let data else { return nil }
+        let edid = Unmanaged<CFData>.fromOpaque(data).takeRetainedValue() as Data   // ours to release either way
+        return status == 0 ? [UInt8](edid) : nil
     }
 
     /// IOAVServiceCopyEDID(service, &data): private like the rest, looked up at run
@@ -73,10 +74,12 @@ enum MacMonitors {
 
         var monitors: MonitorSet {
             let ports = MonitorDiscovery.ports(in: entries, screens: screens)
-            var members = ports.compactMap { port in
-                services[port.connection].map {
-                    MonitorSet.Member(port: port, link: DDCLink(bus: AVServiceBus($0), ways: port.ways))
-                }
+            var members = ports.compactMap { found -> MonitorSet.Member? in
+                guard let service = services[found.connection] else { return nil }
+                let bus = AVServiceBus(service)
+                var port = found
+                port.monitorInput = bus.copyEDID().flatMap(EDID.input)
+                return MonitorSet.Member(port: port, link: DDCLink(bus: bus, ways: port.ways))
             }
             // Only with a monitor around: otherwise it can be the built-in screen's.
             if let service = defaultService,

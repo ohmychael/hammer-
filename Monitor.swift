@@ -122,14 +122,43 @@ enum EDID {
         bytes.count >= 128 && Array(bytes.prefix(8)) == header && bytes[0..<128].reduce(UInt8(0), &+) == 0
     }
 
+    enum Input: Equatable { case hdmi, displayPort }
+
+    /// Which of the monitor's inputs this EDID is for. An HDMI input lists HDMI's
+    /// vendor block (OUI 00-0C-03, or the HDMI Forum's C4-5D-D8) in its CTA-861
+    /// extension; EDID 1.4 can also name the interface in byte 20. nil: can't tell.
+    static func input(_ bytes: [UInt8]) -> Input? {
+        guard isValid(bytes) else { return nil }
+        let version14 = bytes[18] == 1 && bytes[19] >= 4
+        let interface = bytes[20] & 0x80 != 0 && version14 ? bytes[20] & 0x0F : 0
+        if interface == 0x5 { return .displayPort }
+        let extensions = Int(bytes[126])
+        for index in stride(from: 1, through: extensions, by: 1) where bytes.count >= (index + 1) * 128 {
+            let block = Array(bytes[(index * 128)..<((index + 1) * 128)])
+            guard block[0] == 0x02, block[2] >= 4 else { continue }      // CTA-861 extension
+            var at = 4
+            let end = min(Int(block[2]), 127)
+            while at < end {
+                let tag = block[at] >> 5, length = Int(block[at] & 0x1F)
+                if tag == 3, length >= 3, at + 3 < 128 {
+                    let oui = (block[at + 1], block[at + 2], block[at + 3])
+                    if oui == (0x03, 0x0C, 0x00) || oui == (0xD8, 0x5D, 0xC4) { return .hdmi }
+                }
+                at += length + 1
+            }
+        }
+        if interface == 0x2 || interface == 0x3 { return .hdmi }
+        return nil
+    }
+
     /// The model name it gives, e.g. "DELL U3818DW".
     static func name(_ bytes: [UInt8]) -> String? {
         guard bytes.count >= 128 else { return nil }
         for start in stride(from: 54, through: 108, by: 18)
         where bytes[start] == 0 && bytes[start + 1] == 0 && bytes[start + 3] == 0xFC {
-            let text = bytes[(start + 5)..<(start + 18)].prefix { $0 != 0x0A }
+            let text = bytes[(start + 5)..<(start + 18)].prefix { $0 != 0x0A && $0 != 0x00 }
             let name = String(decoding: text, as: UTF8.self).trimmingCharacters(in: .whitespaces)
-            return name.isEmpty ? nil : name
+            if !name.isEmpty { return name }
         }
         return nil
     }
@@ -165,6 +194,7 @@ struct DDCTiming {
     var writeCycles = 2                  // many monitors miss the odd message, so each is sent twice
     var triesPerWay = 2
     var triesOnKnownWay = 3
+    var slowRead: UInt32 = 150_000       // the last try waits this long, after a single request
 }
 
 /// What one read found out.
@@ -184,6 +214,7 @@ struct DDCRead: Equatable {
     var lastReply: [UInt8]?          // the last bytes read that weren't an answer
     var busy = false                 // the monitor said "nothing yet" at least once
     var interrupted = false          // stopped early (a slider moved), so this says nothing
+    var slow = false                 // answered only when asked slowly (one request, long wait)
     var tries = 0
 
     var answered: Bool { answer != .none }
@@ -200,6 +231,7 @@ final class DDCLink: @unchecked Sendable {
     let ways: [DDCWay]
     var timing: DDCTiming
     private(set) var knownWay: DDCWay?      // the way the monitor last answered on
+    private(set) var slow = false           // it answers only one request with a long wait
     private let sleep: (UInt32) -> Void
 
     init(bus: DDCBus, ways: [DDCWay], timing: DDCTiming = DDCTiming(),
@@ -236,14 +268,18 @@ final class DDCLink: @unchecked Sendable {
         return sent ? 0 : lastError
     }
 
-    /// Asks for a setting, trying each way until the monitor answers.
+    /// Asks for a setting, trying each way until the monitor answers. Last, one slow
+    /// try per address (a single request, a long wait), for monitors that want that;
+    /// if that's what works, it's used from then on.
     /// `stop` is checked between tries: reads give way to a slider being moved.
     func read(code: UInt8, stop: () -> Bool = { false }) -> DDCRead {
         var result = DDCRead()
         var order = ways
         if let known = knownWay { order = [known] + ways.filter { $0 != known } }
         var refusedChips: [UInt32] = []
-        var fallback: (way: DDCWay, current: UInt16, max: UInt16)?
+        var fallback: (way: DDCWay, current: UInt16, max: UInt16, slow: Bool)?
+        let cycles = slow ? 1 : timing.writeCycles
+        let wait = slow ? timing.slowRead : timing.beforeRead
 
         for way in order where !refusedChips.contains(way.chip) {
             let tries = way == knownWay ? timing.triesOnKnownWay : timing.triesPerWay
@@ -254,58 +290,94 @@ final class DDCLink: @unchecked Sendable {
                     return result
                 }
                 if attempt > 0 || result.tries > 0 { sleep(timing.betweenTries) }
-                result.tries += 1
-                let request = DDCPacket.get(code: code, seed: way.readSeed)
-                var sent = false
-                for _ in 0..<max(1, timing.writeCycles) {
-                    sleep(timing.beforeWrite)
-                    let status = bus.write(chip: way.chip, offset: DDCWay.hostAddress, request)
-                    if status == 0 { sent = true } else { result.sendError = status }
-                }
-                guard sent else { continue }
-                sentOnThisChip = true
-                result.sent = true
-
-                sleep(timing.beforeRead)
-                let (status, bytes) = bus.read(chip: way.chip, offset: way.readOffset, count: 11)
-                guard status == 0 else {
-                    result.readError = status
-                    result.readErrors[status, default: 0] += 1
+                switch ask(way, code: code, cycles: cycles, wait: wait, into: &result) {
+                case .notSent:
                     continue
-                }
-                switch DDCPacket.parseReply(bytes, code: code) {
-                case let .value(current, max):
-                    result.answer = .value(current: current, max: max)
-                    result.way = way
-                    result.checksumOK = true
-                    knownWay = way
-                    return result
-                case .unsupported:
-                    result.answer = .unsupported
-                    result.way = way
+                case .answered:
                     knownWay = way
                     return result
                 case let .badChecksum(current, max):
-                    if fallback == nil { fallback = (way, current, max) }
-                    result.lastReply = bytes
-                case .busy:
-                    result.busy = true
-                    result.lastReply = bytes
-                case .nothing, .garbage:
-                    result.lastReply = bytes
+                    sentOnThisChip = true
+                    if fallback == nil { fallback = (way, current, max, slow) }
+                case .noAnswer:
+                    sentOnThisChip = true
                 }
             }
             // Every request on this chip was refused: other ways on it won't do better.
             if !sentOnThisChip { refusedChips.append(way.chip) }
         }
 
+        if !slow && result.sent && fallback == nil {
+            var chips: [UInt32] = []
+            for way in order where !refusedChips.contains(way.chip) && !chips.contains(way.chip) {
+                chips.append(way.chip)
+                if stop() {
+                    result.interrupted = true
+                    return result
+                }
+                sleep(timing.betweenTries)
+                if case .answered = ask(way, code: code, cycles: 1, wait: timing.slowRead, into: &result) {
+                    knownWay = way
+                    slow = true
+                    result.slow = true
+                    return result
+                }
+            }
+        }
+
         if let fallback {
             result.answer = .value(current: fallback.current, max: fallback.max)
             result.way = fallback.way
             result.checksumOK = false
+            result.slow = fallback.slow
             knownWay = fallback.way
         }
         return result
+    }
+
+    private enum Asked { case notSent, answered, badChecksum(UInt16, UInt16), noAnswer }
+
+    /// One try: send the request (`cycles` times), wait, read the answer.
+    private func ask(_ way: DDCWay, code: UInt8, cycles: Int, wait: UInt32, into result: inout DDCRead) -> Asked {
+        result.tries += 1
+        let request = DDCPacket.get(code: code, seed: way.readSeed)
+        var sent = false
+        for _ in 0..<max(1, cycles) {
+            sleep(timing.beforeWrite)
+            let status = bus.write(chip: way.chip, offset: DDCWay.hostAddress, request)
+            if status == 0 { sent = true } else { result.sendError = status }
+        }
+        guard sent else { return .notSent }
+        result.sent = true
+
+        sleep(wait)
+        let (status, bytes) = bus.read(chip: way.chip, offset: way.readOffset, count: 11)
+        guard status == 0 else {
+            result.readError = status
+            result.readErrors[status, default: 0] += 1
+            return .noAnswer
+        }
+        switch DDCPacket.parseReply(bytes, code: code) {
+        case let .value(current, max):
+            result.answer = .value(current: current, max: max)
+            result.way = way
+            result.checksumOK = true
+            return .answered
+        case .unsupported:
+            result.answer = .unsupported
+            result.way = way
+            return .answered
+        case let .badChecksum(current, max):
+            result.lastReply = bytes
+            return .badChecksum(current, max)
+        case .busy:
+            result.busy = true
+            result.lastReply = bytes
+            return .noAnswer
+        case .nothing, .garbage:
+            result.lastReply = bytes
+            return .noAnswer
+        }
     }
 }
 
@@ -348,6 +420,7 @@ struct MonitorPort: Equatable {
     var transport: String?
     var label: String?               // e.g. "dcpext0"
     var isDefault = false            // macOS's default connection (IOAVServiceCreate), as plain m1ddc uses
+    var monitorInput: EDID.Input?    // which of the monitor's inputs it's on (from its EDID)
 
     /// m1ddc's last resort: the connection macOS picks by itself.
     static let macDefault = MonitorPort(connection: 0, framebuffer: nil, name: nil, attached: false,
@@ -362,6 +435,9 @@ struct MonitorPort: Equatable {
     var looksLikeHDMI: Bool {
         throughHDMIConverter || (transport?.uppercased().contains("HDMI") ?? false)
     }
+    /// The Mac sends DisplayPort, the monitor gets HDMI: a USB-C to HDMI cable,
+    /// adapter or hub converts it on the way, and most of those drop DDC.
+    var throughHDMIAdapter: Bool { monitorInput == .hdmi && !looksLikeHDMI }
 }
 
 enum MonitorDiscovery {
@@ -519,7 +595,6 @@ struct MonitorCheck {
         var noService = false        // macOS gave no way to talk to it
         var edidName: String?        // the monitor's name from the EDID macOS has for this connection
         var edidOverI2C: EDIDRead?   // tried only if the monitor doesn't answer
-        var slowRead: DDCRead?       // a last slow try, only if it doesn't answer
         var brightness = DDCRead()
         var contrast: DDCRead?
         var change: Change?
@@ -536,6 +611,7 @@ struct MonitorCheck {
         case notDirect               // DisplayLink, AirPlay or Sidecar
         case notFound                // macOS shows it, Hammer can't find its connection
         case cantSend                // macOS refused every message
+        case hdmiAdapter             // no answer, and it's on HDMI through a USB-C adapter
         case noAnswer                // sent, but the monitor never answered
     }
 
@@ -570,27 +646,18 @@ struct MonitorCheck {
     private static func test(_ port: MonitorPort, bus: DDCBus, timing: DDCTiming,
                              sleep: @escaping (UInt32) -> Void) -> PortResult {
         var result = PortResult(port: port)
-        result.edidName = bus.copyEDID().flatMap(EDID.name)
-        var link = DDCLink(bus: bus, ways: port.ways, timing: timing, sleep: sleep)
+        let edid = bus.copyEDID()
+        result.edidName = edid.flatMap(EDID.name)
+        if let edid { result.port.monitorInput = EDID.input(edid) }
+        let link = DDCLink(bus: bus, ways: port.ways, timing: timing, sleep: sleep)
         result.brightness = link.read(code: DDCCode.brightness)
 
-        if !result.brightness.answered && result.brightness.sent {
-            // Can anything be read over this connection? Every monitor answers at 0x50.
+        if !result.brightness.answered && result.brightness.sent && !port.throughHDMIConverter {
+            // Can anything be read over this connection? Every monitor's ID info (EDID)
+            // answers at 0x50: a read, with offset 0 to start at the beginning. Not
+            // through the M1 HDMI converter, where 0x50 may not reach the monitor.
             let (status, bytes) = bus.read(chip: EDID.chip, offset: 0, count: 128)
             result.edidOverI2C = EDIDRead(status: status, valid: status == 0 && EDID.isValid(bytes))
-            // A last slow try: one request, a long wait.
-            var slow = timing
-            slow.writeCycles = 1
-            slow.beforeRead = 150_000
-            slow.triesPerWay = 2
-            slow.triesOnKnownWay = 2
-            let slowLink = DDCLink(bus: bus, ways: [port.ways[0]], timing: slow, sleep: sleep)
-            let slowRead = slowLink.read(code: DDCCode.brightness)
-            result.slowRead = slowRead
-            if slowRead.answered {
-                link = slowLink
-                result.brightness = slowRead
-            }
         }
         guard result.brightness.answered else { return result }
         result.contrast = link.read(code: DDCCode.contrast)
@@ -660,6 +727,7 @@ struct MonitorCheck {
         // Nothing known to have a monitor: every connection is a candidate.
         let candidates = attached.isEmpty ? ports : attached
         if candidates.allSatisfy({ $0.port.isDefault }) { return .notFound }   // only macOS's guess was left
+        if candidates.contains(where: { $0.port.throughHDMIAdapter }) { return .hdmiAdapter }
         if candidates.allSatisfy({ $0.noService || !$0.brightness.sent }) { return .cantSend }
         return .noAnswer
     }
@@ -669,8 +737,9 @@ struct MonitorCheck {
     var wireReads: Bool? {
         let probes = ports.filter { $0.port.attached || ports.allSatisfy { !$0.port.attached } }
             .compactMap { $0.edidOverI2C }
-        if probes.isEmpty { return nil }
-        return probes.contains { $0.valid }
+        if probes.contains(where: { $0.valid }) { return true }
+        if !probes.isEmpty && probes.allSatisfy({ $0.status != 0 }) { return false }
+        return nil                   // not tried, or something came back that wasn't an EDID
     }
 
     /// The monitor's name for messages: "the DELL U3818DW", or "the monitor".
@@ -721,7 +790,10 @@ struct MonitorCheck {
                 lines.append("  macOS gave Hammer no way to talk to it")
                 continue
             }
-            if let name = result.edidName { lines.append("  macOS's EDID for it: \(name)") }
+            if let name = result.edidName {
+                let input = port.monitorInput.map { $0 == .hdmi ? ", on its HDMI input" : ", on its DisplayPort/USB-C input" } ?? ""
+                lines.append("  Its ID info (EDID), from macOS: \(name)\(input)")
+            }
             let b = result.brightness
             lines.append("  Sent: " + (b.sent ? "yes" : "no" + (b.sendError.map { " (error \(Self.hex($0)))" } ?? "")))
             lines.append("  Brightness: " + Self.describe(b))
@@ -742,7 +814,9 @@ struct MonitorCheck {
             case nil:
                 break
             }
-            if let way = b.way { lines.append("  Answered on: \(way)") }
+            if let way = b.way {
+                lines.append("  Answered on: \(way)" + (b.slow ? ", only when asked slowly (one request, 150 ms wait)" : ""))
+            }
             if !b.answered, let reply = b.lastReply {
                 lines.append("  Last reply: " + reply.map { String(format: "%02X", $0) }.joined(separator: " "))
             }
@@ -750,12 +824,8 @@ struct MonitorCheck {
                 lines.append("  Read errors: " + Self.describe(b.readErrors))
             }
             if let probe = result.edidOverI2C {
-                lines.append("  Its EDID over the same wire: " + (probe.valid ? "read fine"
-                    : probe.status != 0 ? "failed (error \(Self.hex(probe.status)))" : "came back, but not an EDID"))
-            }
-            if let slow = result.slowRead {
-                lines.append("  One slow try (one request, 150 ms wait): " + Self.describe(slow)
-                             + (slow.answered || slow.readErrors.isEmpty ? "" : ", " + Self.describe(slow.readErrors)))
+                lines.append("  Its ID info (EDID) over the same wire: " + (probe.valid ? "read fine"
+                    : probe.status != 0 ? "failed (error \(Self.hex(probe.status)))" : "came back, but not as expected"))
             }
         }
 
@@ -799,21 +869,29 @@ struct MonitorCheck {
             return ["Result: macOS wouldn't let Hammer send anything to \(name).",
                     hdmi ? "This Mac's HDMI port doesn't pass monitor control. Plug the monitor's USB-C (or DisplayPort) cable straight into the Mac instead."
                          : "Plug its USB-C cable straight into the Mac (not through a hub, dock or adapter), then check again."]
+        case .hdmiAdapter:
+            return ["Result: \(Name) is plugged in with HDMI on its side, through a USB-C to HDMI cable,",
+                    "adapter or hub. Those convert the signal and usually drop brightness control (DDC/CI).",
+                    "Use a USB-C to USB-C cable from the Mac to the monitor's USB-C port instead",
+                    "(the Dell U3818DW comes with one), or USB-C to DisplayPort. Then, on the monitor,",
+                    "choose Menu → Input Source → USB Type-C (or DP), and check again."]
         case .noAnswer where wireReads == true:
-            return ["Result: Hammer can read from \(name) over this cable (its EDID came back),",
+            return ["Result: Hammer can read \(name)'s ID info (EDID) over this connection,",
                     "but its control channel (DDC/CI) doesn't answer. Try these, checking again after each:",
                     "  1. On the monitor: Menu → Others → DDC/CI → On.",
-                    "  2. Unplug the monitor's power cord for 10 seconds, plug it back in, and turn it on."]
-                + (hdmi ? ["  3. Use USB-C rather than HDMI: this Mac's HDMI port may not pass control."] : [])
-                + ["  \(hdmi ? 4 : 3). Move Hammer's Brightness slider and watch the screen: some monitors take changes without answering.",
-                   "If it still doesn't work, send this report along."]
+                    "  2. Unplug the monitor's power cord for 10 seconds, plug it back in, and turn it on.",
+                    "  3. Plug its USB-C cable straight into the Mac, not through a hub, dock or adapter."
+                        + (hdmi ? " Use USB-C rather than HDMI." : ""),
+                    "  4. Move Hammer's Brightness slider and watch the screen: some monitors take changes without answering.",
+                    "If it still doesn't work, send this report along."]
         case .noAnswer where wireReads == false:
-            return ["Result: macOS can't read anything back over this connection, not even the monitor's EDID.",
-                    "Messages go out, but nothing comes back. Try these, checking again after each:",
+            return ["Result: Nothing comes back from \(name) over this connection, not even its ID info (EDID).",
+                    "Messages go out, but no answers return. Try these, checking again after each:",
                     "  1. Use a USB-C cable straight from the Mac to the monitor's USB-C port (no hub, dock or adapter),",
                     "     and try another USB-C port on the Mac.",
-                    "  2. Unplug the monitor's power cord for 10 seconds, plug it back in, and turn it on.",
-                    "  3. Move Hammer's Brightness slider and watch the screen: changes may still get through.",
+                    "  2. On the monitor: Menu → Others → DDC/CI → On.",
+                    "  3. Unplug the monitor's power cord for 10 seconds, plug it back in, and turn it on.",
+                    "  4. Move Hammer's Brightness slider and watch the screen: changes may still get through.",
                     "If it still doesn't work, send this report along."]
         case .noAnswer:
             return ["Result: Hammer sent messages to \(name), but it didn't answer.",
@@ -867,7 +945,7 @@ struct MonitorMenu: Equatable {
     /// `hasDefault`: macOS's default connection is being tried too; `attached`: ports
     /// with a monitor seen; `answers`: whether one gave a value when last asked.
     static func make(connections: Int, hasDefault: Bool = false, attached: Int, screens: [MonitorScreen],
-                     answers: Bool?) -> MonitorMenu {
+                     answers: Bool?, hdmiAdapter: Bool = false) -> MonitorMenu {
         let external = screens.filter { !$0.builtIn }
         let virtualOnly = !external.isEmpty && external.allSatisfy { $0.direct == false }
         if attached == 0 && external.isEmpty {
@@ -888,6 +966,9 @@ struct MonitorMenu: Equatable {
         var menu = MonitorMenu(sliders: true, offerCheck: true)
         if connections == 0 && answers != true {
             menu.hints.append("Can't find the Dell's port; trying the Mac's default.")
+        } else if answers == false && hdmiAdapter {
+            menu.hints += ["The Dell is on HDMI through a USB-C adapter or cable,",
+                           "which blocks control. Use USB-C to USB-C instead."]
         } else if answers == false {
             menu.hints.append("The Dell isn't answering Hammer.")
         }
