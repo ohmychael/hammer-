@@ -16,6 +16,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash          # bash -eo pipefail: a failure inside "… | tee" fails the step
+
 jobs:
   build:
     runs-on: macos-15

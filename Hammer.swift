@@ -921,7 +921,8 @@ func hotKeyPressed(_ call: EventHandlerCallRef?, _ event: EventRef?, _ userData:
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
-    // Monitor (Monitor.swift, MonitorMac.swift). `monitors` is used on ddcQueue only.
+    // Monitor (Monitor.swift, MonitorMac.swift). The MonitorSet object talks to the
+    // monitor and keeps what it learns, so it's only ever used on ddcQueue.
     private var monitors = MonitorSet([])
     private var monitorCount = 0                     // connections found, for the menu
     private var monitorAttached = 0                  // ...with a monitor plugged in
@@ -930,6 +931,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var monitorValues: [UInt8: (current: UInt16, max: UInt16)] = [:]
     private var monitorSliders: [UInt8: NSSlider] = [:]
     private var monitorMoved: [UInt8: Date] = [:]    // when you last moved each slider
+    private let sliderMoves = SliderMoves()          // the same, for reads in the background
     private var monitorReadAt: Date?
     private var monitorGeneration = 0                // bumps when the monitor list is rebuilt
     private var checkingMonitor = false
@@ -1168,7 +1170,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         menuIsOpen = true
         GoveeBluetooth.shared.rescan()
-        readMonitor(ifOlderThan: 5)          // catches changes made with the monitor's own buttons
+        // Catches changes made with the monitor's own buttons, and a monitor that
+        // starts answering (e.g. DDC/CI switched on). Asking a silent one is slow,
+        // so that's at most once a minute.
+        readMonitor(ifOlderThan: monitorAnswers == false ? 60 : 5)
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -1626,28 +1631,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func readMonitor(ifOlderThan seconds: TimeInterval) {
         guard monitorCount > 0 else { return }
         if let last = monitorReadAt, Date().timeIntervalSince(last) < seconds { return }
-        monitorReadAt = Date()
-        let set = monitors, generation = monitorGeneration
+        let started = Date()
+        monitorReadAt = started
+        let set = monitors, generation = monitorGeneration, moves = sliderMoves
         ddcQueue.async {
+            // Stops between tries if you move a slider, so your change goes out first.
+            let stop = { moves.movedSince(started) }
             var values: [UInt8: (current: UInt16, max: UInt16)] = [:]
-            if let brightness = set.read(code: DDCCode.brightness) {
+            if let brightness = set.read(code: DDCCode.brightness, stop: stop) {
                 values[DDCCode.brightness] = brightness.reading
-                if let contrast = brightness.member.link.read(code: DDCCode.contrast).reading {
+                if let contrast = brightness.member.link.read(code: DDCCode.contrast, stop: stop).reading {
                     values[DDCCode.contrast] = contrast
                 }
             }
-            let found = values, answers = set.anyAnswers
-            Task { @MainActor in self.monitorWasRead(found, answers: answers, generation: generation) }
+            let found = values
+            let answers: Bool? = set.lastReadInterrupted ? nil : set.anyAnswers
+            Task { @MainActor in
+                self.monitorWasRead(found, answers: answers, started: started, generation: generation)
+            }
         }
     }
 
-    private func monitorWasRead(_ values: [UInt8: (current: UInt16, max: UInt16)], answers: Bool,
-                                generation: Int) {
+    private func monitorWasRead(_ values: [UInt8: (current: UInt16, max: UInt16)], answers: Bool?,
+                                started: Date, generation: Int) {
         guard generation == monitorGeneration else { return }      // the monitors changed meanwhile
+        guard let answers else {                                    // interrupted: ask again next time
+            monitorReadAt = nil
+            return
+        }
         let before = monitorAnswers
         monitorAnswers = answers
         for (code, value) in values {
-            if let moved = monitorMoved[code], Date().timeIntervalSince(moved) < 3 { continue }   // don't fight your hand
+            if let moved = monitorMoved[code], moved >= started { continue }   // you moved it since: yours wins
             monitorValues[code] = value
             if let slider = monitorSliders[code] { show(value, on: slider) }
         }
@@ -1656,27 +1671,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func addMonitor(to menu: NSMenu) {
         monitorSliders = [:]
-        let external = monitorScreens.filter { !$0.builtIn }
-        if monitorAttached == 0 && external.isEmpty {
-            menu.addItem(label("Dell not connected"))
-            menu.addItem(hint("Plug it in with USB-C or DisplayPort."))
-            menu.addItem(hint("Hammer picks it up automatically."))
-            menu.addItem(hint("Not a DisplayLink dock — those block control."))
-        } else if monitorAttached == 0 && external.allSatisfy({ $0.direct == false }) {
-            menu.addItem(label("Dell connected through DisplayLink or AirPlay"))
-            menu.addItem(hint("Brightness control needs a direct cable:"))
-            menu.addItem(hint("USB-C or DisplayPort straight into the Mac."))
-        } else if monitorCount == 0 {
-            menu.addItem(label("Can't find the Dell's connection"))
-            menu.addItem(checkMonitorItem())
-        } else {
+        let state = MonitorMenu.make(connections: monitorCount, attached: monitorAttached,
+                                     screens: monitorScreens, answers: monitorAnswers)
+        if let title = state.title { menu.addItem(label(title)) }
+        if state.sliders {
             menu.addItem(monitorSlider("Brightness", code: DDCCode.brightness))
             menu.addItem(monitorSlider("Contrast", code: DDCCode.contrast))
-            if monitorAnswers == false {
-                menu.addItem(hint("The Dell isn't answering Hammer."))
-                menu.addItem(checkMonitorItem())
-            }
         }
+        for line in state.hints { menu.addItem(hint(line)) }
+        if state.offerCheck { menu.addItem(checkMonitorItem()) }
     }
 
     private func monitorSlider(_ title: String, code: UInt8) -> NSMenuItem {
@@ -1696,6 +1699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let code = UInt8(slider.tag)
         let value = UInt16(slider.doubleValue.rounded())
         monitorMoved[code] = Date()
+        sliderMoves.moved()
         monitorValues[code] = (current: value, max: UInt16(slider.maxValue.rounded()))
         let set = monitors
         schedule("ddc-\(code)", on: ddcQueue, after: 0.05) {
@@ -2415,10 +2419,17 @@ enum Hammer {
                 return 2
             }
             _ = monitors.read(code: code)            // learns which connection answers, so it goes there
-            monitors.write(code: code, value: value)
-            let names = monitors.targets.map { $0.port.name ?? "the monitor" }
-            print("Sent to \(names.joined(separator: ", "))."
-                  + (monitors.anyAnswers ? "" : " It isn't answering, so Hammer can't confirm it."))
+            guard monitors.write(code: code, value: value) else {
+                print("macOS wouldn't send it. Run: ~/Hammer/Hammer monitor check")
+                return 1
+            }
+            if monitors.anyAnswers {
+                let names = Set(monitors.targets.map { $0.port.name ?? "the monitor" })
+                print("Sent to \(names.sorted().joined(separator: ", ")).")
+            } else {
+                print("Sent, but the monitor isn't answering, so Hammer can't confirm it took it."
+                      + " Run: ~/Hammer/Hammer monitor check")
+            }
         }
         return 0
     }

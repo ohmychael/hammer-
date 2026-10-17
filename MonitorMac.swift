@@ -9,10 +9,14 @@ import IOKit
 // MARK: - Private IOKit calls
 //
 // macOS has no public API for talking to a display over I²C on Apple Silicon.
-// These three functions live inside IOKit but aren't in any header, so we
-// declare them ourselves. MonitorControl, m1ddc and BetterDisplay all use them.
+// These functions live inside IOKit but aren't in any header, so we declare
+// them ourselves. MonitorControl, m1ddc and BetterDisplay all use them.
 
 typealias IOAVService = CFTypeRef
+
+/// macOS's default display connection: what plain `m1ddc set …` talks to.
+@_silgen_name("IOAVServiceCreate")
+func IOAVServiceCreate(_ allocator: CFAllocator?) -> Unmanaged<IOAVService>?
 
 @_silgen_name("IOAVServiceCreateWithService")
 func IOAVServiceCreateWithService(_ allocator: CFAllocator?, _ service: io_service_t) -> Unmanaged<IOAVService>?
@@ -48,22 +52,33 @@ enum MacMonitors {
     struct Scan {
         var entries: [RegistryEntry] = []
         var services: [UInt64: IOAVService] = [:]   // by connection, external ones only
+        var defaultService: IOAVService?               // macOS's default, tried last
         var screens: [MonitorScreen] = []
 
         var monitors: MonitorSet {
             let ports = MonitorDiscovery.ports(in: entries, screens: screens)
-            return MonitorSet(ports.compactMap { port in
+            var members = ports.compactMap { port in
                 services[port.connection].map {
                     MonitorSet.Member(port: port, link: DDCLink(bus: AVServiceBus($0), ways: port.ways))
                 }
-            })
+            }
+            // Only with an external monitor around: otherwise it can be the built-in screen's.
+            if hasExternal, let service = defaultService {
+                let port = MonitorPort.macDefault
+                members.append(MonitorSet.Member(port: port, link: DDCLink(bus: AVServiceBus(service), ways: port.ways)))
+            }
+            return MonitorSet(members)
         }
+
+        /// An external connection was found, or macOS shows an external screen.
+        var hasExternal: Bool { !services.isEmpty || screens.contains { !$0.builtIn } }
     }
 
     /// Reads the registry and the screen list. Call on the main thread (it asks NSScreen).
     static func scan() -> Scan {
         var scan = Scan()
         scan.screens = screens()
+        scan.defaultService = IOAVServiceCreate(kCFAllocatorDefault)?.takeRetainedValue()
 
         let root = IORegistryGetRootEntry(kIOMainPortDefault)
         defer { IOObjectRelease(root) }
@@ -85,8 +100,8 @@ enum MacMonitors {
             let entryName = String(cString: name)
             let isConnection = entryName == "DCPAVServiceProxy"
             let isFramebuffer = !isConnection
-                && (IOObjectConformsTo(entry, "IOMobileFramebuffer") != 0
-                    || entryName.contains("AppleCLCD2") || entryName.contains("IOMobileFramebufferShim"))
+                && (IOObjectConformsTo(entry, "IOMobileFramebuffer") != 0                 // m1ddc
+                    || entryName == "AppleCLCD2" || entryName == "IOMobileFramebufferShim")   // AppleSiliconDDC
             guard isConnection || isFramebuffer else { continue }
 
             var id: UInt64 = 0
@@ -204,6 +219,7 @@ enum MacMonitors {
     /// the monitor and takes a few seconds, so run it on the monitor queue.
     static func check(_ scan: Scan) -> MonitorCheck {
         MonitorCheck.run(mac: mac(), screens: scan.screens, entries: scan.entries,
-                         bus: { id in scan.services[id].map { AVServiceBus($0) } })
+                         bus: { id in scan.services[id].map { AVServiceBus($0) } },
+                         defaultBus: scan.hasExternal ? scan.defaultService.map { AVServiceBus($0) } : nil)
     }
 }

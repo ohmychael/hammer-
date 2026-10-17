@@ -234,6 +234,8 @@ final class FakeMonitor: DDCBus {
     var missFirst = 0                              // ignore this many "get" requests first
     var busyFirst = 0                              // answer this many reads with "nothing yet"
     var corruptReplies = false
+    var answerLimit = Int.max                      // goes quiet after this many answers
+    var applyLimit = Int.max                       // takes this many sets, then ignores them
     var supported: Set<UInt8> = [0x10, 0x12, 0x62]
     var values: [UInt8: (current: UInt16, max: UInt16)] = [0x10: (40, 100), 0x12: (75, 100), 0x62: (20, 100)]
 
@@ -250,7 +252,7 @@ final class FakeMonitor: DDCBus {
         if bytes[0] == 0x84, bytes[1] == 0x03, bytes.count == 6 {
             if checksSetChecksum, DDCPacket.checksum(bytes[0..<5], seed: 0x6E ^ 0x51) != bytes[5] { return 0 }
             sets.append((bytes[2], UInt16(bytes[3]) << 8 | UInt16(bytes[4])))
-            if applySets, let old = values[bytes[2]] {
+            if applySets, sets.count <= applyLimit, let old = values[bytes[2]] {
                 values[bytes[2]] = (Swift.min(UInt16(bytes[3]) << 8 | UInt16(bytes[4]), old.max), old.max)
             }
         } else if bytes[0] == 0x82, bytes[1] == 0x01, bytes.count == 4 {
@@ -267,12 +269,13 @@ final class FakeMonitor: DDCBus {
         if readStatus != 0 { return (readStatus, []) }
         if chip != self.chip { return (wrongChipStatus, []) }
         let silence = [UInt8](repeating: 0, count: count)
-        guard ddcOn, acceptedReadOffsets.contains(offset), let code = pending else { return (0, silence) }
+        guard ddcOn, acceptedReadOffsets.contains(offset), let code = pending, answerLimit > 0 else { return (0, silence) }
         if busyFirst > 0 {
             busyFirst -= 1
             return (0, [0x6E, 0x80, 0xBE] + [UInt8](repeating: 0, count: count - 3))
         }
         pending = nil
+        answerLimit -= 1
         let value = values[code] ?? (0, 0)
         var reply: [UInt8] = [0x6E, 0x88, 0x02, supported.contains(code) ? 0x00 : 0x01, code, 0x00,
                               UInt8(value.max >> 8), UInt8(value.max & 0xFF),
@@ -288,6 +291,10 @@ func fastLink(_ bus: DDCBus, _ ways: [DDCWay], _ clock: Clock = Clock()) -> DDCL
     DDCLink(bus: bus, ways: ways, sleep: { clock.slept += UInt64($0) })
 }
 let usbC = DDCWay.all(chip: 0x37)
+func viaConverterPort() -> MonitorPort {
+    MonitorPort(connection: 7, framebuffer: nil, name: nil, attached: false,
+                throughHDMIConverter: true, transport: nil, label: nil)
+}
 let viaConverter = MonitorPort(connection: 1, framebuffer: nil, name: nil, attached: true,
                                throughHDMIConverter: true, transport: nil, label: nil).ways
 
@@ -339,13 +346,13 @@ expect(link.write(code: 0x10, value: 10) == 0 && monitor.values[0x10]?.current =
 // Converter detected, but the monitor turns out to be on 0x37 after all.
 monitor = FakeMonitor()
 link = fastLink(monitor, viaConverter)
-expect(link.writeChip == 0xB7, "sets go to the converter first")
+expect(link.writeChips == [0xB7, 0x37], "until it answers, sets go to the converter and 0x37")
 expect(link.write(code: 0x10, value: 30) == 0 && monitor.values[0x10]?.current == 30,
        "a set refused on 0xB7 is sent on 0x37")
 read = link.read(code: 0x10)
 expect(read.reading?.current == 30 && read.way?.chip == 0x37 && read.tries == 3,
        "a refused chip is given up after its first way")
-expect(link.writeChip == 0x37, "then sets go where it answered")
+expect(link.writeChips == [0x37], "then sets go only where it answered")
 
 // DDC/CI switched off: messages go out, nothing comes back.
 monitor = FakeMonitor(); monitor.ddcOn = false
@@ -404,26 +411,26 @@ func framebuffer(_ id: UInt64, _ name: String? = nil, display: Bool = false, tra
     RegistryEntry(id: id, name: "AppleCLCD2", isFramebuffer: true, path: path, productName: name,
                   hasDisplay: display, transport: transport)
 }
-func connection(_ id: UInt64, _ location: String? = "External", provider: String? = nil,
+func proxy(_ id: UInt64, _ location: String? = "External", provider: String? = nil,
                 path: String = "") -> RegistryEntry {
     RegistryEntry(id: id, name: "DCPAVServiceProxy", path: path, location: location, provider: provider)
 }
 let builtIn = MonitorScreen(id: 1, name: "Built-in Retina Display", builtIn: true, framebuffer: 100, direct: true)
 
 // MacBook Air: the Dell on USB-C.
-var entries = [framebuffer(100, display: true), connection(101, "Embedded"),
+var entries = [framebuffer(100, display: true), proxy(101, "Embedded"),
                framebuffer(200, "DELL U3818DW", display: true, transport: "DP → DP"),
-               connection(201, path: "IOService:/AppleARMPE/arm-io@10F00000/AppleT810xIO/dcpext@A8000000/AppleDCPExpert/DCPAVServiceProxy")]
+               proxy(201, path: "IOService:/AppleARMPE/arm-io@10F00000/AppleT810xIO/dcpext@A8000000/AppleDCPExpert/DCPAVServiceProxy")]
 var screens = [builtIn, MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 200, direct: true)]
 var ports = MonitorDiscovery.ports(in: entries, screens: screens)
 expect(ports.count == 1 && ports[0].connection == 201 && ports[0].attached && ports[0].name == "DELL U3818DW"
        && ports[0].label == "dcpext" && ports[0].ways == usbC, "MacBook Air: one port, the Dell's")
 
 // 14" MacBook Pro with M1 Pro: an empty port listed first, the Dell on HDMI.
-entries = [framebuffer(100, display: true), connection(101, "Embedded"),
-           framebuffer(300), connection(301, path: "IOService:/x/dcpext0@1/y"),
+entries = [framebuffer(100, display: true), proxy(101, "Embedded"),
+           framebuffer(300), proxy(301, path: "IOService:/x/dcpext0@1/y"),
            framebuffer(400, "DELL U3818DW", display: true, transport: "DP → HDMI"),
-           connection(401, provider: "AppleDCPMCDP29XX", path: "IOService:/x/dcpext1@2/y")]
+           proxy(401, provider: "AppleDCPMCDP29XX", path: "IOService:/x/dcpext1@2/y")]
 screens = [builtIn, MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 400, direct: true)]
 ports = MonitorDiscovery.ports(in: entries, screens: screens)
 expect(ports.map(\.connection) == [401, 301], "the Dell's port comes first; the empty one (Hammer's old pick) last")
@@ -436,13 +443,13 @@ ports = MonitorDiscovery.ports(in: entries, screens: [])
 expect(ports.map(\.connection) == [401, 301] && ports[0].name == "DELL U3818DW", "found from the EDID alone")
 
 // Odd orders never pair the Dell's connection with the wrong screen.
-ports = MonitorDiscovery.ports(in: [connection(1), framebuffer(2, "X", display: true)], screens: [])
+ports = MonitorDiscovery.ports(in: [proxy(1), framebuffer(2, "X", display: true)], screens: [])
 expect(ports.count == 1 && ports[0].framebuffer == nil && !ports[0].attached, "connection before any framebuffer")
-ports = MonitorDiscovery.ports(in: [framebuffer(100, display: true), connection(5)], screens: [builtIn])
+ports = MonitorDiscovery.ports(in: [framebuffer(100, display: true), proxy(5)], screens: [builtIn])
 expect(ports.count == 1 && ports[0].name == nil && !ports[0].attached, "never paired with the built-in screen")
-ports = MonitorDiscovery.ports(in: [framebuffer(2, "X", display: true), connection(3), connection(4)], screens: [])
+ports = MonitorDiscovery.ports(in: [framebuffer(2, "X", display: true), proxy(3), proxy(4)], screens: [])
 expect(ports.map(\.connection) == [3, 4] && ports[0].attached && !ports[1].attached, "one connection per framebuffer")
-expect(MonitorDiscovery.ports(in: [framebuffer(2, display: true), connection(3, nil)], screens: []).isEmpty,
+expect(MonitorDiscovery.ports(in: [framebuffer(2, display: true), proxy(3, nil)], screens: []).isEmpty,
        "a connection without a location is skipped")
 expect(MonitorDiscovery.shortLabel("IOService:/AppleARMPE/arm-io@10F00000/AppleT600xIO/dcpext0@A8000000/x") == "dcpext0"
        && MonitorDiscovery.shortLabel("") == nil && MonitorDiscovery.shortLabel("IOService:/a/b") == nil, "port labels")
@@ -459,7 +466,7 @@ let emptyPort = MonitorPort(connection: 301, framebuffer: 300, name: nil, attach
 var dell = FakeMonitor(), empty = FakeMonitor()
 empty.writeStatus = Int32(bitPattern: 0xE00002C0)
 var set = MonitorSet([member(emptyPort, empty), member(dellPort, dell)])
-expect(set.targets.map(\.port.connection) == [401], "before anyone answers: the port with a monitor")
+expect(set.targets.map(\.port.connection) == [401, 301], "before anyone answers: everywhere, the Dell's port first")
 var found = set.read(code: 0x10)
 expect(found?.reading.current == 40 && found?.member.port.connection == 401 && empty.writes.isEmpty,
        "reads the Dell first and never bothers the empty port")
@@ -486,21 +493,22 @@ let mac = MonitorCheck.Mac(model: "MacBookPro18,3", chip: "Apple M1 Pro", system
 func runCheck(_ entries: [RegistryEntry], _ screens: [MonitorScreen], _ buses: [UInt64: FakeMonitor]) -> MonitorCheck {
     MonitorCheck.run(mac: mac, screens: screens, entries: entries, bus: { buses[$0] }, sleep: { _ in })
 }
-let airEntries = [framebuffer(100, display: true), connection(101, "Embedded"),
-                  framebuffer(200, "DELL U3818DW", display: true, transport: "DP → DP"), connection(201)]
+let airEntries = [framebuffer(100, display: true), proxy(101, "Embedded"),
+                  framebuffer(200, "DELL U3818DW", display: true, transport: "DP → DP"), proxy(201)]
 let airScreens = [builtIn, MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 200, direct: true)]
 
 dell = FakeMonitor()
 var check = runCheck(airEntries, airScreens, [201: dell])
 expect(check.verdict == .working, "working Dell")
 expect(check.ports[0].change == .confirmed(from: 40, to: 60) && dell.values[0x10]?.current == 40
-       && dell.sets.map(\.value) == [60, 60, 40, 40], "the change test moves brightness and puts it back")
+       && dell.sets.map(\.value) == [60, 60, 40, 40] && check.ports[0].restored == true,
+       "the change test moves brightness and puts it back")
 expect(check.ports[0].contrast?.reading?.current == 75, "reads contrast too")
 expect(check.text.contains("Result: Working. Hammer can read and change the DELL U3818DW's brightness.")
        && check.text.contains("Mac: MacBookPro18,3 · Apple M1 Pro · macOS Version 15.1 (Build 24B83)")
        && check.text.contains("Screens: Built-in Retina Display (built in), DELL U3818DW")
        && check.text.contains("also DCPAVServiceProxy (Embedded)")
-       && check.text.contains("Change test: 40 → 60, read back 60, put back to 40 ✓"), "working report:\n\(check.text)")
+       && check.text.contains("Change test: 40 → 60, read back 60, put back ✓"), "working report:\n\(check.text)")
 dell = FakeMonitor(); dell.values[0x10] = (90, 100)
 check = runCheck(airEntries, airScreens, [201: dell])
 expect(check.ports[0].change == .confirmed(from: 90, to: 70) && dell.values[0x10]?.current == 90, "bright screen: tests downward")
@@ -518,7 +526,7 @@ expect(check.ports[0].change == nil && check.verdict == .working, "no range to t
 dell = FakeMonitor(); dell.applySets = false
 check = runCheck(airEntries, airScreens, [201: dell])
 expect(check.verdict == .ignoresChanges && check.advice.joined().contains("Preset Modes → Standard")
-       && check.text.contains("read back 40, put back to 40 ✗"), "brightness locked")
+       && check.text.contains("read back 40, put back ✗"), "brightness locked")
 
 dell = FakeMonitor(); dell.ddcOn = false
 check = runCheck(airEntries, airScreens, [201: dell])
@@ -527,17 +535,17 @@ expect(check.advice.joined(separator: "\n").contains("Menu → Others → DDC/CI
        && !check.advice.joined().contains("HDMI") && check.text.contains("Last reply: 00 00 00"), "DDC/CI off: advice")
 
 // M1 Pro, Dell on HDMI behind the converter, empty port listed first.
-let proEntries = [framebuffer(100, display: true), connection(101, "Embedded"),
-                  framebuffer(300), connection(301),
+let proEntries = [framebuffer(100, display: true), proxy(101, "Embedded"),
+                  framebuffer(300), proxy(301),
                   framebuffer(400, "DELL U3818DW", display: true, transport: "DP → HDMI"),
-                  connection(401, provider: "AppleDCPMCDP29XX", path: "IOService:/x/dcpext1@2/y")]
+                  proxy(401, provider: "AppleDCPMCDP29XX", path: "IOService:/x/dcpext1@2/y")]
 let proScreens = [builtIn, MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 400, direct: true)]
 dell = FakeMonitor(); dell.chip = 0xB7
 empty = FakeMonitor(); empty.writeStatus = Int32(bitPattern: 0xE00002C0)
 check = runCheck(proEntries, proScreens, [301: empty, 401: dell])
 expect(check.verdict == .working && check.ports[0].brightness.way?.chip == 0xB7, "M1 HDMI works through 0xB7")
 expect(check.text.contains("DELL U3818DW (dcpext1, DP → HDMI, HDMI converter)")
-       && check.text.contains("Nothing plugged in") && check.text.contains("error e00002c0"), "HDMI report:\n\(check.text)")
+       && check.text.contains("No monitor seen here") && check.text.contains("error e00002c0"), "HDMI report:\n\(check.text)")
 dell.ddcOn = false
 check = runCheck(proEntries, proScreens, [301: empty, 401: dell])
 expect(check.verdict == .noAnswer && check.advice.joined().contains("Use USB-C rather than HDMI"), "silent over HDMI")
@@ -545,14 +553,14 @@ expect(check.verdict == .noAnswer && check.advice.joined().contains("Use USB-C r
 // Other setups.
 let displayLink = [builtIn, MonitorScreen(id: 3, name: "DELL U3818DW", builtIn: false, framebuffer: nil, direct: false)]
 let unplugged = FakeMonitor(); unplugged.writeStatus = Int32(bitPattern: 0xE00002C0)
-check = runCheck([framebuffer(100, display: true), connection(101, "Embedded"), framebuffer(300), connection(301)],
+check = runCheck([framebuffer(100, display: true), proxy(101, "Embedded"), framebuffer(300), proxy(301)],
                  displayLink, [301: unplugged])
 expect(check.verdict == .notDirect && check.text.contains("DELL U3818DW (through DisplayLink, AirPlay or Sidecar)")
        && check.advice.joined().contains("straight into the Mac"), "DisplayLink")
-check = runCheck([framebuffer(100, display: true), connection(101, "Embedded"), framebuffer(300), connection(301)],
+check = runCheck([framebuffer(100, display: true), proxy(101, "Embedded"), framebuffer(300), proxy(301)],
                  [builtIn], [301: unplugged])
 expect(check.verdict == .noMonitor && check.monitorName == "the monitor", "nothing plugged in")
-check = runCheck([framebuffer(100, display: true), connection(101, "Embedded")],
+check = runCheck([framebuffer(100, display: true), proxy(101, "Embedded")],
                  [builtIn, MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 900, direct: true)], [:])
 expect(check.verdict == .notFound && check.text.contains("External connections: 0 · also DCPAVServiceProxy (Embedded)")
        && check.advice.first == "Result: macOS shows the DELL U3818DW, but Hammer can't find the connection it's on.",
@@ -567,6 +575,141 @@ expect(check.verdict == .cantSend && check.text.contains("macOS gave Hammer no w
 check = runCheck([], [], [:])
 expect(check.verdict == .noMonitor && check.text.contains("Screens: none") && check.text.contains("Mac: MacBookPro18,3"),
        "empty everything")
+
+
+// MARK: Monitor: more setups (from the review)
+
+// A wrong address that's silently accepted, not refused: sets still reach the monitor.
+monitor = FakeMonitor(); monitor.wrongChipStatus = 0
+link = fastLink(monitor, viaConverter)
+expect(link.write(code: 0x10, value: 33) == 0 && monitor.values[0x10]?.current == 33,
+       "converter detected wrongly, wrong address silent: the set still arrives on 0x37")
+read = link.read(code: 0x10)
+expect(read.reading?.current == 33 && read.way?.chip == 0x37 && read.tries == 7, "and reads find 0x37 after the 0xB7 ways")
+
+// A Dell that takes sets but never answers, with a stale EDID making an empty port look used.
+let staleEntries = [framebuffer(100, display: true), proxy(101, "Embedded"),
+                    framebuffer(300, display: true), proxy(301),          // stale: nothing plugged in
+                    framebuffer(400, display: true), proxy(401)]          // the Dell, but not linked to a screen
+ports = MonitorDiscovery.ports(in: staleEntries, screens: [builtIn])
+expect(ports.map(\.attached) == [true, true], "no screen links: the EDID decides (both look used)")
+ports = MonitorDiscovery.ports(in: staleEntries,
+                               screens: [builtIn, MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 400, direct: true)])
+expect(ports.map(\.connection) == [401, 301] && ports.map(\.attached) == [true, false],
+       "with a screen linked, a stale EDID doesn't count")
+dell = FakeMonitor(); dell.acceptedReadOffsets = []                      // write-only
+empty = FakeMonitor(); empty.ddcOn = false
+var wrongFirst = emptyPort; wrongFirst.attached = true                   // stale: looks used
+var dellUnseen = dellPort; dellUnseen.attached = false
+set = MonitorSet([member(wrongFirst, empty), member(dellUnseen, dell)])
+expect(set.read(code: 0x10) == nil && !set.anyAnswers, "nobody answers")
+set.write(code: 0x10, value: 55)
+expect(dell.values[0x10]?.current == 55, "the set still reaches the write-only Dell (as Hammer always did)")
+
+// A connection listed before its framebuffer, on a Mac with several ports.
+ports = MonitorDiscovery.ports(in: [framebuffer(100, display: true), proxy(101, "Embedded"), proxy(301),
+                                    framebuffer(300), framebuffer(400, "DELL U3818DW", display: true), proxy(401)],
+                               screens: [builtIn, MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 400, direct: true)])
+expect(ports.map(\.connection) == [401, 301] && ports[1].name == nil && !ports[1].attached,
+       "an early connection isn't given the built-in screen or the Dell")
+
+// "No such setting" from one connection: keep looking, and it isn't a target.
+let quietPort = MonitorPort(connection: 9, framebuffer: nil, name: "Other", attached: true,
+                            throughHDMIConverter: false, transport: nil, label: nil)
+let other = FakeMonitor(); other.supported = []
+dell = FakeMonitor()
+set = MonitorSet([member(quietPort, other), member(dellPort, dell)])
+found = set.read(code: 0x10)
+expect(found?.member.port.connection == 401 && set.members[0].answers == false
+       && set.targets.map(\.port.connection) == [401], "\"no such setting\" doesn't make a connection the target")
+
+// macOS's default connection is asked last.
+let defaultMonitor = FakeMonitor()
+set = MonitorSet([member(.macDefault, defaultMonitor), member(emptyPort, FakeMonitor()), member(dellPort, FakeMonitor())])
+expect(set.ordered.map(\.port.connection) == [401, 301, 0], "order: monitor seen, others, macOS default")
+
+// Asking several silent connections: how long, and giving way to a slider.
+let silent = (0..<3).map { _ -> FakeMonitor in let m = FakeMonitor(); m.ddcOn = false; return m }
+clock = Clock()
+set = MonitorSet([MonitorSet.Member(port: dellPort, link: fastLink(silent[0], dellPort.ways, clock)),
+                  MonitorSet.Member(port: emptyPort, link: fastLink(silent[1], emptyPort.ways, clock)),
+                  MonitorSet.Member(port: viaConverterPort(), link: fastLink(silent[2], viaConverter, clock))])
+expect(set.read(code: 0x10) == nil && !set.lastReadInterrupted, "three silent connections")
+expect(clock.slept < 2_500_000, "asked in under 2.5 s of waiting (\(clock.slept) µs)")
+clock.slept = 0
+var stopChecks = 0
+set = MonitorSet([MonitorSet.Member(port: dellPort, link: fastLink(silent[0], dellPort.ways, clock)),
+                  MonitorSet.Member(port: emptyPort, link: fastLink(silent[1], emptyPort.ways, clock))])
+expect(set.read(code: 0x10, stop: { stopChecks += 1; return stopChecks > 1 }) == nil && set.lastReadInterrupted
+       && clock.slept < 200_000 && set.members.allSatisfy { $0.answers == nil },
+       "a moved slider stops the read within a try, and nothing is concluded")
+let moves = SliderMoves()
+let before = Date()
+expect(!moves.movedSince(before), "no move yet")
+moves.moved(at: before.addingTimeInterval(1))
+expect(moves.movedSince(before) && !moves.movedSince(before.addingTimeInterval(2)), "moves are timed")
+
+// The check: a monitor that goes quiet after the change, one that won't go back, a bad checksum.
+dell = FakeMonitor(); dell.answerLimit = 2                               // brightness, contrast, then nothing
+check = runCheck(airEntries, airScreens, [201: dell])
+expect(check.ports[0].change == .noReadBack(from: 40, to: 60) && check.verdict == .unsure
+       && check.ports[0].restored == nil && dell.values[0x10]?.current == 40, "went quiet: unsure, still put back")
+expect(check.advice.joined().contains("Did the screen get brighter or dimmer"), "asks what you saw")
+dell = FakeMonitor(); dell.applyLimit = 2                                // takes the change, not the way back
+check = runCheck(airEntries, airScreens, [201: dell])
+expect(check.ports[0].change == .confirmed(from: 40, to: 60) && check.ports[0].restored == false
+       && dell.sets.map(\.value) == [60, 60, 40, 40, 40, 40], "tries twice to put it back")
+expect(check.text.contains("put back (but it reads differently now) ✓"), "and says so")
+dell = FakeMonitor(); dell.corruptReplies = true
+check = runCheck(airEntries, airScreens, [201: dell])
+expect(check.verdict == .working && check.ports[0].change == nil && dell.sets.isEmpty
+       && check.text.contains("40 of 100 (reply had a wrong checksum)"), "a doubtful reading isn't used for the test")
+dell = FakeMonitor(); dell.supported = [0x12]
+check = runCheck(airEntries, airScreens, [201: dell])
+expect(check.verdict == .noBrightness && check.advice.joined().contains("no brightness setting"), "no brightness setting")
+
+// The check falls back to macOS's default connection only if no port answered.
+dell = FakeMonitor(); dell.ddcOn = false
+let fallbackMonitor = FakeMonitor()
+check = MonitorCheck.run(mac: mac, screens: airScreens, entries: airEntries, bus: { $0 == 201 ? dell : nil },
+                         defaultBus: fallbackMonitor, sleep: { _ in })
+expect(check.ports.count == 2 && check.ports[1].port.isDefault && check.verdict == .working
+       && check.text.contains("Tried last (macOS default connection)") && check.text.contains("External connections: 1"),
+       "the default connection, tried last, works:\n\(check.text)")
+dell = FakeMonitor()
+check = MonitorCheck.run(mac: mac, screens: airScreens, entries: airEntries, bus: { $0 == 201 ? dell : nil },
+                         defaultBus: fallbackMonitor, sleep: { _ in })
+expect(check.ports.count == 1, "not tried when the Dell's port answers")
+check = MonitorCheck.run(mac: mac, screens: [builtIn, MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: nil, direct: true)],
+                         entries: [framebuffer(100, display: true), proxy(101, "Embedded")], bus: { _ in nil },
+                         defaultBus: fallbackMonitor, sleep: { _ in })
+expect(check.verdict == .working, "no External connection listed at all: the default connection still works")
+
+// A Sidecar iPad next to a directly cabled Dell doesn't make it "DisplayLink".
+dell = FakeMonitor(); dell.ddcOn = false
+let withIPad = airScreens + [MonitorScreen(id: 5, name: "Sidecar Display (AirPlay)", builtIn: false, framebuffer: nil, direct: false)]
+check = runCheck(airEntries, withIPad, [201: dell])
+expect(check.verdict == .noAnswer && check.monitorName == "the DELL U3818DW", "Sidecar alongside: still the Dell's problem")
+check = runCheck([framebuffer(100, display: true), proxy(101, "Embedded"), framebuffer(300), proxy(301)],
+                 [builtIn, MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: nil, direct: nil)],
+                 [301: silent[0]])
+expect(check.verdict == .noAnswer, "nothing seen attached, but connections sent fine: no answer, not \"can't find\"")
+
+// The menu.
+let dellScreen = MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 400, direct: true)
+let dlScreen = MonitorScreen(id: 3, name: "DELL U3818DW", builtIn: false, framebuffer: nil, direct: false)
+var state = MonitorMenu.make(connections: 2, attached: 0, screens: [builtIn], answers: nil)
+expect(state.title == "Dell not connected" && !state.sliders && !state.offerCheck, "menu: nothing plugged in")
+state = MonitorMenu.make(connections: 0, attached: 0, screens: [builtIn, dlScreen], answers: nil)
+expect(state.title == "Dell connected through DisplayLink or AirPlay" && !state.sliders && state.offerCheck, "menu: DisplayLink")
+state = MonitorMenu.make(connections: 0, attached: 0, screens: [builtIn, dellScreen], answers: nil)
+expect(state.title == "Can't find the Dell's connection" && state.offerCheck, "menu: no connection")
+state = MonitorMenu.make(connections: 2, attached: 1, screens: [builtIn, dellScreen], answers: true)
+expect(state.title == nil && state.sliders && state.hints.isEmpty && state.offerCheck, "menu: working")
+state = MonitorMenu.make(connections: 2, attached: 1, screens: [builtIn, dellScreen], answers: false)
+expect(state.sliders && state.hints == ["The Dell isn't answering Hammer."], "menu: not answering")
+state = MonitorMenu.make(connections: 2, attached: 0, screens: [builtIn, dlScreen], answers: false)
+expect(state.sliders && state.hints.count == 2, "menu: connections found but the screen looks virtual: sliders and a warning")
 
 // MARK: Text
 
