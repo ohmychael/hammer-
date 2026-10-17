@@ -128,10 +128,10 @@ expect(backoff.failed(bulbA, now: at(3)) == 6, "third failure in a row waits 6 s
 
 // 200 quick failures (the old retry storm) end up a minute apart, not milliseconds.
 var storm = ConnectBackoff()
-var clock = 0.0, attempts = 0
-while clock < 600 {
-    if storm.canTry(bulbA, now: at(clock)) { attempts += 1; storm.failed(bulbA, now: at(clock)) }
-    clock += 0.05
+var elapsed = 0.0, attempts = 0
+while elapsed < 600 {
+    if storm.canTry(bulbA, now: at(elapsed)) { attempts += 1; storm.failed(bulbA, now: at(elapsed)) }
+    elapsed += 0.05
 }
 expect(attempts <= 15, "a bulb that always fails is tried at most ~15 times in 10 minutes: \(attempts)")
 
