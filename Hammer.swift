@@ -415,6 +415,15 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     private var central: CBCentralManager?
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var found: [UUID: (model: String, name: String)] = [:]
+    private var signalStrength: [UUID: Int] = [:]          // latest signal strength, in dBm
+
+    /// Roughly how far away a bulb is, from its signal strength.
+    func distance(of id: UUID) -> String? {
+        guard let dBm = signalStrength[id] else { return nil }
+        if dBm >= -60 { return "very close" }
+        if dBm >= -75 { return "nearby" }
+        return "far away"
+    }
     private var controls: [UUID: CBCharacteristic] = [:]
     private var queued: [UUID: [Data]] = [:]
     private var idleTimers: [UUID: DispatchWorkItem] = [:]
@@ -501,8 +510,9 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         // Govee bulbs advertise names like "ihoment_H6006_1A2B".
         let advertised = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? peripheral.name ?? ""
-        guard let model = Self.model(in: advertised), Self.supportedModels.contains(model),
-              found[peripheral.identifier] == nil else { return }
+        guard let model = Self.model(in: advertised), Self.supportedModels.contains(model) else { return }
+        if RSSI.intValue < 0 { signalStrength[peripheral.identifier] = RSSI.intValue }   // 127 means "unknown"
+        guard found[peripheral.identifier] == nil else { return }
         let suffix = advertised.split(separator: "_").count >= 3 ? " " + advertised.split(separator: "_").last! : ""
         peripherals[peripheral.identifier] = peripheral
         found[peripheral.identifier] = (model, "\(model) bulb\(suffix)")
@@ -579,12 +589,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return result
     }
 
-    /// The lights shown in the menu: everything found, minus the ones you've
-    /// hidden, under the names you've given them.
-    private var lights: [GoveeLight] {
-        let names = customNames, hidden = hiddenIDs
-        return foundLights
-            .filter { !hidden.contains($0.id) }
+    /// Your lights: the only ones Hammer controls, including All Lights.
+    private var lights: [GoveeLight] { named(foundLights.filter { isMine($0) }) }
+
+    /// Everything else in range: listed under Other Lights, never controlled.
+    private var otherLights: [GoveeLight] { named(foundLights.filter { !isMine($0) }) }
+
+    /// A light found only over Bluetooth could be anyone's (Bluetooth reaches
+    /// through walls), so it's yours only once you add it. Lights on your Wi-Fi
+    /// or in your Govee account are yours unless you remove them.
+    private func isMine(_ light: GoveeLight) -> Bool {
+        isBluetoothOnly(light) ? myBluetoothIDs.contains(light.id) : !hiddenIDs.contains(light.id)
+    }
+
+    private func isBluetoothOnly(_ light: GoveeLight) -> Bool {
+        light.lanIP == nil && light.bluetoothID?.uuidString == light.id
+    }
+
+    private func named(_ list: [GoveeLight]) -> [GoveeLight] {
+        let names = customNames
+        return list
             .map { light -> GoveeLight in
                 var named = light
                 if let name = names[light.id] { named.name = name }
@@ -593,9 +617,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    private var hiddenCount: Int { foundLights.filter { hiddenIDs.contains($0.id) }.count }
+    /// Bluetooth bulbs you've added. Until the first add, any bulb you'd
+    /// already renamed counts as yours.
+    private var myBluetoothIDs: Set<String> {
+        get {
+            if let saved = UserDefaults.standard.stringArray(forKey: "myBluetoothLights") { return Set(saved) }
+            return Set(customNames.keys)
+        }
+        set { UserDefaults.standard.set(Array(newValue), forKey: "myBluetoothLights") }
+    }
 
-    /// Names you've given lights, and lights you've hidden, kept between launches.
+    /// Names you've given lights, and Wi-Fi/cloud lights you've removed, kept between launches.
     private var customNames: [String: String] {
         get { UserDefaults.standard.dictionary(forKey: "lightNames") as? [String: String] ?? [:] }
         set { UserDefaults.standard.set(newValue, forKey: "lightNames") }
@@ -719,8 +751,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let problem = GoveeBluetooth.shared.problem {
             menu.addItem(hint(problem))
         }
-        if lights.isEmpty && searchingForLights {
+        let others = otherLights
+        if lights.isEmpty && others.isEmpty && searchingForLights {
             menu.addItem(hint("Searching…"))
+        } else if lights.isEmpty && !others.isEmpty {
+            menu.addItem(label("No lights added yet"))
+            menu.addItem(hint("Bulbs found over Bluetooth could be anyone's, so"))
+            menu.addItem(hint("Hammer won't touch them until you add yours from"))
+            menu.addItem(hint("Other Lights below."))
         } else if lights.isEmpty {
             menu.addItem(label("No lights found"))
             menu.addItem(hint("Bluetooth bulbs (like the H6006) appear by themselves"))
@@ -732,9 +770,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if lights.count > 1 { menu.addItem(lightItem(nil)) }    // "All Lights"
             for light in lights { menu.addItem(lightItem(light)) }
         }
-        if hiddenCount > 0 {
-            menu.addItem(action("Show Hidden Lights (\(hiddenCount))", #selector(showHiddenLights)))
-        }
+        if !others.isEmpty { menu.addItem(otherLightsItem(others)) }
         menu.addItem(action("Rescan Lights", #selector(rescanLights)))
         menu.addItem(action(Govee.apiKey == nil ? "Add Govee Cloud Key…" : "Change Govee Cloud Key…",
                             #selector(addCloudKey)))
@@ -897,7 +933,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             submenu.addItem(.separator())
             submenu.addItem(action("Blink to Identify", #selector(blink(_:)), lightID: id))
             submenu.addItem(action("Rename…", #selector(renameLight(_:)), lightID: id))
-            submenu.addItem(action("Hide This Light", #selector(hideLight(_:)), lightID: id))
+            submenu.addItem(action("Remove from My Lights", #selector(removeFromMyLights(_:)), lightID: id))
         }
 
         let title: String
@@ -975,9 +1011,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Telling lights apart
 
+    /// Lights that aren't yours yet, each with how far away it seems and a way to add it.
+    private func otherLightsItem(_ others: [GoveeLight]) -> NSMenuItem {
+        let submenu = NSMenu()
+        submenu.addItem(hint("Hammer never controls these, not even with"))
+        submenu.addItem(hint("All Lights. Add the ones that are yours."))
+        submenu.addItem(.separator())
+        for light in others {
+            let options = NSMenu()
+            if let ble = light.bluetoothID, let distance = GoveeBluetooth.shared.distance(of: ble) {
+                options.addItem(hint("Signal: \(distance)"))
+            }
+            options.addItem(action("Add to My Lights", #selector(addToMyLights(_:)), lightID: light.id))
+            options.addItem(action("Blink to Identify", #selector(blink(_:)), lightID: light.id))
+            options.addItem(hint("Blinking flashes this bulb wherever it is."))
+            let item = NSMenuItem(title: light.name, action: nil, keyEquivalent: "")
+            item.submenu = options
+            submenu.addItem(item)
+        }
+        let item = NSMenuItem(title: "Other Lights (\(others.count))", action: nil, keyEquivalent: "")
+        item.submenu = submenu
+        return item
+    }
+
     /// Flashes the light off and on twice so you can see which one it is.
     @objc private func blink(_ sender: NSMenuItem) {
-        let targets = targetLights(sender)
+        // Works on your lights and on Other Lights (to check which bulb one is).
+        guard let id = sender.representedObject as? String else { return }
+        let targets = foundLights.filter { $0.id == id }
         goveeQueue.async {
             targets.forEach { Govee.setPower($0, on: true) }   // wakes a sleeping Bluetooth link first
             usleep(1_500_000)
@@ -1010,17 +1071,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
     }
 
-    /// Hidden lights leave the menu and aren't touched by All Lights.
-    @objc private func hideLight(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        var hidden = hiddenIDs
-        hidden.insert(id)
-        hiddenIDs = hidden
+    @objc private func addToMyLights(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let light = foundLights.first(where: { $0.id == id }) else { return }
+        if isBluetoothOnly(light) {
+            var mine = myBluetoothIDs
+            mine.insert(id)
+            myBluetoothIDs = mine
+        } else {
+            var hidden = hiddenIDs
+            hidden.remove(id)
+            hiddenIDs = hidden
+        }
         rebuildMenu()
     }
 
-    @objc private func showHiddenLights() {
-        hiddenIDs = []
+    /// Moves a light to Other Lights, where Hammer won't control it.
+    @objc private func removeFromMyLights(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let light = foundLights.first(where: { $0.id == id }) else { return }
+        if isBluetoothOnly(light) {
+            var mine = myBluetoothIDs
+            mine.remove(id)
+            myBluetoothIDs = mine
+        } else {
+            var hidden = hiddenIDs
+            hidden.insert(id)
+            hiddenIDs = hidden
+        }
         rebuildMenu()
     }
 
