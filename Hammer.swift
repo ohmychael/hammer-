@@ -685,6 +685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // unless it ran out more than an hour ago.
         if let end = timerEnd, Date().timeIntervalSince(end) > 3600 { timerEnd = nil }
         armTimer()
+        startClock()
 
         // Pick up the monitor automatically when it's plugged in or unplugged.
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
@@ -1028,7 +1029,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // The sleep timer turns off all your lights, so it lives in All Lights —
         // or in the one light's menu when there's only one (and no All Lights).
         let hasTimer = light == nil || lights.count == 1
-        if hasTimer { addSleepTimer(to: submenu) }
+        if hasTimer {
+            addSleepTimer(to: submenu)
+            addTurnOnTime(to: submenu)
+        }
 
         var title: String
         if let light {
@@ -1037,6 +1041,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             title = "All Lights (\(lights.count))"
         }
         if hasTimer, let end = timerEnd { title += " · off at \(clockTime(end))" }
+        if hasTimer, let next = turnOnNext { title += " · on at \(clockTime(next))" }
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.submenu = submenu
         return item
@@ -1264,6 +1269,157 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timerEnd = nil
         armTimer()
         rebuildMenu()
+    }
+
+    // MARK: Turn on at a set time
+
+    private let defaults = UserDefaults.standard
+    private var clock: Timer?
+
+    /// The next time your lights turn on, and the time of day it repeats at.
+    /// Saved so restarts and updates keep the schedule.
+    private var turnOnNext: Date? {
+        get { defaults.object(forKey: "turnOnNext") as? Date }
+        set { defaults.set(newValue, forKey: "turnOnNext") }
+    }
+    private var turnOnHour: Int { defaults.integer(forKey: "turnOnHour") }
+    private var turnOnMinute: Int { defaults.integer(forKey: "turnOnMinute") }
+    private var turnOnRepeats: Bool { defaults.bool(forKey: "turnOnRepeats") }
+    private var turnOnWakesMac: Bool { defaults.bool(forKey: "turnOnWakesMac") }
+
+    private func addTurnOnTime(to submenu: NSMenu) {
+        submenu.addItem(.separator())
+        submenu.addItem(label("Turn On At"))
+        if let next = turnOnNext {
+            let when = turnOnRepeats ? "every day at \(clockTime(next))" : "at \(clockTime(next))"
+            submenu.addItem(hint("Your lights turn on \(when)."))
+            if turnOnWakesMac { submenu.addItem(hint("Your Mac wakes a minute before.")) }
+            submenu.addItem(action("Change Time…", #selector(setTurnOnTime)))
+            submenu.addItem(action("Remove", #selector(removeTurnOnTime)))
+        } else {
+            submenu.addItem(action("Set a Time…", #selector(setTurnOnTime)))
+        }
+    }
+
+    /// Checks the schedule every 30 seconds and right after the Mac wakes.
+    private func startClock() {
+        let tick = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            guard let delegate = self else { return }
+            Task { @MainActor in delegate.checkTurnOn() }
+        }
+        RunLoop.main.add(tick, forMode: .common)
+        clock = tick
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(macWoke),
+                                                          name: NSWorkspace.didWakeNotification, object: nil)
+        checkTurnOn()
+    }
+
+    @objc private func macWoke() {
+        // Give Bluetooth a few seconds to come back before sending anything.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let delegate = self else { return }
+            Task { @MainActor in
+                delegate.checkTurnOn()
+                delegate.checkTimer()
+            }
+        }
+    }
+
+    func checkTurnOn() {
+        guard let next = turnOnNext, Date() >= next else { return }
+        // Skip it if the Mac was asleep and it's now more than 30 minutes late.
+        if Date().timeIntervalSince(next) < 30 * 60 {
+            let targets = lights
+            goveeQueue.async { targets.forEach { Govee.setPower($0, on: true) } }
+        }
+        turnOnNext = turnOnRepeats ? nextOccurrence(hour: turnOnHour, minute: turnOnMinute) : nil
+        rebuildMenuSoon()
+    }
+
+    private func nextOccurrence(hour: Int, minute: Int) -> Date? {
+        Calendar.current.nextDate(after: Date(), matching: DateComponents(hour: hour, minute: minute, second: 0),
+                                  matchingPolicy: .nextTime)
+    }
+
+    @objc private func setTurnOnTime() {
+        if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+
+        let picker = NSDatePicker()
+        picker.datePickerStyle = .textFieldAndStepper
+        picker.datePickerElements = .hourMinute
+        picker.dateValue = turnOnNext ?? nextOccurrence(hour: 7, minute: 0) ?? Date()
+        picker.frame = NSRect(x: 0, y: 54, width: 110, height: 24)
+
+        let everyDay = NSButton(checkboxWithTitle: "Every day", target: nil, action: nil)
+        everyDay.state = (turnOnNext == nil || turnOnRepeats) ? .on : .off
+        everyDay.frame = NSRect(x: 0, y: 28, width: 320, height: 20)
+
+        let wake = NSButton(checkboxWithTitle: "Wake my Mac for this (asks for your password)",
+                            target: nil, action: nil)
+        wake.state = (turnOnNext == nil || turnOnWakesMac) ? .on : .off
+        wake.frame = NSRect(x: 0, y: 2, width: 340, height: 20)
+
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 80))
+        box.addSubview(picker)
+        box.addSubview(everyDay)
+        box.addSubview(wake)
+
+        let alert = NSAlert()
+        alert.messageText = "Turn your lights on at"
+        alert.informativeText = "They come back with the color and brightness they last had. "
+            + "Your Mac needs to be awake then, and it can't wake with the lid closed on battery."
+        alert.accessoryView = box
+        alert.addButton(withTitle: "Set")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let parts = Calendar.current.dateComponents([.hour, .minute], from: picker.dateValue)
+        let hour = parts.hour ?? 7, minute = parts.minute ?? 0
+        let repeats = everyDay.state == .on
+        defaults.set(hour, forKey: "turnOnHour")
+        defaults.set(minute, forKey: "turnOnMinute")
+        defaults.set(repeats, forKey: "turnOnRepeats")
+        turnOnNext = nextOccurrence(hour: hour, minute: minute)
+
+        if wake.state == .on, let next = turnOnNext {
+            defaults.set(scheduleMacWake(before: next, everyDay: repeats), forKey: "turnOnWakesMac")
+        } else {
+            defaults.set(false, forKey: "turnOnWakesMac")
+        }
+        rebuildMenu()
+    }
+
+    @objc private func removeTurnOnTime() {
+        if turnOnWakesMac && turnOnRepeats {
+            runAsAdmin("/usr/bin/pmset repeat cancel")     // stop the daily wake too
+        }
+        turnOnNext = nil
+        defaults.set(false, forKey: "turnOnWakesMac")
+        rebuildMenu()
+    }
+
+    /// Asks macOS to wake the Mac a minute before `date` (needs your password once).
+    /// A daily wake replaces any other repeating wake schedule on this Mac.
+    private func scheduleMacWake(before date: Date, everyDay: Bool) -> Bool {
+        let wakeAt = date.addingTimeInterval(-60)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        if everyDay {
+            formatter.dateFormat = "HH:mm:ss"
+            return runAsAdmin("/usr/bin/pmset repeat wake MTWRFSU \(formatter.string(from: wakeAt))")
+        } else {
+            formatter.dateFormat = "MM/dd/yy HH:mm:ss"
+            return runAsAdmin("/usr/bin/pmset schedule wake '\(formatter.string(from: wakeAt))'")
+        }
+    }
+
+    /// Runs a command with administrator rights, using macOS's standard password prompt.
+    @discardableResult
+    private func runAsAdmin(_ command: String) -> Bool {
+        let source = "do shell script \"\(command)\" with administrator privileges"
+        var error: NSDictionary?
+        NSAppleScript(source: source)?.executeAndReturnError(&error)
+        return error == nil
     }
 
     // MARK: Telling lights apart
