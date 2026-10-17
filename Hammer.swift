@@ -8,8 +8,9 @@
 // Install (builds it and keeps it updated from GitHub):
 //   curl -fsSL https://raw.githubusercontent.com/ohmychael/hammer-/main/install-hammer.sh | bash
 //
-// Build by hand:  swiftc -parse-as-library -O Hammer.swift HammerCore.swift Deliveries.swift DeliveryAlerts.swift -o Hammer
-// Tests:          swiftc HammerCore.swift Deliveries.swift Tests/main.swift -o hammer-tests && ./hammer-tests
+// Build by hand:  swiftc -parse-as-library -O Hammer.swift HammerCore.swift Monitor.swift MonitorMac.swift \
+//                    Deliveries.swift DeliveryAlerts.swift -o Hammer
+// Tests:          swiftc HammerCore.swift Monitor.swift Deliveries.swift Tests/main.swift -o hammer-tests && ./hammer-tests
 // Run:    ./Hammer                        menu bar app (hammer icon)
 //         If the icon is hidden behind the notch, open Hammer from Apps or
 //         Spotlight, or press Control-Option-H: the menu appears at the pointer.
@@ -17,6 +18,7 @@
 // Monitor from Terminal:
 //         ./Hammer get brightness         read a value from the monitor
 //         ./Hammer set brightness 40      write a value
+//         ./Hammer monitor check          if it doesn't work: tests each step and says why
 //         Names: brightness, contrast, volume — or a hex VCP code like 10.
 //         Stick to codes you know: some (e.g. 04) reset the monitor to factory settings.
 //
@@ -39,93 +41,6 @@ import AppKit
 import Carbon.HIToolbox     // global keyboard shortcut
 import CoreBluetooth
 import IOKit
-
-// MARK: - Private IOKit calls (monitor)
-//
-// macOS has no public API for talking to a display over I²C on Apple Silicon.
-// These three functions live inside IOKit but aren't in any header, so we
-// declare them ourselves. MonitorControl, m1ddc and BetterDisplay all use them.
-
-typealias IOAVService = CFTypeRef
-
-@_silgen_name("IOAVServiceCreateWithService")
-func IOAVServiceCreateWithService(_ allocator: CFAllocator?, _ service: io_service_t) -> Unmanaged<IOAVService>?
-
-@_silgen_name("IOAVServiceReadI2C")
-func IOAVServiceReadI2C(_ service: IOAVService, _ chipAddress: UInt32, _ offset: UInt32,
-                        _ buffer: UnsafeMutableRawPointer, _ size: UInt32) -> IOReturn
-
-@_silgen_name("IOAVServiceWriteI2C")
-func IOAVServiceWriteI2C(_ service: IOAVService, _ chipAddress: UInt32, _ dataAddress: UInt32,
-                         _ buffer: UnsafeMutableRawPointer, _ size: UInt32) -> IOReturn
-
-// MARK: - Finding the monitor
-
-/// One handle per external display. A MacBook's built-in screen reports
-/// Location = "Embedded" and is skipped.
-func externalDisplays() -> [IOAVService] {
-    var displays: [IOAVService] = []
-    var iterator = io_iterator_t()
-    guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("DCPAVServiceProxy"),
-                                       &iterator) == KERN_SUCCESS else { return displays }
-    defer { IOObjectRelease(iterator) }
-
-    var entry = IOIteratorNext(iterator)
-    while entry != 0 {
-        let location = IORegistryEntryCreateCFProperty(entry, "Location" as CFString,
-                                                       kCFAllocatorDefault, 0)?.takeRetainedValue() as? String
-        if location == "External",
-           let service = IOAVServiceCreateWithService(kCFAllocatorDefault, entry)?.takeRetainedValue() {
-            displays.append(service)
-        }
-        IOObjectRelease(entry)
-        entry = IOIteratorNext(iterator)
-    }
-    return displays
-}
-
-// MARK: - DDC/CI protocol (VESA MCCS)
-//
-// The monitor listens on I²C address 0x37. Each message from the Mac is:
-// a length byte (0x80 | n), an opcode, the payload, and an XOR checksum that
-// also covers the bus addresses 0x6E (monitor) and 0x51 (Mac).
-
-enum DDC {
-    static let monitorAddress: UInt32 = 0x37
-    static let hostAddress: UInt32 = 0x51
-
-    /// Standard MCCS "VCP" feature codes.
-    static let codes: [String: UInt8] = ["brightness": 0x10, "contrast": 0x12, "volume": 0x62]
-
-    static func write(_ display: IOAVService, code: UInt8, value: UInt16) -> Bool {
-        var packet = DDCPacket.set(code: code, value: value)
-        var sent = false
-        for _ in 0..<2 {                    // many monitors drop the odd write, so send it twice
-            usleep(10_000)
-            if IOAVServiceWriteI2C(display, monitorAddress, hostAddress,
-                                   &packet, UInt32(packet.count)) == kIOReturnSuccess {
-                sent = true
-            }
-        }
-        return sent
-    }
-
-    static func read(_ display: IOAVService, code: UInt8) -> (current: UInt16, max: UInt16)? {
-        var request = DDCPacket.get(code: code)
-        var reply = [UInt8](repeating: 0, count: 11)
-
-        for _ in 0..<4 {                    // the monitor doesn't always answer first time
-            usleep(10_000)
-            guard IOAVServiceWriteI2C(display, monitorAddress, hostAddress,
-                                      &request, UInt32(request.count)) == kIOReturnSuccess else { continue }
-            usleep(50_000)                  // DDC/CI gives the monitor 40 ms to prepare its answer
-            guard IOAVServiceReadI2C(display, monitorAddress, hostAddress,
-                                     &reply, UInt32(reply.count)) == kIOReturnSuccess else { continue }
-            if let reading = DDCPacket.parseReply(reply, code: code) { return reading }
-        }
-        return nil
-    }
-}
 
 // MARK: - Govee lights
 
@@ -1006,7 +921,18 @@ func hotKeyPressed(_ call: EventHandlerCallRef?, _ event: EventRef?, _ userData:
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
-    private var displays: [IOAVService] = []
+    // Monitor (Monitor.swift, MonitorMac.swift). `monitors` is used on ddcQueue only.
+    private var monitors = MonitorSet([])
+    private var monitorCount = 0                     // connections found, for the menu
+    private var monitorAttached = 0                  // ...with a monitor plugged in
+    private var monitorScreens: [MonitorScreen] = []
+    private var monitorAnswers: Bool?                // nil until asked
+    private var monitorValues: [UInt8: (current: UInt16, max: UInt16)] = [:]
+    private var monitorSliders: [UInt8: NSSlider] = [:]
+    private var monitorMoved: [UInt8: Date] = [:]    // when you last moved each slider
+    private var monitorReadAt: Date?
+    private var monitorGeneration = 0                // bumps when the monitor list is rebuilt
+    private var checkingMonitor = false
     private var networkLights: [GoveeLight] = []     // found over Wi-Fi or the Govee cloud
     private var bluetoothLights: [GoveeLight] = []   // found nearby over Bluetooth
     private var searchingForLights = false
@@ -1090,7 +1016,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }()
     private var colorTargetID: String?
-    private var monitorStatus: NSMenuItem?      // shown if the monitor doesn't answer
     private var hotKeyRef: EventHotKeyRef?
 
     private let ddcQueue = DispatchQueue(label: "Hammer.ddc")       // I²C is slow; keep it off the main thread
@@ -1103,7 +1028,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.autosaveName = "Hammer"   // remembers where you Cmd-drag the icon
         installEditMenu()
         registerHotKey()
-        displays = externalDisplays()
+        findMonitors()
 
         GoveeBluetooth.shared.onChange = { [weak self] in
             guard let delegate = self else { return }
@@ -1186,8 +1111,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func screensChanged() {
-        displays = externalDisplays()
-        rebuildMenu()
+        findMonitors()
+        rebuildMenuSoon()
     }
 
     // MARK: Menu
@@ -1196,20 +1121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
 
         menu.addItem(label("Monitor"))
-        monitorStatus = nil
-        if displays.isEmpty {
-            menu.addItem(label("Dell not connected"))
-            menu.addItem(hint("Plug it in with USB-C or DisplayPort."))
-            menu.addItem(hint("Hammer picks it up automatically."))
-            menu.addItem(hint("Not a DisplayLink dock — those block control."))
-        } else {
-            menu.addItem(monitorSlider("Brightness", code: 0x10))
-            menu.addItem(monitorSlider("Contrast", code: 0x12))
-            let status = hint("Not responding? On the Dell: Menu → Others → DDC/CI → On")
-            status.isHidden = true
-            monitorStatus = status
-            menu.addItem(status)
-        }
+        addMonitor(to: menu)
 
         menu.addItem(.separator())
         menu.addItem(label("Govee Lights"))
@@ -1256,6 +1168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         menuIsOpen = true
         GoveeBluetooth.shared.rescan()
+        readMonitor(ifOlderThan: 5)          // catches changes made with the monitor's own buttons
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -1692,32 +1605,157 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         queue.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
-    // MARK: Monitor
+    // MARK: Monitor (the logic is in Monitor.swift, the macOS calls in MonitorMac.swift)
+
+    /// Finds the monitor's connection again (at launch and whenever screens
+    /// change), then reads its brightness and contrast for the sliders.
+    private func findMonitors() {
+        let scan = MacMonitors.scan()
+        monitors = scan.monitors
+        monitorCount = monitors.members.count
+        monitorAttached = monitors.members.filter { $0.port.attached }.count
+        monitorScreens = scan.screens
+        monitorGeneration += 1
+        monitorAnswers = nil
+        monitorReadAt = nil
+        readMonitor(ifOlderThan: 0)
+    }
+
+    /// Reads brightness and contrast in the background and moves the sliders to
+    /// match, unless you've just moved one yourself.
+    private func readMonitor(ifOlderThan seconds: TimeInterval) {
+        guard monitorCount > 0 else { return }
+        if let last = monitorReadAt, Date().timeIntervalSince(last) < seconds { return }
+        monitorReadAt = Date()
+        let set = monitors, generation = monitorGeneration
+        ddcQueue.async {
+            var values: [UInt8: (current: UInt16, max: UInt16)] = [:]
+            if let brightness = set.read(code: DDCCode.brightness) {
+                values[DDCCode.brightness] = brightness.reading
+                if let contrast = brightness.member.link.read(code: DDCCode.contrast).reading {
+                    values[DDCCode.contrast] = contrast
+                }
+            }
+            let answers = set.anyAnswers
+            Task { @MainActor in self.monitorWasRead(values, answers: answers, generation: generation) }
+        }
+    }
+
+    private func monitorWasRead(_ values: [UInt8: (current: UInt16, max: UInt16)], answers: Bool,
+                                generation: Int) {
+        guard generation == monitorGeneration else { return }      // the monitors changed meanwhile
+        let before = monitorAnswers
+        monitorAnswers = answers
+        for (code, value) in values {
+            if let moved = monitorMoved[code], Date().timeIntervalSince(moved) < 3 { continue }   // don't fight your hand
+            monitorValues[code] = value
+            if let slider = monitorSliders[code] { show(value, on: slider) }
+        }
+        if before != answers { rebuildMenuSoon() }                   // show or hide "isn't answering"
+    }
+
+    private func addMonitor(to menu: NSMenu) {
+        monitorSliders = [:]
+        let external = monitorScreens.filter { !$0.builtIn }
+        if monitorAttached == 0 && external.isEmpty {
+            menu.addItem(label("Dell not connected"))
+            menu.addItem(hint("Plug it in with USB-C or DisplayPort."))
+            menu.addItem(hint("Hammer picks it up automatically."))
+            menu.addItem(hint("Not a DisplayLink dock — those block control."))
+        } else if monitorAttached == 0 && external.allSatisfy({ $0.direct == false }) {
+            menu.addItem(label("Dell connected through DisplayLink or AirPlay"))
+            menu.addItem(hint("Brightness control needs a direct cable:"))
+            menu.addItem(hint("USB-C or DisplayPort straight into the Mac."))
+        } else if monitorCount == 0 {
+            menu.addItem(label("Can't find the Dell's connection"))
+            menu.addItem(checkMonitorItem())
+        } else {
+            menu.addItem(monitorSlider("Brightness", code: DDCCode.brightness))
+            menu.addItem(monitorSlider("Contrast", code: DDCCode.contrast))
+            if monitorAnswers == false {
+                menu.addItem(hint("The Dell isn't answering Hammer."))
+                menu.addItem(checkMonitorItem())
+            }
+        }
+    }
 
     private func monitorSlider(_ title: String, code: UInt8) -> NSMenuItem {
         sliderItem(title, range: 0...100, value: 50, action: #selector(monitorSliderMoved(_:))) { slider in
             slider.tag = Int(code)
-            // Start the slider at the monitor's actual current value.
-            guard let display = displays.first else { return }
-            ddcQueue.async {
-                guard let reading = DDC.read(display, code: code) else {
-                    Task { @MainActor in self.monitorStatus?.isHidden = false }   // show the DDC/CI tip
-                    return
-                }
-                Task { @MainActor in
-                    slider.maxValue = Double(reading.max)
-                    slider.doubleValue = Double(reading.current)
-                }
-            }
+            if let value = monitorValues[code] { show(value, on: slider) }
+            monitorSliders[code] = slider
         }
+    }
+
+    private func show(_ value: (current: UInt16, max: UInt16), on slider: NSSlider) {
+        slider.maxValue = Double(Swift.max(1, value.max))
+        slider.doubleValue = Double(value.current)
     }
 
     @objc private func monitorSliderMoved(_ slider: NSSlider) {
         let code = UInt8(slider.tag)
         let value = UInt16(slider.doubleValue.rounded())
-        let targets = displays
+        monitorMoved[code] = Date()
+        monitorValues[code] = (current: value, max: UInt16(slider.maxValue.rounded()))
+        let set = monitors
         schedule("ddc-\(code)", on: ddcQueue, after: 0.05) {
-            for display in targets { _ = DDC.write(display, code: code, value: value) }
+            set.write(code: code, value: value)
+        }
+    }
+
+    private func checkMonitorItem() -> NSMenuItem {
+        checkingMonitor ? hint("Checking the monitor…") : action("Check Monitor Connection…", #selector(checkMonitor))
+    }
+
+    /// Tests each step to the monitor and says what's wrong, if anything.
+    @objc private func checkMonitor() {
+        guard !checkingMonitor else { return }
+        checkingMonitor = true
+        rebuildMenuSoon()
+        let scan = MacMonitors.scan()
+        ddcQueue.async {
+            let check = MacMonitors.check(scan)
+            Task { @MainActor in
+                self.checkingMonitor = false
+                self.findMonitors()            // start fresh, in case something changed (e.g. DDC/CI turned on)
+                self.rebuildMenuSoon()
+                self.showMonitorCheck(check)
+            }
+        }
+    }
+
+    private func showMonitorCheck(_ check: MonitorCheck) {
+        if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+        let alert = NSAlert()
+        alert.messageText = check.verdict == .working ? "The monitor works with Hammer" : "Monitor check"
+        alert.informativeText = check.advice.joined(separator: "\n")
+            + (check.ports.contains { $0.change != nil }
+               ? "\n\nHammer changed the brightness for a moment to test it, and put it back." : "")
+
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 480, height: 220))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let size = scroll.contentSize
+        let text = NSTextView(frame: NSRect(origin: .zero, size: size))
+        text.minSize = NSSize(width: 0, height: size.height)
+        text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        text.isVerticallyResizable = true
+        text.isHorizontallyResizable = false
+        text.autoresizingMask = [.width]
+        text.textContainer?.containerSize = NSSize(width: size.width, height: CGFloat.greatestFiniteMagnitude)
+        text.textContainer?.widthTracksTextView = true
+        text.isEditable = false
+        text.isSelectable = true
+        text.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        text.string = check.text
+        scroll.documentView = text
+        alert.accessoryView = scroll
+
+        alert.addButton(withTitle: "Done")
+        alert.addButton(withTitle: "Copy Report")
+        if alert.runModal() == .alertSecondButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(check.text, forType: .string)
         }
     }
 
@@ -2339,6 +2377,7 @@ enum Hammer {
         if let command = args.first {
             switch command {
             case "get", "set": exit(runMonitorCommand(args))
+            case "monitor": exit(runMonitorCheck(args))
             case "govee": exit(runGoveeCommand(Array(args.dropFirst())))
             default: break
             }
@@ -2352,41 +2391,48 @@ enum Hammer {
     }
 
     static func runMonitorCommand(_ args: [String]) -> Int32 {
-        guard args.count >= 2, let code = parseCode(args[1]) else {
+        guard args.count >= 2, let code = DDCCode.parse(args[1]) else {
             print("usage: Hammer get <brightness|contrast|volume|hex code>")
             print("       Hammer set <brightness|contrast|volume|hex code> <value>")
+            print("       Hammer monitor check")
             return 2
         }
-        guard let display = externalDisplays().first else {
-            print("No external display found.")
+        let monitors = MacMonitors.scan().monitors
+        guard !monitors.members.isEmpty else {
+            print("No monitor connection found. Run: ~/Hammer/Hammer monitor check")
             return 1
         }
 
         if args[0] == "get" {
-            guard let value = DDC.read(display, code: code) else {
-                print("The monitor didn't answer. Check that DDC/CI is on in its menu (Others).")
+            guard let found = monitors.read(code: code) else {
+                print("The monitor didn't answer. Run: ~/Hammer/Hammer monitor check")
                 return 1
             }
-            print("\(value.current) (max \(value.max))")
+            print("\(found.reading.current) (max \(found.reading.max))")
         } else {
             guard args.count >= 3, let value = UInt16(args[2]) else {
                 print("Give a number to set, e.g. Hammer set brightness 40")
                 return 2
             }
-            guard DDC.write(display, code: code, value: value) else {
-                print("Write failed.")
-                return 1
-            }
-            print("Done.")
+            _ = monitors.read(code: code)            // learns which connection answers, so it goes there
+            monitors.write(code: code, value: value)
+            let names = monitors.targets.map { $0.port.name ?? "the monitor" }
+            print("Sent to \(names.joined(separator: ", "))."
+                  + (monitors.anyAnswers ? "" : " It isn't answering, so Hammer can't confirm it."))
         }
         return 0
     }
 
-    static func parseCode(_ text: String) -> UInt8? {
-        let lower = text.lowercased()
-        if let named = DDC.codes[lower] { return named }
-        let hex = lower.hasPrefix("0x") ? String(lower.dropFirst(2)) : lower
-        return UInt8(hex, radix: 16)
+    /// `Hammer monitor check`: tests each step to the monitor and says what's wrong.
+    static func runMonitorCheck(_ args: [String]) -> Int32 {
+        guard args.count >= 2, args[1] == "check" else {
+            print("usage: Hammer monitor check")
+            return 2
+        }
+        print("Checking the monitor (its brightness may change for a moment)…\n")
+        let check = MacMonitors.check(MacMonitors.scan())
+        print(check.text)
+        return check.verdict == .working ? 0 : 1
     }
 
     static func runGoveeCommand(_ args: [String]) -> Int32 {

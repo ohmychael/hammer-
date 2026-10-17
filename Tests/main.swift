@@ -1,5 +1,5 @@
-// Tests for HammerCore.swift. Run by build.sh before every install:
-//   swiftc HammerCore.swift Tests/main.swift -o hammer-tests && ./hammer-tests
+// Tests for HammerCore.swift, Monitor.swift and Deliveries.swift. Run by build.sh before every install:
+//   swiftc HammerCore.swift Monitor.swift Deliveries.swift Tests/main.swift -o hammer-tests && ./hammer-tests
 // Exits with 1 if anything fails, which stops the update.
 
 import Foundation
@@ -194,21 +194,27 @@ expect(GoveeName.distance(dBm: -76) == "far away" && GoveeName.distance(dBm: -10
 
 expect(DDCPacket.set(code: 0x10, value: 50) == [0x84, 0x03, 0x10, 0x00, 0x32, 0x9A], "set brightness 50")
 expect(DDCPacket.set(code: 0x12, value: 300) == [0x84, 0x03, 0x12, 0x01, 0x2C, 0x87], "values over 255 use both bytes")
-expect(DDCPacket.get(code: 0x10) == [0x82, 0x01, 0x10, 0xAC], "get brightness")
+expect(DDCPacket.get(code: 0x10) == [0x82, 0x01, 0x10, 0xFD], "get brightness, seeded like m1ddc and MonitorControl")
+expect(DDCPacket.get(code: 0x10, seed: DDCPacket.readSeeds[1]) == [0x82, 0x01, 0x10, 0xAC],
+       "get brightness, MCCS's textbook checksum")
 
 let goodReply: [UInt8] = [0x6E, 0x88, 0x02, 0x00, 0x10, 0x00, 0x00, 0x64, 0x00, 0x32, 0xF2]
-let parsed = DDCPacket.parseReply(goodReply, code: 0x10)
-expect(parsed?.current == 50 && parsed?.max == 100, "reads current 50 of max 100")
+expect(DDCPacket.parseReply(goodReply, code: 0x10) == .value(current: 50, max: 100), "reads current 50 of max 100")
 var corrupt = goodReply
 corrupt[9] = 0x33
-expect(DDCPacket.parseReply(corrupt, code: 0x10) == nil, "a bad checksum is rejected")
-expect(DDCPacket.parseReply(goodReply, code: 0x12) == nil, "an answer about another setting is rejected")
+expect(DDCPacket.parseReply(corrupt, code: 0x10) == .badChecksum(current: 51, max: 100),
+       "a bad checksum is kept apart")
+expect(DDCPacket.parseReply(goodReply, code: 0x12) == .garbage, "an answer about another setting is rejected")
 var unsupported = goodReply
 unsupported[3] = 0x01
 unsupported[10] ^= 0x01                                    // keep the checksum valid
-expect(DDCPacket.parseReply(unsupported, code: 0x10) == nil, "\"unsupported\" result is rejected")
-expect(DDCPacket.parseReply(Array(goodReply.prefix(10)), code: 0x10) == nil, "too short")
-expect(DDCPacket.parseReply([], code: 0x10) == nil, "empty")
+expect(DDCPacket.parseReply(unsupported, code: 0x10) == .unsupported, "\"unsupported\" is recognized")
+expect(DDCPacket.parseReply(Array(goodReply.prefix(10)), code: 0x10) == .garbage, "too short")
+expect(DDCPacket.parseReply([], code: 0x10) == .nothing, "empty")
+expect(DDCPacket.parseReply([UInt8](repeating: 0, count: 11), code: 0x10) == .nothing, "silence (zeros)")
+expect(DDCPacket.parseReply([UInt8](repeating: 0xFF, count: 11), code: 0x10) == .nothing, "silence (ones)")
+expect(DDCPacket.parseReply([0x6E, 0x80, 0xBE] + [UInt8](repeating: 0, count: 8), code: 0x10) == .busy,
+       "null message: busy")
 
 // MARK: Text
 

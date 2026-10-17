@@ -165,41 +165,6 @@ enum GoveeName {
     }
 }
 
-// MARK: - DDC/CI packets (monitor control, VESA MCCS)
-//
-// Each message from the Mac: a length byte (0x80 | n), an opcode, the payload,
-// and an XOR checksum that also covers the bus addresses 0x6E (monitor) and
-// 0x51 (Mac). Replies are checked against 0x50 instead.
-
-enum DDCPacket {
-    static func checksum(_ bytes: ArraySlice<UInt8>, seed: UInt8) -> UInt8 {
-        bytes.reduce(seed) { $0 ^ $1 }
-    }
-
-    /// "Set VCP Feature": 0x84 = four bytes follow, 0x03 = set.
-    static func set(code: UInt8, value: UInt16) -> [UInt8] {
-        var packet: [UInt8] = [0x84, 0x03, code, UInt8(value >> 8), UInt8(value & 0xFF), 0]
-        packet[5] = checksum(packet[0..<5], seed: 0x6E ^ 0x51)
-        return packet
-    }
-
-    /// "Get VCP Feature": 0x82 = two bytes follow, 0x01 = get.
-    static func get(code: UInt8) -> [UInt8] {
-        var packet: [UInt8] = [0x82, 0x01, code, 0]
-        packet[3] = checksum(packet[0..<3], seed: 0x6E ^ 0x51)
-        return packet
-    }
-
-    /// Reply: 6E 88 02 result code type maxHi maxLo curHi curLo checksum.
-    /// Nil unless it's a valid, successful answer about `code`.
-    static func parseReply(_ reply: [UInt8], code: UInt8) -> (current: UInt16, max: UInt16)? {
-        guard reply.count >= 11, reply[2] == 0x02, reply[3] == 0x00, reply[4] == code,
-              checksum(reply[0..<10], seed: 0x50) == reply[10] else { return nil }
-        return (current: UInt16(reply[8]) << 8 | UInt16(reply[9]),
-                max: UInt16(reply[6]) << 8 | UInt16(reply[7]))
-    }
-}
-
 // MARK: - Text
 
 enum TimerText {
