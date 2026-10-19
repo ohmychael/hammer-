@@ -21,6 +21,37 @@ defaults:
     shell: bash          # bash -eo pipefail: a failure inside "… | tee" fails the step
 
 jobs:
+  edge-probe:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Probe Microsoft Edge (app window, AppleScript)
+        run: |
+          set +e
+          ls -d "/Applications/Microsoft Edge.app" && defaults read "/Applications/Microsoft Edge.app/Contents/Info" CFBundleShortVersionString
+          defaults read "/Applications/Microsoft Edge.app/Contents/Info" NSAppleScriptEnabled
+          open -na "Microsoft Edge" --args --no-first-run --app=https://www.youtube.com/ --window-size=760,460 --window-position=100,40
+          sleep 15
+          run() { echo "\$ $1"; perl -e 'alarm 20; exec @ARGV' osascript -e "$1" 2>&1; echo "(exit $?)"; }
+          run 'tell application "Microsoft Edge" to count windows'
+          run 'tell application "Microsoft Edge" to get {id, name, bounds, mode} of every window'
+          run 'tell application "Microsoft Edge" to get URL of active tab of every window'
+          run 'tell application "Microsoft Edge" to get minimized of every window'
+          run 'tell application "Microsoft Edge" to get frontmost'
+          run 'tell application "Microsoft Edge" to set bounds of window 1 to {300, 60, 1060, 520}'
+          run 'tell application "Microsoft Edge" to get bounds of window 1'
+          run 'tell application "Microsoft Edge" to set minimized of window 1 to true'
+          sleep 2
+          run 'tell application "Microsoft Edge" to get minimized of every window'
+          run 'tell application "Microsoft Edge" to set minimized of window 1 to false'
+          run 'tell application "Microsoft Edge" to set index of window 1 to 1'
+          run 'tell application "Microsoft Edge" to activate'
+          open -na "Microsoft Edge" --args --app=https://www.youtube.com/
+          sleep 6
+          run 'tell application "Microsoft Edge" to get {id, name} of every window'
+          ps -ax | grep -i "Microsoft Edge" | grep -v grep | cut -c1-150 | head -5
+        shell: bash
+
   build:
     runs-on: macos-15
     timeout-minutes: 50
