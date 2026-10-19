@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write     # only to save the player check's pictures on the ci-screenshots branch
 
 defaults:
   run:
@@ -45,7 +45,7 @@ jobs:
         timeout-minutes: 10
         run: |
           start=$(date +%s)
-          swiftc -O HammerCore.swift Monitor.swift Deliveries.swift Tests/main.swift \
+          swiftc -O HammerCore.swift Monitor.swift Player.swift Deliveries.swift Tests/main.swift \
             -o /tmp/hammer-tests 2>&1 | tee /tmp/tests-build.log
           /tmp/hammer-tests | tee /tmp/tests.log
           echo "::notice title=Tests::$(tail -1 /tmp/tests.log) (built and run in $(( $(date +%s) - start )) s)"
@@ -55,7 +55,7 @@ jobs:
         run: |
           start=$(date +%s)
           swiftc -parse-as-library -O Hammer.swift HammerCore.swift Monitor.swift MonitorMac.swift \
-            Deliveries.swift DeliveryAlerts.swift -o /tmp/Hammer 2>&1 | tee /tmp/app-build.log
+            Player.swift PlayerMac.swift Deliveries.swift DeliveryAlerts.swift -o /tmp/Hammer 2>&1 | tee /tmp/app-build.log
           echo "::notice title=App::built in $(( $(date +%s) - start )) s"
 
       - name: Monitor commands (there's no monitor here)
@@ -80,6 +80,31 @@ jobs:
           codesign -d -r- ~/Applications/Hammer.app 2>&1 | grep designated | tee /tmp/req1.txt
           pkill -x Hammer || true
 
+      - name: YouTube player check (loads a real video, pops it out, takes pictures)
+        timeout-minutes: 4
+        run: |
+          set +e
+          perl -e 'alarm shift; exec @ARGV' 150 ~/Applications/Hammer.app/Contents/MacOS/Hammer player-check /tmp/player-shots \
+            > /tmp/player.txt 2>&1
+          echo "exit $?" >> /tmp/player.txt
+          cat /tmp/player.txt
+          node Tests/Player/script_test.js | tee -a /tmp/player.txt
+          grep -q "^exit 0$" /tmp/player.txt
+
+      - name: Keep the pictures (on the ci-screenshots branch)
+        if: always()
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          ls /tmp/player-shots/*.png >/dev/null 2>&1 || exit 0
+          cp /tmp/player.txt /tmp/player-shots/ 2>/dev/null || true
+          cd /tmp/player-shots
+          git init -q && git checkout -q -b ci-screenshots
+          git add -A
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "Player pictures for $GITHUB_SHA"
+          git push -qf "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ci-screenshots \
+            && echo "::notice title=Player pictures::saved to the ci-screenshots branch"
+
       - name: Sign again (the way the next update does)
         timeout-minutes: 5
         run: |
@@ -100,7 +125,7 @@ jobs:
             [ -f "$log" ] || continue
             { grep -E "error:" "$log" || true; } | head -10 | while IFS= read -r line; do echo "::error::$line"; done
           done
-          for file in /tmp/check.txt /tmp/install1.log /tmp/req1.txt /tmp/sign2.log /tmp/req2.txt /tmp/ps.log; do
+          for file in /tmp/player.txt /tmp/check.txt /tmp/install1.log /tmp/req1.txt /tmp/sign2.log /tmp/req2.txt /tmp/ps.log; do
             [ -f "$file" ] || continue
             body="$(tail -40 "$file" | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
             echo "::notice title=$(basename "$file")::$body"

@@ -943,6 +943,85 @@ expect(state.sliders && state.hints.first == "The Dell is on HDMI through a USB-
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: true, hdmiAdapter: true)
 expect(state.hints.isEmpty, "menu: an adapter that works isn't mentioned")
 
+
+// MARK: YouTube player: links
+
+func playerVideo(_ text: String) -> String? {
+    YouTubeLink.video(in: text).map { "\($0.id)" + ($0.start.map { "@\($0)" } ?? "") }
+}
+expect(playerVideo("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ", "watch link")
+expect(playerVideo("https://m.youtube.com/watch?v=dQw4w9WgXcQ&t=1m30s") == "dQw4w9WgXcQ@90", "mobile link with a time")
+expect(playerVideo("youtube.com/watch?feature=share&v=dQw4w9WgXcQ") == "dQw4w9WgXcQ", "no https, v not first")
+expect(playerVideo("https://youtu.be/dQw4w9WgXcQ?si=abc&t=42") == "dQw4w9WgXcQ@42", "short link")
+expect(playerVideo("https://www.youtube.com/shorts/dQw4w9WgXcQ") == "dQw4w9WgXcQ", "shorts")
+expect(playerVideo("https://www.youtube.com/embed/dQw4w9WgXcQ?start=7") == "dQw4w9WgXcQ@7", "embed with start")
+expect(playerVideo("https://www.youtube.com/live/dQw4w9WgXcQ") == "dQw4w9WgXcQ", "live")
+expect(playerVideo("https://music.youtube.com/watch?v=dQw4w9WgXcQ&list=RD") == "dQw4w9WgXcQ", "YouTube Music")
+expect(playerVideo("  https://youtu.be/dQw4w9WgXcQ\n") == "dQw4w9WgXcQ", "spaces and a newline around it")
+expect(playerVideo("https://www.youtube.com/watch?v=short") == nil, "an ID that isn't 11 characters")
+expect(playerVideo("https://www.youtube.com/@channel") == nil && playerVideo("https://www.youtube.com/") == nil, "not a video")
+expect(playerVideo("https://notyoutube.com/watch?v=dQw4w9WgXcQ") == nil, "a look-alike site")
+expect(playerVideo("https://youtube.com.evil.example/watch?v=dQw4w9WgXcQ") == nil, "youtube.com as a prefix")
+expect(playerVideo("check this out https://youtu.be/dQw4w9WgXcQ") == nil, "a sentence isn't a link")
+expect(playerVideo("") == nil && playerVideo(String(repeating: "a", count: 5000)) == nil, "empty, or far too long")
+expect(playerVideo("https://www.youtube.com/watch?v=dQw4w9WgX!Q") == nil, "odd characters in the ID")
+expect(YouTubeLink.parseTime("90") == 90 && YouTubeLink.parseTime("1h2m3s") == 3723 && YouTubeLink.parseTime("2m") == 120
+       && YouTubeLink.parseTime("90s") == 90, "times")
+expect(YouTubeLink.parseTime("") == nil && YouTubeLink.parseTime("1x") == nil && YouTubeLink.parseTime("1m30") == nil
+       && YouTubeLink.parseTime("-5") == nil && YouTubeLink.parseTime("m") == nil, "bad times")
+expect(YouTubeLink.watchURL(id: "dQw4w9WgXcQ").absoluteString == "https://m.youtube.com/watch?v=dQw4w9WgXcQ"
+       && YouTubeLink.watchURL(id: "dQw4w9WgXcQ", start: 90).absoluteString == "https://m.youtube.com/watch?v=dQw4w9WgXcQ&t=90s",
+       "watch URLs")
+expect(YouTubeLink.searchURL("lofi & chill").absoluteString == "https://m.youtube.com/results?search_query=lofi%20%26%20chill",
+       "search URL escapes the query")
+
+// MARK: YouTube player: which pages stay inside it
+
+func playerDecide(_ text: String) -> PlayerNavigation { PlayerNavigation.decide(URL(string: text)!) }
+expect(playerDecide("https://m.youtube.com/watch?v=x") == .stay && playerDecide("https://www.youtube.com/") == .stay
+       && playerDecide("https://youtu.be/dQw4w9WgXcQ") == .stay, "YouTube stays")
+expect(playerDecide("https://accounts.google.com/ServiceLogin") == .stay && playerDecide("https://consent.youtube.com/m") == .stay
+       && playerDecide("https://accounts.google.co.uk/x") == .stay, "signing in stays")
+expect(playerDecide("about:blank") == .stay, "blank pages stay")
+expect(playerDecide("https://example.com/merch") == .openInBrowser && playerDecide("https://www.youtube.com.evil.example/") == .openInBrowser
+       && playerDecide("http://amzn.to/x") == .openInBrowser, "other sites open in your browser")
+expect(playerDecide("mailto:a@b.c") == .openInBrowser && playerDecide("itms-apps://x") == .openInBrowser, "other kinds of links too")
+
+// MARK: YouTube player: where the windows go
+
+let playerWideScreen = CGRect(x: 0, y: 0, width: 3840, height: 1575)          // visible frame: the menu bar is above
+var playerDrop = PlayerGeometry.dropdown(visible: playerWideScreen, anchorMaxX: 3700)
+expect(playerDrop == CGRect(x: 3280, y: 871, width: 420, height: 700), "dropdown under the icon: \(playerDrop)")
+playerDrop = PlayerGeometry.dropdown(visible: playerWideScreen, anchorMaxX: nil)
+expect(playerDrop.maxX == 3832 && playerDrop.maxY == 1571, "no icon: the top-right corner")
+playerDrop = PlayerGeometry.dropdown(visible: playerWideScreen, anchorMaxX: 200)
+expect(playerDrop.minX == 8 && playerDrop.width == 420, "an icon near the left edge: kept on screen")
+playerDrop = PlayerGeometry.dropdown(visible: CGRect(x: 0, y: 0, width: 300, height: 500), anchorMaxX: 290)
+expect(playerDrop.width == 284 && playerDrop.height == 484 && playerDrop.minX == 8 && playerDrop.minY >= 0, "a small screen: shrunk to fit")
+let playerSecond = CGRect(x: -1920, y: 200, width: 1920, height: 1055)  // a screen to the left
+playerDrop = PlayerGeometry.dropdown(visible: playerSecond, anchorMaxX: nil)
+expect(playerSecond.contains(playerDrop), "another screen: inside it")
+
+var playerMini = PlayerGeometry.miniDefault(visible: playerWideScreen)
+expect(playerMini == CGRect(x: 3424, y: 16, width: 400, height: 225), "mini player: bottom right, 16:9: \(playerMini)")
+playerMini = PlayerGeometry.miniDefault(visible: CGRect(x: 0, y: 0, width: 300, height: 400))
+expect(playerMini.width == 240 && playerMini.height == 135, "never smaller than 240 wide")
+
+let playerDragged = CGRect(x: 500, y: 1200, width: 400, height: 225)
+expect(PlayerGeometry.snap(playerDragged, in: playerWideScreen) == CGRect(x: 16, y: 1334, width: 400, height: 225), "snaps top left")
+expect(PlayerGeometry.snap(CGRect(x: 3000, y: 100, width: 400, height: 225), in: playerWideScreen)
+       == CGRect(x: 3424, y: 16, width: 400, height: 225), "snaps bottom right")
+expect(PlayerGeometry.snap(CGRect(x: -300, y: -100, width: 400, height: 225), in: playerWideScreen).origin == CGPoint(x: 16, y: 16),
+       "playerDragged partly off screen: bottom left")
+let playerHuge = PlayerGeometry.snap(CGRect(x: 0, y: 0, width: 8000, height: 4500), in: playerWideScreen)
+expect(playerHuge.width <= playerWideScreen.width - 32 && playerHuge.height <= playerWideScreen.height - 32
+       && abs(playerHuge.width / playerHuge.height - 16.0 / 9.0) < 0.01, "bigger than the screen: shrunk, still 16:9 (\(playerHuge))")
+let playerLaptop = CGRect(x: 0, y: 0, width: 1512, height: 944)
+let playerMoved = PlayerGeometry.clamp(CGRect(x: 3424, y: 16, width: 400, height: 225), in: playerLaptop)
+expect(playerMoved == CGRect(x: 1112, y: 16, width: 400, height: 225), "the screen got smaller: brought back on")
+expect(PlayerGeometry.clamp(CGRect(x: 10, y: 10, width: 100, height: 50), in: .zero) == CGRect(x: 10, y: 10, width: 100, height: 50),
+       "no screen: left alone")
+
 // MARK: Text
 
 expect(TimerText.describe(minutes: 5) == "5 min", "5 min")

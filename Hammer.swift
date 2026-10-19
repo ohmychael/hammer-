@@ -9,8 +9,9 @@
 //   curl -fsSL https://raw.githubusercontent.com/ohmychael/hammer-/main/install-hammer.sh | bash
 //
 // Build by hand:  swiftc -parse-as-library -O Hammer.swift HammerCore.swift Monitor.swift MonitorMac.swift \
-//                    Deliveries.swift DeliveryAlerts.swift -o Hammer
-// Tests:          swiftc HammerCore.swift Monitor.swift Deliveries.swift Tests/main.swift -o hammer-tests && ./hammer-tests
+//                    Player.swift PlayerMac.swift Deliveries.swift DeliveryAlerts.swift -o Hammer
+//                 (the app also needs PlayerScript.js in its Resources: build.sh does this)
+// Tests:          swiftc HammerCore.swift Monitor.swift Player.swift Deliveries.swift Tests/main.swift -o hammer-tests && ./hammer-tests
 // Run:    ./Hammer                        menu bar app (hammer icon)
 //         If the icon is hidden behind the notch, open Hammer from Apps or
 //         Spotlight, or press Control-Option-H: the menu appears at the pointer.
@@ -910,11 +911,15 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
 
 // MARK: - Menu bar app
 
-/// Called by macOS when Control-Option-H is pressed.
+/// Called by macOS when Control-Option-H (id 1) or Control-Option-Y (id 2) is pressed.
 func hotKeyPressed(_ call: EventHandlerCallRef?, _ event: EventRef?, _ userData: UnsafeMutableRawPointer?) -> OSStatus {
     guard let userData else { return noErr }
+    var hotKey = EventHotKeyID()
+    let status = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                   nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKey)
+    let which = status == noErr ? hotKey.id : 1
     let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-    Task { @MainActor in delegate.showMenuAtMouse() }
+    Task { @MainActor in delegate.handleHotKey(which) }
     return noErr
 }
 
@@ -1022,6 +1027,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }()
     private var colorTargetID: String?
     private var hotKeyRef: EventHotKeyRef?
+    private var playerHotKeyRef: EventHotKeyRef?
+    // YouTube mini player (Player.swift, PlayerMac.swift), made the first time it's used.
+    private var youTube: YouTubePlayer?
 
     private let ddcQueue = DispatchQueue(label: "Hammer.ddc")       // I²C is slow; keep it off the main thread
     private let goveeQueue = DispatchQueue(label: "Hammer.govee")   // one light command at a time
@@ -1078,7 +1086,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Control-Option-H opens the menu from anywhere.
+    /// Control-Option-H opens the menu from anywhere; Control-Option-Y the YouTube player.
     private func registerHotKey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), hotKeyPressed, 1, &spec,
@@ -1086,6 +1094,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let id = EventHotKeyID(signature: OSType(0x484D_4D52), id: 1)    // "HMMR"
         RegisterEventHotKey(UInt32(kVK_ANSI_H), UInt32(controlKey | optionKey), id,
                             GetApplicationEventTarget(), 0, &hotKeyRef)
+        let playerID = EventHotKeyID(signature: OSType(0x484D_4D52), id: 2)
+        RegisterEventHotKey(UInt32(kVK_ANSI_Y), UInt32(controlKey | optionKey), playerID,
+                            GetApplicationEventTarget(), 0, &playerHotKeyRef)
+    }
+
+    func handleHotKey(_ id: UInt32) {
+        if id == 2 { toggleYouTube() } else { showMenuAtMouse() }
+    }
+
+    // MARK: YouTube
+
+    private var player: YouTubePlayer {
+        if let youTube { return youTube }
+        let made = YouTubePlayer(anchor: { [weak self] in
+            guard let window = self?.statusItem.button?.window else { return (NSScreen.main, nil) }
+            return (window.screen, window.frame.maxX)
+        })
+        made.onChange = { [weak self] in self?.rebuildMenuSoon() }
+        youTube = made
+        return made
+    }
+
+    @objc private func toggleYouTube() { player.toggle() }
+
+    /// Plays the YouTube link you copied. Reading the clipboard only when you
+    /// choose this keeps macOS from asking about it every time the menu opens.
+    @objc private func playCopiedLink() {
+        let copied = NSPasteboard.general.string(forType: .string) ?? ""
+        guard let link = YouTubeLink.video(in: copied) else {
+            if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+            let alert = NSAlert()
+            alert.messageText = "No YouTube link copied"
+            alert.informativeText = "Copy a video's link (in YouTube: Share → Copy link), then choose Play Copied Link."
+            alert.runModal()
+            return
+        }
+        player.play(link)
+    }
+
+    private func addYouTube(to menu: NSMenu) {
+        menu.addItem(label("YouTube"))
+        let open = action(youTube?.place == .mini ? "Back to the YouTube Player" : "YouTube Player",
+                          #selector(toggleYouTube))
+        open.keyEquivalent = "y"
+        open.keyEquivalentModifierMask = [.control, .option]
+        menu.addItem(open)
+        menu.addItem(action("Play Copied Link", #selector(playCopiedLink)))
+        if let youTube, youTube.place != .hidden, !youTube.title.isEmpty {
+            menu.addItem(hint((youTube.playing ? "Playing: " : "Paused: ") + truncated(youTube.title, 44)))
+        }
+    }
+
+    private func truncated(_ text: String, _ length: Int) -> String {
+        text.count <= length ? text : String(text.prefix(length - 1)) + "…"
     }
 
     /// Menu bar apps have no Edit menu, which stops Cmd-V from pasting into
@@ -1157,6 +1219,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         addDeliveries(to: menu)
+
+        menu.addItem(.separator())
+        addYouTube(to: menu)
 
         menu.addItem(.separator())
         menu.addItem(hint("Open this menu anywhere: Control-Option-H"))
@@ -2394,6 +2459,7 @@ enum Hammer {
             switch command {
             case "get", "set": exit(runMonitorCommand(args))
             case "monitor": exit(runMonitorCheck(args))
+            case "player-check": PlayerCheck.run(args)
             case "govee": exit(runGoveeCommand(Array(args.dropFirst())))
             default: break
             }

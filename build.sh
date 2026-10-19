@@ -16,11 +16,12 @@ mkdir -p "$BUILD"
 
 # 1. Run the tests, then compile. Any failure stops here, before anything is replaced.
 echo "Running tests..."
-swiftc -O "$REPO/HammerCore.swift" "$REPO/Monitor.swift" "$REPO/Deliveries.swift" "$REPO/Tests/main.swift" \
-  -o "$BUILD/hammer-tests"
+swiftc -O "$REPO/HammerCore.swift" "$REPO/Monitor.swift" "$REPO/Player.swift" "$REPO/Deliveries.swift" \
+  "$REPO/Tests/main.swift" -o "$BUILD/hammer-tests"
 "$BUILD/hammer-tests"
 swiftc -parse-as-library -O "$REPO/Hammer.swift" "$REPO/HammerCore.swift" "$REPO/Monitor.swift" \
-  "$REPO/MonitorMac.swift" "$REPO/Deliveries.swift" "$REPO/DeliveryAlerts.swift" -o "$BUILD/Hammer"
+  "$REPO/MonitorMac.swift" "$REPO/Player.swift" "$REPO/PlayerMac.swift" "$REPO/Deliveries.swift" \
+  "$REPO/DeliveryAlerts.swift" -o "$BUILD/Hammer"
 
 # 2. Assemble the app next to the build, then swap it in.
 STAGE="$BUILD/Hammer.app"
@@ -28,6 +29,7 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 cp "$BUILD/Hammer" "$STAGE/Contents/MacOS/Hammer"
 echo "$VERSION" > "$STAGE/Contents/Resources/VERSION"
+cp "$REPO/PlayerScript.js" "$STAGE/Contents/Resources/PlayerScript.js"   # runs inside the YouTube player's page
 cat > "$STAGE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
