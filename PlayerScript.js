@@ -52,8 +52,12 @@
 
   // Mini player: hide everything but the video, and make it fill the window.
   // Effects that would trap a fixed-position video inside its box are turned off.
+  // Otherwise (the dropdown): the page's own background is cleared, so Hammer's
+  // glass shows through. On YouTube's mobile site only <html> paints it.
   const style = document.createElement('style');
   style.textContent = `
+    html:not(.hammer-mini), html:not(.hammer-mini) body { background: transparent !important;
+      background-color: transparent !important; }
     html.hammer-mini, html.hammer-mini body { background: #000 !important; overflow: hidden !important; }
     html.hammer-mini body * { visibility: hidden !important; transform: none !important; filter: none !important;
       contain: none !important; perspective: none !important; backdrop-filter: none !important;

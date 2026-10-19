@@ -846,6 +846,8 @@ final class PlayerCheck: NSObject, NSApplicationDelegate {
         player.toggle()                                                // the home page
         _ = await wait(20) { false }
         await dumpBackgrounds("home")
+        let clear = await player.evaluateBool("getComputedStyle(document.documentElement).backgroundColor === 'rgba(0, 0, 0, 0)'")
+        expect(clear == true, "YouTube's background is cleared, so the glass shows")
         player.play((id: "jNQXAC9IVRw", start: nil))                  // "Me at the zoo", 19 s
         expect(player.place == .dropdown, "the dropdown opens")
         let video = await wait(40) { self.player.hasVideo }

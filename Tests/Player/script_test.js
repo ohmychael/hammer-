@@ -123,6 +123,8 @@ expect('data-hammer-path' in player.attrs && 'data-hammer-path' in player.parent
 hammer.mini(false);
 expect(page.boxes.every((e) => !('data-hammer-path' in e.attrs)), 'and unmarked after');
 expect(/\[data-hammer-path\] \{ display: block !important; \}/.test(page.appended[0].textContent), 'marked boxes are shown');
+expect(/html:not\(\.hammer-mini\), html:not\(\.hammer-mini\) body \{ background: transparent !important;/.test(page.appended[0].textContent),
+       'outside the mini player the page background is cleared for the glass');
 
 // A video page counts as having a video before anything has loaded; other pages don't.
 page = makePage([makeVideo({ duration: NaN, readyState: 0 })], '/watch');
