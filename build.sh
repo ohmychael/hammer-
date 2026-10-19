@@ -20,8 +20,8 @@ swiftc -O "$REPO/HammerCore.swift" "$REPO/Monitor.swift" "$REPO/Player.swift" "$
   "$REPO/Tests/main.swift" -o "$BUILD/hammer-tests"
 "$BUILD/hammer-tests"
 swiftc -parse-as-library -O "$REPO/Hammer.swift" "$REPO/HammerCore.swift" "$REPO/Monitor.swift" \
-  "$REPO/MonitorMac.swift" "$REPO/Player.swift" "$REPO/PlayerMac.swift" "$REPO/Deliveries.swift" \
-  "$REPO/DeliveryAlerts.swift" -o "$BUILD/Hammer"
+  "$REPO/MonitorMac.swift" "$REPO/Player.swift" "$REPO/PlayerMac.swift" "$REPO/EdgeMac.swift" \
+  "$REPO/Deliveries.swift" "$REPO/DeliveryAlerts.swift" -o "$BUILD/Hammer"
 
 # 2. Assemble the app next to the build, then swap it in.
 STAGE="$BUILD/Hammer.app"
@@ -46,6 +46,7 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
   <key>LSUIElement</key><true/>
   <key>NSLocalNetworkUsageDescription</key><string>Hammer looks for your Govee lights on your Wi-Fi network.</string>
   <key>NSBluetoothAlwaysUsageDescription</key><string>Hammer controls your Govee bulbs over Bluetooth.</string>
+  <key>NSAppleEventsUsageDescription</key><string>Hammer opens YouTube in your Microsoft Edge and keeps its window in the top-right corner. It never reads your cookies, passwords or history.</string>
 </dict>
 </plist>
 PLIST

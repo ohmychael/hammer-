@@ -11,7 +11,7 @@ A small Mac menu bar app for the desk:
   Bluetooth reaches through walls, so a bulb found only over Bluetooth could be a neighbor's. Those start under **Other Lights**, where Hammer never controls them (not even with All Lights), until you choose **Add to My Lights**. Each shows roughly how far away it is, and **Blink to Identify** helps you tell which is which.
 - **Turn On At** (in All Lights) — pick a time, once or every day, and your lights come on with the color and brightness they last had. Optionally wakes the Mac a minute before (macOS asks for your password once).
 - **Delivery alerts** — a Mac notification when a package is delivered ("Delivered · eBay — Apple iPhone 15 Pro Max"), from the delivery emails in your Gmail: eBay, Amazon, UPS, USPS, FedEx and most other stores. Click it to open the email. Failed or attempted deliveries show as **Delivery problem**. See [Delivery alerts](#delivery-alerts).
-- **YouTube player** — press **Control-Option-Y** (or choose YouTube Player in the menu) and YouTube drops down from the top-right corner: search, browse and watch without opening your browser. **Pop out** turns the video into a small player that floats above everything, even full-screen apps. See [YouTube player](#youtube-player).
+- **YouTube** — press **⌘Y** (or **Control-Option-Y**) and YouTube appears flush in the screen's top-right corner. If you have Microsoft Edge, it opens there as an Edge app window, so you're signed in and your extensions work; press the shortcut again to tuck it away. Or use Hammer's own glass player, with a mini player that floats above everything. See [YouTube](#youtube).
 - **Sleep timer** (in All Lights) — pick 5 minutes to 8 hours on a slider and all your lights turn off then. The Mac stays awake until the timer runs out (closing the lid still puts it to sleep), and the timer survives Hammer restarting.
 
 Open the menu from the hammer icon in the menu bar, by pressing **Control-Option-H**, or by opening Hammer from Apps or Spotlight.
@@ -29,16 +29,35 @@ Hammer finds which of the Mac's display connections the monitor is actually on (
 
 The menu always offers **Check Monitor Connection…**, and says so if the monitor doesn't answer. It tests each step: whether macOS sees the monitor, which connection and which of the monitor's inputs it's on, whether Hammer's messages go out, whether anything can be read back over the cable (the monitor's ID info), whether the monitor answers, and whether a change actually takes effect. It moves the brightness for a moment and puts it back. Then it tells you what to fix, and **Copy Report** copies the details. The same check runs in Terminal with `~/Hammer/Hammer monitor check`.
 
-## YouTube player
+## YouTube
 
-**Control-Option-Y** opens it; press it again, press Esc, or click anywhere outside it to close it (clicks inside it never do). It's YouTube's own mobile site on the same glass as macOS's menus, in a wide panel under the menu bar: drag its edges to resize it, and it remembers the size. Search, recommendations and signing in work as usual, and ads play as YouTube serves them. Hammer doesn't download or block anything.
+**⌘Y** or **Control-Option-Y** opens YouTube in the screen's top-right corner, right under the menu bar. Where it opens is up to you in **YouTube Options**.
+
+### In Microsoft Edge (the default when Edge is installed)
+
+YouTube opens in your own Edge as an *app window*: no tabs, no address bar. It's your Edge profile, so you're signed in to your account and your extensions run there as usual.
+
+- The first time, macOS asks **"Hammer wants access to control Microsoft Edge"**. Choose **Allow**. Hammer only opens, moves and minimizes that one window. It never reads your cookies, passwords or history. If you chose Don't Allow: System Settings → Privacy & Security → Automation → Hammer → turn on Microsoft Edge.
+- **The shortcut toggles it.** In front: it's tucked away (minimized; a playing video keeps playing). Anywhere else (behind other windows, minimized): it comes back to the corner, in front. Closed: a new one opens.
+- Resize it and it keeps that size, and goes back to the corner each time.
+- **Play Copied Link** plays the copied YouTube link in that window.
+- For a small floating video, use Edge's own picture-in-picture (right-click the video twice → Picture in picture).
+- It's an ordinary Edge window, so clicking into other apps doesn't close it: it just goes behind them.
+
+### In Hammer's player
+
+**Control-Option-Y** (or ⌘Y) opens it; press it again, press Esc, or click anywhere outside it to close it (clicks inside it never do). It's YouTube's own mobile site on the same glass as macOS's menus, in a wide panel flush in the top-right corner: drag its edges to resize it, and it remembers the size. Search, recommendations and signing in work as usual, and ads play as YouTube serves them. Hammer doesn't download or block anything.
 
 - **Pop out** (the ⧉ button) moves the playing video into a mini player in the corner of the screen. It floats above every window and over full-screen apps. Drag it anywhere and it settles into the nearest corner; drag its edges to resize it. Point at it for play/pause, 10 seconds back or forward, back to the dropdown, and close. Double-click it to go back to the dropdown.
 - Closing the dropdown while a video plays pops it out by itself; closing the mini player pauses it.
 - **Pin** (📌) keeps the dropdown open when you click into other apps.
 - **Play Copied Link** in the menu plays the YouTube link you copied (from Share → Copy link, a message, anywhere).
 - Links to other sites open in your browser. The safari button opens the current video there.
-- Signing in: tap **You → Sign in** once and it stays signed in. It can't use your browser's sign-in: browsers keep theirs to themselves, and a copied sign-in looks to Google like a stolen one. Google sometimes refuses to sign in inside apps; everything works signed out too.
+- Signing in: tap **You → Sign in** once and it stays signed in. It can't use your browser's sign-in: browsers keep theirs to themselves, and a copied sign-in looks to Google like a stolen one. Google sometimes refuses to sign in inside apps; everything works signed out too. To use your Edge sign-in, choose Microsoft Edge in YouTube Options.
+
+### ⌘Y
+
+**⌘Y Opens YouTube** (in YouTube Options) is on to start with. While it's on, other apps don't get ⌘Y: Finder's Quick Look (Space still works) and History in Edge, Chrome and Safari (use the History menu). Turn it off and Control-Option-Y still works.
 
 ## Bluetooth bulbs and your phone
 
@@ -111,8 +130,9 @@ Bluetooth bulbs are controlled from the menu bar app only.
 | `HammerCore.swift` | Logic that needs only Foundation: packets, the Bluetooth command queue, name parsing |
 | `Monitor.swift` | Monitor control logic (Foundation only): DDC/CI messages, finding the monitor's connection, the monitor check |
 | `MonitorMac.swift` | Monitor control on the Mac: reads IOKit's display registry and sends the bytes |
-| `Player.swift` | YouTube player logic (Foundation only): YouTube links, which pages stay in the player, where the windows go |
+| `Player.swift` | YouTube logic (Foundation only): YouTube links, which pages stay in the player, where the windows go, and the scripts and steps for YouTube in Edge |
 | `PlayerMac.swift` | The YouTube dropdown and floating mini player, and its self-test (`Hammer player-check`) |
+| `EdgeMac.swift` | YouTube in your own Microsoft Edge: starts the app window, runs Hammer's scripts, asks macOS's permission; self-test (`Hammer edge-check`) |
 | `PlayerScript.js` | Runs inside the YouTube page: finds the video, plays/pauses/seeks it, shows only the video in the mini player |
 | `Tests/Player/` | Tests for `PlayerScript.js` in node with a stand-in page |
 | `Deliveries.swift` | Delivery alerts logic (Foundation only): which emails are deliveries, reading Gmail over IMAP |

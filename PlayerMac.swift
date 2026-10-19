@@ -269,6 +269,15 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         showDropdown()                                       // turns the full page back on
     }
 
+    /// Where the dropdown is (for the self-test).
+    var dropdownFrame: NSRect { dropdown.frame }
+
+    /// Pauses and closes both windows (you switched to YouTube in Edge).
+    func putAway() {
+        run("window.__hammer && (window.__hammer.pause(), window.__hammer.mini(false))")
+        if place != .hidden { hideAll() }
+    }
+
     /// The mini player's ✕: pauses and puts it away.
     func closeMini() {
         run("window.__hammer && (window.__hammer.pause(), window.__hammer.mini(false))")
@@ -843,6 +852,11 @@ final class PlayerCheck: NSObject, NSApplicationDelegate {
         expect(YouTubePlayer.scriptURL != nil, "PlayerScript.js found")
         player.toggle()                                                // the home page
         _ = await wait(20) { false }
+        if let visible = NSScreen.main?.visibleFrame {
+            let frame = player.dropdownFrame
+            expect(abs(frame.maxX - visible.maxX) < 0.5 && abs(frame.maxY - visible.maxY) < 0.5,
+                   "the dropdown is flush in the top-right corner: \(frame) on \(visible)")
+        }
         await dumpBackgrounds("home")
         let clear = await player.evaluateBool("getComputedStyle(document.documentElement).backgroundColor === 'rgba(0, 0, 0, 0)'")
         expect(clear == true, "YouTube's background is cleared, so the glass shows")

@@ -1039,6 +1039,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     // YouTube mini player (Player.swift, PlayerMac.swift), made the first time it's used.
     private var youTube: YouTubePlayer?
+    // YouTube in your own Microsoft Edge (EdgeMac.swift), likewise.
+    private var edgeYouTube: EdgePlayer?
 
     private let ddcQueue = DispatchQueue(label: "Hammer.ddc")       // I²C is slow; keep it off the main thread
     private let goveeQueue = DispatchQueue(label: "Hammer.govee")   // one light command at a time
@@ -1143,7 +1145,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return made
     }
 
-    @objc private func toggleYouTube() { player.toggle() }
+    private var edge: EdgePlayer {
+        if let edgeYouTube { return edgeYouTube }
+        let made = EdgePlayer(screen: { [weak self] in self?.statusItem.button?.window?.screen },
+                              useHammerPlayer: { [weak self] in
+                                  self?.setYouTubeInEdge(false)
+                                  self?.player.showDropdown()
+                              })
+        edgeYouTube = made
+        return made
+    }
+
+    /// YouTube opens in Microsoft Edge (signed in, your extensions) if it's installed,
+    /// unless you chose Hammer's own player in YouTube Options.
+    private var youTubeInEdge: Bool {
+        (UserDefaults.standard.object(forKey: "youTubeInEdge") as? Bool ?? true) && EdgePlayer.isInstalled
+    }
+
+    private func setYouTubeInEdge(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: "youTubeInEdge")
+        if on { youTube?.putAway() }
+        rebuildMenuSoon()
+    }
+
+    @objc private func useEdgeForYouTube() { setYouTubeInEdge(true) }
+    @objc private func useHammerPlayerForYouTube() { setYouTubeInEdge(false) }
+
+    @objc private func toggleYouTube() {
+        if youTubeInEdge { edge.toggle() } else { player.toggle() }
+    }
 
     /// Plays the YouTube link you copied. Reading the clipboard only when you
     /// choose this keeps macOS from asking about it every time the menu opens.
@@ -1157,12 +1187,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.runModal()
             return
         }
-        player.play(link)
+        if youTubeInEdge { edge.toggle(play: EdgeYouTube.watchURL(id: link.id, start: link.start)) } else { player.play(link) }
     }
 
     private func addYouTube(to menu: NSMenu) {
         menu.addItem(label("YouTube"))
-        let open = action(youTube?.place == .mini ? "Back to the YouTube Player" : "YouTube Player",
+        let inEdge = youTubeInEdge
+        let open = action(inEdge ? "YouTube in Edge" : youTube?.place == .mini ? "Back to the YouTube Player" : "YouTube Player",
                           #selector(toggleYouTube))
         if commandYOn && commandYWorks {
             open.keyEquivalent = "y"
@@ -1176,9 +1207,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(hint("Another app has Control-Option-Y, so it's menu only."))
         }
         menu.addItem(action("Play Copied Link", #selector(playCopiedLink)))
-        if let youTube, youTube.place != .hidden, !youTube.title.isEmpty {
+        if !inEdge, let youTube, youTube.place != .hidden, !youTube.title.isEmpty {
             menu.addItem(hint((youTube.playing ? "Playing: " : "Paused: ") + truncated(youTube.title, 44)))
         }
+        menu.addItem(youTubeOptions(inEdge: inEdge))
+    }
+
+    /// Where YouTube opens, and whether Command-Y opens it.
+    private func youTubeOptions(inEdge: Bool) -> NSMenuItem {
+        let options = NSMenu()
+        let edgeItem = action("Open in Microsoft Edge (your account, your extensions)", #selector(useEdgeForYouTube))
+        edgeItem.state = inEdge ? .on : .off
+        let installed = EdgePlayer.isInstalled
+        edgeItem.isEnabled = installed
+        options.addItem(edgeItem)
+        if !installed { options.addItem(hint("Microsoft Edge isn't installed.")) }
+        let hammerItem = action("Open in Hammer's Player (glass, mini player)", #selector(useHammerPlayerForYouTube))
+        hammerItem.state = inEdge ? .off : .on
+        options.addItem(hammerItem)
+        options.addItem(.separator())
+        let commandY = action("⌘Y Opens YouTube", #selector(toggleCommandY))
+        commandY.state = commandYOn ? .on : .off
+        options.addItem(commandY)
+        if commandYOn && !commandYWorks {
+            options.addItem(hint("Another app has ⌘Y everywhere, so use ⌃⌥Y."))
+        } else {
+            options.addItem(hint("While on, other apps don't get ⌘Y (Finder's Quick Look, History in Edge)."))
+        }
+        let item = NSMenuItem(title: "YouTube Options", action: nil, keyEquivalent: "")
+        item.submenu = options
+        return item
     }
 
     private func truncated(_ text: String, _ length: Int) -> String {
@@ -2495,6 +2553,7 @@ enum Hammer {
             case "get", "set": exit(runMonitorCommand(args))
             case "monitor": exit(runMonitorCheck(args))
             case "player-check": PlayerCheck.run(args)
+            case "edge-check": EdgeCheck.run()
             case "govee": exit(runGoveeCommand(Array(args.dropFirst())))
             default: break
             }
