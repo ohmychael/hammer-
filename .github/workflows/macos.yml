@@ -26,21 +26,28 @@ jobs:
     timeout-minutes: 14
     steps:
       - name: Probe Microsoft Edge (app window, AppleScript)
-        timeout-minutes: 9
+        timeout-minutes: 10
+        env:
+          TOKEN: ${{ github.token }}
         run: |
           set +e
-          note() { echo "::notice title=$1::$(printf '%s' "$2" | tail -c 900 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"; }
+          note() { echo "::notice title=$1::$(printf '%s' "$2" | tail -c 1500 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"; }
           lim() { perl -e '$t = shift; $p = fork; if (!$p) { exec @ARGV } $SIG{ALRM} = sub { kill 9, $p; print "TIMEOUT\n"; exit 124 }; alarm $t; waitpid $p, 0; exit $? >> 8' "$@"; }
-          note "edge" "$(ls -d /Applications/*Edge* 2>&1; defaults read '/Applications/Microsoft Edge.app/Contents/Info' CFBundleShortVersionString 2>&1; defaults read '/Applications/Microsoft Edge.app/Contents/Info' NSAppleScriptEnabled 2>&1; defaults read '/Applications/Microsoft Edge.app/Contents/Info' CFBundleIdentifier 2>&1)"
-          note "open1" "$(lim 20 open -na 'Microsoft Edge' --args --no-first-run --no-default-browser-check --app=https://www.youtube.com/ 2>&1; echo exit $?)"
-          sleep 12
-          note "ps" "$(ps -ax -o pid=,command= | grep -i 'Edge' | grep -v -e grep -e Helper | cut -c1-200 | head -4)"
+          mkdir -p /tmp/shots
+          shot() { screencapture -x "/tmp/shots/$1.png" 2>/dev/null; }
+          note "finder" "$(lim 15 osascript -e 'tell application "Finder" to get name of startup disk' 2>&1; echo "(exit $?)")"
+          "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" --use-mock-keychain --no-first-run --no-default-browser-check \
+            --app=https://www.youtube.com/ >/tmp/edge.log 2>&1 &
+          sleep 15
+          shot 1-after-launch
+          note "edge-log" "$(tail -15 /tmp/edge.log)"
           n=0
           run() { n=$((n+1)); note "as$n" "$1 => $(lim 25 osascript -e "$1" 2>&1; echo "(exit $?)")"; }
+          run 'tell application "Microsoft Edge" to get version'
+          shot 2-after-first-script
           run 'tell application "Microsoft Edge" to count windows'
-          run 'tell application "Microsoft Edge" to get {id, bounds, mode, minimized, visible} of every window'
+          run 'tell application "Microsoft Edge" to get {id, bounds, mode, minimized, visible, index} of every window'
           run 'tell application "Microsoft Edge" to get {URL, title} of active tab of every window'
-          run 'tell application "Microsoft Edge" to get count of tabs of every window'
           run 'tell application "Microsoft Edge" to set bounds of window 1 to {300, 60, 1060, 520}'
           run 'tell application "Microsoft Edge" to get bounds of window 1'
           run 'tell application "Microsoft Edge" to set minimized of window 1 to true'
@@ -48,15 +55,15 @@ jobs:
           run 'tell application "Microsoft Edge" to get minimized of every window'
           run 'tell application "Microsoft Edge" to set minimized of window 1 to false'
           run 'tell application "Microsoft Edge" to set index of window 1 to 1'
-          run 'tell application "Microsoft Edge" to set URL of active tab of window 1 to "https://www.youtube.com/watch?v=jNQXAC9IVRw"'
-          sleep 3
-          run 'tell application "Microsoft Edge" to get URL of active tab of window 1'
-          note "open2" "$(lim 20 open -na 'Microsoft Edge' --args --app=https://www.youtube.com/ 2>&1; echo exit $?)"
+          "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" --app=https://www.youtube.com/watch?v=jNQXAC9IVRw >>/tmp/edge.log 2>&1
+          note "second-launch-exit" "$?"
           sleep 6
-          run 'tell application "Microsoft Edge" to get {id, mode} of every window'
-          run 'tell application "System Events" to get name of every window of process "Microsoft Edge"'
-          screencapture -x /tmp/edge.png 2>&1; ls -la /tmp/edge.png
-          note "done" "probe finished"
+          shot 3-end
+          run 'tell application "Microsoft Edge" to get {id, mode, bounds} of every window'
+          cd /tmp/shots && git init -q && git checkout -q -b edge-probe-shots && git add -A \
+            && git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "Edge probe pictures" \
+            && git push -qf "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" edge-probe-shots
+          note "done" "probe finished, pictures pushed: $?"
 
   build:
     if: github.ref != 'refs/heads/edge-probe'

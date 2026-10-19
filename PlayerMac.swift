@@ -62,7 +62,7 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
     static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 "
         + "(KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
 
-    private let anchor: () -> (screen: NSScreen?, maxX: CGFloat?, iconFrame: NSRect?)   // the menu bar icon
+    private let anchor: () -> (screen: NSScreen?, iconFrame: NSRect?)   // the menu bar icon: its screen and where it is
     private let web: WKWebView
     private let dropdown = PlayerPanel.make(resizable: true, activating: true)
     private let mini = PlayerPanel.make(resizable: true, activating: false)
@@ -87,7 +87,7 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         set { UserDefaults.standard.set(NSStringFromSize(newValue), forKey: sizeKey) }
     }
 
-    init(anchor: @escaping () -> (screen: NSScreen?, maxX: CGFloat?, iconFrame: NSRect?)) {
+    init(anchor: @escaping () -> (screen: NSScreen?, iconFrame: NSRect?)) {
         self.anchor = anchor
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()                 // stays signed in between launches
@@ -204,9 +204,8 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         }
         run("window.__hammer && window.__hammer.mini(false)")   // always the full page here
         attachWeb(to: webHolder)
-        let (screen, maxX, _) = anchor()
-        let visible = (screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let frame = PlayerGeometry.dropdown(size: dropdownSize, visible: visible, anchorMaxX: maxX)
+        let visible = (anchor().screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let frame = PlayerGeometry.dropdown(size: dropdownSize, visible: visible)     // flush in the top-right corner
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
         dropdown.setFrame(frame.offsetBy(dx: 0, dy: 10), display: false)
         dropdown.alphaValue = 0
@@ -345,9 +344,8 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
             if fixed != mini.frame { mini.setFrame(fixed, display: true) }
             miniFrame = fixed
         } else if place == .dropdown {
-            let (screen, maxX, _) = anchor()
-            if let visible = (screen ?? NSScreen.main)?.visibleFrame {
-                dropdown.setFrame(PlayerGeometry.dropdown(size: dropdownSize, visible: visible, anchorMaxX: maxX), display: true)
+            if let visible = (anchor().screen ?? NSScreen.main)?.visibleFrame {
+                dropdown.setFrame(PlayerGeometry.dropdown(size: dropdownSize, visible: visible), display: true)
             }
         }
     }
@@ -771,7 +769,7 @@ final class MiniOverlay: NSView {
 final class PlayerCheck: NSObject, NSApplicationDelegate {
     private let folder: URL
     private var failed = false
-    private lazy var player = YouTubePlayer(anchor: { (NSScreen.main, nil, nil) })
+    private lazy var player = YouTubePlayer(anchor: { (NSScreen.main, nil) })
 
     init(folder: URL) { self.folder = folder }
 

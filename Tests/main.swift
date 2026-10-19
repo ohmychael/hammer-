@@ -1005,21 +1005,20 @@ expect(playerDecide("mailto:a@b.c") == .block && playerDecide("itms-apps://x") =
 // MARK: YouTube player: where the windows go
 
 let playerWideScreen = CGRect(x: 0, y: 0, width: 3840, height: 1575)          // visible frame: the menu bar is above
-var playerDrop = PlayerGeometry.dropdown(visible: playerWideScreen, anchorMaxX: 3700)
-expect(playerDrop == CGRect(x: 2940, y: 1111, width: 760, height: 460), "dropdown under the icon, wide and short: \(playerDrop)")
-playerDrop = PlayerGeometry.dropdown(visible: playerWideScreen, anchorMaxX: nil)
-expect(playerDrop.maxX == 3832 && playerDrop.maxY == 1571, "no icon: the top-right corner")
-playerDrop = PlayerGeometry.dropdown(visible: playerWideScreen, anchorMaxX: 200)
-expect(playerDrop.minX == 8 && playerDrop.width == 760, "an icon near the left edge: kept on screen")
-playerDrop = PlayerGeometry.dropdown(visible: CGRect(x: 0, y: 0, width: 300, height: 500), anchorMaxX: 290)
-expect(playerDrop.width == 284 && playerDrop.height == 460 && playerDrop.minX == 8 && playerDrop.minY >= 0, "a small screen: shrunk to fit")
-playerDrop = PlayerGeometry.dropdown(size: CGSize(width: 900, height: 380), visible: playerWideScreen, anchorMaxX: nil)
-expect(playerDrop.size == CGSize(width: 900, height: 380), "your own size is kept")
-playerDrop = PlayerGeometry.dropdown(size: CGSize(width: 100, height: 50), visible: playerWideScreen, anchorMaxX: nil)
+var playerDrop = PlayerGeometry.dropdown(visible: playerWideScreen)
+expect(playerDrop == CGRect(x: 3080, y: 1115, width: 760, height: 460), "dropdown flush in the top-right corner, wide and short: \(playerDrop)")
+expect(playerDrop.maxX == playerWideScreen.maxX && playerDrop.maxY == playerWideScreen.maxY, "no gap at the right or under the menu bar")
+playerDrop = PlayerGeometry.dropdown(visible: CGRect(x: 0, y: 0, width: 300, height: 400))
+expect(playerDrop == CGRect(x: 0, y: 0, width: 300, height: 400), "a small screen: shrunk to fit, still in the corner: \(playerDrop)")
+playerDrop = PlayerGeometry.dropdown(size: CGSize(width: 900, height: 380), visible: playerWideScreen)
+expect(playerDrop.size == CGSize(width: 900, height: 380) && playerDrop.maxX == 3840 && playerDrop.maxY == 1575, "your own size is kept, in the corner")
+playerDrop = PlayerGeometry.dropdown(size: CGSize(width: 100, height: 50), visible: playerWideScreen)
 expect(playerDrop.size == CGSize(width: 480, height: 300), "never smaller than 480 × 300")
+playerDrop = PlayerGeometry.dropdown(size: CGSize(width: 9000, height: 9000), visible: playerWideScreen)
+expect(playerDrop == playerWideScreen, "never bigger than the screen")
 let playerSecond = CGRect(x: -1920, y: 200, width: 1920, height: 1055)  // a screen to the left
-playerDrop = PlayerGeometry.dropdown(visible: playerSecond, anchorMaxX: nil)
-expect(playerSecond.contains(playerDrop), "another screen: inside it")
+playerDrop = PlayerGeometry.dropdown(visible: playerSecond)
+expect(playerSecond.contains(playerDrop) && playerDrop.maxX == 0 && playerDrop.maxY == 1255, "another screen: in its own top-right corner")
 
 var playerMini = PlayerGeometry.miniDefault(visible: playerWideScreen)
 expect(playerMini == CGRect(x: 3424, y: 16, width: 400, height: 225), "mini player: bottom right, 16:9: \(playerMini)")
