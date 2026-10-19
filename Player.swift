@@ -172,3 +172,357 @@ enum PlayerGeometry {
         return CGRect(x: x, y: y, width: width, height: height)
     }
 }
+
+// MARK: - YouTube in your own Microsoft Edge
+
+/// YouTube in Microsoft Edge itself: your profile, so you're signed in and your
+/// extensions run. Hammer opens it as an Edge app window (no tabs, no address
+/// bar) and keeps it in the screen's top-right corner. Hammer steers that window
+/// with AppleScript, which macOS asks you to allow once ("Hammer wants to control
+/// Microsoft Edge"). Hammer never reads Edge's cookies, passwords or history.
+///
+/// These build the scripts and read their answers; EdgeMac.swift runs them.
+enum EdgeYouTube {
+    static let bundleID = "com.microsoft.edgemac"
+    /// The full (desktop) site: it's Edge, so it's what your extensions expect.
+    static let home = URL(string: "https://www.youtube.com/")!
+
+    static func watchURL(id: String, start: Int? = nil) -> URL {
+        var parts = URLComponents(string: "https://www.youtube.com/watch")!
+        parts.queryItems = [URLQueryItem(name: "v", value: id)]
+            + (start.map { [URLQueryItem(name: "t", value: "\($0)s")] } ?? [])
+        return parts.url!
+    }
+
+    /// Edge's command line for a YouTube app window.
+    static func launchArguments(_ url: URL) -> [String] { ["--app=\(url.absoluteString)"] }
+
+    // MARK: Where the window goes
+
+    /// AppleScript's window bounds {left, top, right, bottom}: measured from the
+    /// top-left corner of the main screen (the one with the menu bar), y going
+    /// down. `frame` is in macOS's own coordinates (from the bottom left, y going up).
+    static func bounds(_ frame: CGRect, mainScreenHeight: CGFloat) -> [Int] {
+        [Int(frame.minX.rounded()), Int((mainScreenHeight - frame.maxY).rounded()),
+         Int(frame.maxX.rounded()), Int((mainScreenHeight - frame.minY).rounded())]
+    }
+
+    /// The window's size from its bounds, or nil if they don't make sense.
+    static func size(ofBounds bounds: [Int]) -> CGSize? {
+        guard bounds.count == 4, bounds[2] > bounds[0], bounds[3] > bounds[1] else { return nil }
+        return CGSize(width: bounds[2] - bounds[0], height: bounds[3] - bounds[1])
+    }
+
+    /// Where to show it: the top-right corner of the screen with the menu bar
+    /// icon, at the size you left it (or the default), fitted to the screen.
+    static func showBounds(current: [Int]?, visible: CGRect, mainScreenHeight: CGFloat) -> [Int] {
+        let size = current.flatMap(size(ofBounds:)) ?? PlayerGeometry.dropdownSize
+        return bounds(PlayerGeometry.dropdown(size: size, visible: visible), mainScreenHeight: mainScreenHeight)
+    }
+
+    // MARK: The scripts
+
+    /// AppleScript text in quotes. Quotes and backslashes are escaped; anything
+    /// that can't go in a one-line script (returns, tabs, control characters) is dropped.
+    static func quoted(_ text: String) -> String {
+        var out = "\""
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            default:
+                if scalar.value < 0x20 || scalar.value == 0x7F || scalar == "\u{2028}" || scalar == "\u{2029}" { continue }
+                out.unicodeScalars.append(scalar)
+            }
+        }
+        return out + "\""
+    }
+
+    private static let tellEdge = "tell application id \(quoted(bundleID))"
+    // "tab" means Edge's tabs inside a tell block, so separators are made outside it.
+    private static let separators = "set sep to character id 9\nset nl to character id 10\n"
+
+    /// Every Edge window: "id<TAB>tabs<TAB>URL of the tab showing" per line.
+    static func listScript() -> String {
+        separators + """
+        \(tellEdge)
+            set out to ""
+            repeat with w in windows
+                try
+                    set u to (URL of active tab of w) as text
+                on error
+                    set u to ""
+                end try
+                set out to out & ((id of w) as text) & sep & ((count of tabs of w) as text) & sep & u & nl
+            end repeat
+            return out
+        end tell
+        """
+    }
+
+    struct Window: Equatable {
+        let id: Int
+        let tabs: Int
+        let url: String
+    }
+
+    static func parseList(_ output: String) -> [Window] {
+        output.split(whereSeparator: \.isNewline).compactMap { line in
+            let parts = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 3, let id = Int(parts[0]), let tabs = Int(parts[1]) else { return nil }
+            return Window(id: id, tabs: tabs, url: parts[2])
+        }
+    }
+
+    /// The app window Hammer just opened: a window that wasn't there before, with
+    /// one tab, on YouTube. If several (Edge was starting and brought back your
+    /// last windows too), the newest.
+    static func newWindow(in windows: [Window], before: Set<Int>) -> Int? {
+        windows.filter { window in
+            guard !before.contains(window.id), window.tabs == 1,
+                  let host = URL(string: window.url)?.host?.lowercased() else { return false }
+            return YouTubeLink.isYouTubeHost(host) || host == "youtu.be"
+        }.map(\.id).max()
+    }
+
+    /// The window's state: "missing", or "minimized,index,left,top,right,bottom".
+    static func stateScript(id: Int) -> String {
+        """
+        \(tellEdge)
+            if not (exists window id \(id)) then return "missing"
+            set w to window id \(id)
+            set b to bounds of w
+            return ((minimized of w) as text) & "," & ((index of w) as text) & "," & (item 1 of b as text) & "," & (item 2 of b as text) & "," & (item 3 of b as text) & "," & (item 4 of b as text)
+        end tell
+        """
+    }
+
+    struct State: Equatable {
+        let minimized: Bool
+        let index: Int          // 1: in front of Edge's other windows
+        let bounds: [Int]
+    }
+
+    enum StateAnswer: Equatable {
+        case missing
+        case found(State)
+        case unreadable
+    }
+
+    static func parseState(_ output: String) -> StateAnswer {
+        let text = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text == "missing" { return .missing }
+        let parts = text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.count == 6, parts[0] == "true" || parts[0] == "false", let index = Int(parts[1]) else { return .unreadable }
+        let bounds = parts[2...].compactMap { Int($0) ?? Double($0).flatMap { $0.isFinite ? Int($0.rounded()) : nil } }
+        guard bounds.count == 4 else { return .unreadable }
+        return .found(State(minimized: parts[0] == "true", index: index, bounds: bounds))
+    }
+
+    enum Action: Equatable {
+        case open       // no window yet (or you closed it): open one
+        case show       // bring it to the corner, in front
+        case hide       // it's in front: tuck it away (minimize; a playing video keeps playing)
+    }
+
+    /// The shortcut toggles: in front → away; anywhere else → in front, in the corner.
+    static func decide(_ answer: StateAnswer, edgeIsFrontApp: Bool) -> Action {
+        switch answer {
+        case .missing, .unreadable: return .open
+        case .found(let state):
+            return !state.minimized && state.index == 1 && edgeIsFrontApp ? .hide : .show
+        }
+    }
+
+    /// In the corner and in front of Edge's other windows (Hammer then brings Edge forward).
+    static func showScript(id: Int, bounds: [Int]) -> String {
+        let b = bounds.count == 4 ? bounds : [0, 0, 760, 460]
+        return """
+        \(tellEdge)
+            set w to window id \(id)
+            if minimized of w then set minimized of w to false
+            set bounds of w to {\(b[0]), \(b[1]), \(b[2]), \(b[3])}
+            set index of w to 1
+        end tell
+        """
+    }
+
+    static func hideScript(id: Int) -> String {
+        """
+        \(tellEdge)
+            set minimized of window id \(id) to true
+        end tell
+        """
+    }
+
+    /// Plays a video in the window that's already open.
+    static func goScript(id: Int, url: URL) -> String {
+        """
+        \(tellEdge)
+            set URL of active tab of window id \(id) to \(quoted(url.absoluteString))
+        end tell
+        """
+    }
+
+    /// Edge's own "activate", for when macOS won't let Hammer bring it forward directly.
+    static func activateScript() -> String { "\(tellEdge) to activate" }
+
+    /// osascript's error number in its message: "… (-1743)".
+    static func errorNumber(_ message: String) -> Int? {
+        guard let open = message.lastIndex(of: "("), let close = message.lastIndex(of: ")"), open < close else { return nil }
+        return Int(message[message.index(after: open)..<close])
+    }
+
+    /// -1743: you said no (or haven't been asked yet) in Privacy & Security → Automation.
+    static let notAllowed = -1743
+}
+
+// MARK: Steering Edge
+
+/// What the Edge player needs from the Mac. EdgeMac.swift has the real one; the
+/// tests use a stand-in Edge.
+protocol EdgeDriver: AnyObject {
+    var installed: Bool { get }
+    /// Edge's process while it runs: changes when Edge restarts (window IDs start over then).
+    func running() -> String?
+    /// Edge is the app in front.
+    func edgeInFront() -> Bool
+    /// May Hammer steer Edge? `ask`: show macOS's question if you haven't answered it yet.
+    func permission(ask: Bool) async -> EdgePermission
+    func run(_ script: String) async -> EdgeScriptResult
+    /// Starts Edge (or hands it these arguments if it's running). false: it couldn't.
+    func launch(_ arguments: [String]) async -> Bool
+    func bringForward() async
+    func pause(_ seconds: Double) async
+    /// The visible frame of the screen with the menu bar icon, and the main screen's height.
+    func screen() -> (visible: CGRect, mainHeight: CGFloat)
+    func remembered(_ key: String) -> String?
+    func remember(_ value: String?, _ key: String)
+}
+
+enum EdgePermission: Equatable { case allowed, denied, notAsked, notRunning }
+
+enum EdgeScriptResult: Equatable {
+    case ok(String)
+    case failed(number: Int?, message: String)
+}
+
+/// The shortcut and the menu, with Edge: opens YouTube in an Edge app window in
+/// the corner, brings it back there, or tucks it away.
+final class EdgeController {
+    enum Outcome: Equatable {
+        case opened, shown, hidden
+        case notInstalled
+        case notAllowed(openedAnyway: Bool)      // you said no in Privacy & Security → Automation
+        case failed(String)
+    }
+
+    let driver: EdgeDriver
+    private let windowKey = "edgeYouTubeWindow"   // "<Edge's run>|<window ID>"
+    private let sizeKey = "edgeYouTubeSize"       // the size you last left it at: "width,height"
+
+    init(driver: EdgeDriver) { self.driver = driver }
+
+    /// Hammer's window in this run of Edge, if it opened one.
+    func savedWindow(for edge: String) -> Int? {
+        guard let saved = driver.remembered(windowKey) else { return nil }
+        let parts = saved.split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count == 2, String(parts[0]) == edge, let id = Int(parts[1]) else { return nil }
+        return id
+    }
+
+    private var rememberedSize: [Int]? {
+        guard let parts = driver.remembered(sizeKey)?.split(separator: ",").compactMap({ Int($0) }),
+              parts.count == 2, parts[0] > 0, parts[1] > 0 else { return nil }
+        return [0, 0, parts[0], parts[1]]
+    }
+
+    private func rememberSize(_ bounds: [Int]) {
+        guard let size = EdgeYouTube.size(ofBounds: bounds) else { return }
+        driver.remember("\(Int(size.width)),\(Int(size.height))", sizeKey)
+    }
+
+    private func corner(_ current: [Int]?) -> [Int] {
+        let screen = driver.screen()
+        return EdgeYouTube.showBounds(current: current ?? rememberedSize, visible: screen.visible, mainScreenHeight: screen.mainHeight)
+    }
+
+    /// The shortcut: open, show or hide. `play`: a video to play (the window always shows then).
+    func toggle(play url: URL? = nil) async -> Outcome {
+        guard driver.installed else { return .notInstalled }
+        let target = url ?? EdgeYouTube.home
+        guard let edge = driver.running() else {
+            return await open(target, edgeWasRunning: false)        // starting Edge this way opens just this window
+        }
+        let inFront = driver.edgeInFront()                         // before anything changes it
+        switch await driver.permission(ask: true) {
+        case .allowed: break
+        case .notRunning: return await open(target, edgeWasRunning: false)   // Edge just quit
+        case .denied, .notAsked: return .notAllowed(openedAnyway: false)
+        }
+        guard let id = savedWindow(for: edge) else { return await open(target, edgeWasRunning: true) }
+
+        let answer: EdgeYouTube.StateAnswer
+        switch await driver.run(EdgeYouTube.stateScript(id: id)) {
+        case .ok(let text): answer = EdgeYouTube.parseState(text)
+        case .failed(let number, let message):
+            if number == EdgeYouTube.notAllowed { return .notAllowed(openedAnyway: false) }
+            if number == -600 { return await open(target, edgeWasRunning: false) }      // Edge quit meanwhile
+            if number == -1728 || number == -1719 { answer = .missing } else { return .failed(message) }
+        }
+        var action = EdgeYouTube.decide(answer, edgeIsFrontApp: inFront)
+        if url != nil && action == .hide { action = .show }        // a video to play: always show it
+        switch action {
+        case .open:
+            return await open(target, edgeWasRunning: true)
+        case .hide:
+            if case .found(let state) = answer { rememberSize(state.bounds) }
+            return outcome(await driver.run(EdgeYouTube.hideScript(id: id)), success: .hidden)
+        case .show:
+            var current: [Int]?
+            if case .found(let state) = answer { current = state.bounds; rememberSize(state.bounds) }
+            let shown = await driver.run(EdgeYouTube.showScript(id: id, bounds: corner(current)))
+            if case .failed = shown { return outcome(shown, success: .shown) }
+            if let url { _ = await driver.run(EdgeYouTube.goScript(id: id, url: url)) }
+            await driver.bringForward()
+            return .shown
+        }
+    }
+
+    private func outcome(_ result: EdgeScriptResult, success: Outcome) -> Outcome {
+        switch result {
+        case .ok: return success
+        case .failed(let number, let message):
+            return number == EdgeYouTube.notAllowed ? .notAllowed(openedAnyway: false) : .failed(message)
+        }
+    }
+
+    /// Opens a new app window, finds it among Edge's windows, remembers it and puts it in the corner.
+    private func open(_ url: URL, edgeWasRunning: Bool) async -> Outcome {
+        var before = Set<Int>()
+        if edgeWasRunning, case .ok(let text) = await driver.run(EdgeYouTube.listScript()) {
+            before = Set(EdgeYouTube.parseList(text).map(\.id))
+        }
+        guard await driver.launch(EdgeYouTube.launchArguments(url)) else { return .failed("Microsoft Edge didn't open") }
+        var asked = edgeWasRunning
+        for _ in 0..<50 {                                          // up to about 15 seconds
+            await driver.pause(0.3)
+            guard let edge = driver.running() else { continue }
+            if !asked {
+                // Edge has just started: now macOS can ask whether Hammer may steer it.
+                switch await driver.permission(ask: true) {
+                case .notRunning: continue
+                case .denied, .notAsked: return .notAllowed(openedAnyway: true)
+                case .allowed: asked = true
+                }
+            }
+            guard case .ok(let text) = await driver.run(EdgeYouTube.listScript()),
+                  let id = EdgeYouTube.newWindow(in: EdgeYouTube.parseList(text), before: before) else { continue }
+            driver.remember("\(edge)|\(id)", windowKey)
+            _ = await driver.run(EdgeYouTube.showScript(id: id, bounds: corner(nil)))
+            await driver.bringForward()
+            return .opened
+        }
+        return .failed("Edge opened YouTube, but Hammer couldn't find its window to put it in the corner")
+    }
+}
