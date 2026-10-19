@@ -127,7 +127,8 @@ enum PlayerNavigation: Equatable {
 /// Screen coordinates as macOS uses them: origin at the bottom left, and the
 /// visible frame is the screen minus the menu bar and the Dock.
 enum PlayerGeometry {
-    static let dropdownSize = CGSize(width: 420, height: 700)
+    static let dropdownSize = CGSize(width: 760, height: 460)       // wide and short; you can resize it
+    static let minDropdownSize = CGSize(width: 480, height: 300)
     static let miniWidth: CGFloat = 400
     static let minMiniWidth: CGFloat = 240
 
@@ -135,8 +136,8 @@ enum PlayerGeometry {
     /// (or the screen's right edge), shrunk to fit and kept on screen.
     static func dropdown(size: CGSize = dropdownSize, visible: CGRect, anchorMaxX: CGFloat?,
                          margin: CGFloat = 8) -> CGRect {
-        let width = min(size.width, visible.width - 2 * margin)
-        let height = min(size.height, visible.height - 2 * margin)
+        let width = min(max(size.width, minDropdownSize.width), visible.width - 2 * margin)
+        let height = min(max(size.height, minDropdownSize.height), visible.height - 2 * margin)
         let right = min(anchorMaxX ?? visible.maxX - margin, visible.maxX - margin)
         let x = max(visible.minX + margin, right - width)
         let y = visible.maxY - 4 - height

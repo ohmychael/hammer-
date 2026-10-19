@@ -1109,8 +1109,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var player: YouTubePlayer {
         if let youTube { return youTube }
         let made = YouTubePlayer(anchor: { [weak self] in
-            guard let window = self?.statusItem.button?.window else { return (NSScreen.main, nil) }
-            return (window.screen, window.frame.maxX)
+            guard let window = self?.statusItem.button?.window else { return (NSScreen.main, nil, nil) }
+            return (window.screen, window.frame.maxX, window.frame)
         })
         made.onChange = { [weak self] in self?.rebuildMenuSoon() }
         youTube = made

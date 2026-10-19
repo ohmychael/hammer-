@@ -1006,13 +1006,17 @@ expect(playerDecide("mailto:a@b.c") == .block && playerDecide("itms-apps://x") =
 
 let playerWideScreen = CGRect(x: 0, y: 0, width: 3840, height: 1575)          // visible frame: the menu bar is above
 var playerDrop = PlayerGeometry.dropdown(visible: playerWideScreen, anchorMaxX: 3700)
-expect(playerDrop == CGRect(x: 3280, y: 871, width: 420, height: 700), "dropdown under the icon: \(playerDrop)")
+expect(playerDrop == CGRect(x: 2940, y: 1111, width: 760, height: 460), "dropdown under the icon, wide and short: \(playerDrop)")
 playerDrop = PlayerGeometry.dropdown(visible: playerWideScreen, anchorMaxX: nil)
 expect(playerDrop.maxX == 3832 && playerDrop.maxY == 1571, "no icon: the top-right corner")
 playerDrop = PlayerGeometry.dropdown(visible: playerWideScreen, anchorMaxX: 200)
-expect(playerDrop.minX == 8 && playerDrop.width == 420, "an icon near the left edge: kept on screen")
+expect(playerDrop.minX == 8 && playerDrop.width == 760, "an icon near the left edge: kept on screen")
 playerDrop = PlayerGeometry.dropdown(visible: CGRect(x: 0, y: 0, width: 300, height: 500), anchorMaxX: 290)
-expect(playerDrop.width == 284 && playerDrop.height == 484 && playerDrop.minX == 8 && playerDrop.minY >= 0, "a small screen: shrunk to fit")
+expect(playerDrop.width == 284 && playerDrop.height == 460 && playerDrop.minX == 8 && playerDrop.minY >= 0, "a small screen: shrunk to fit")
+playerDrop = PlayerGeometry.dropdown(size: CGSize(width: 900, height: 380), visible: playerWideScreen, anchorMaxX: nil)
+expect(playerDrop.size == CGSize(width: 900, height: 380), "your own size is kept")
+playerDrop = PlayerGeometry.dropdown(size: CGSize(width: 100, height: 50), visible: playerWideScreen, anchorMaxX: nil)
+expect(playerDrop.size == CGSize(width: 480, height: 300), "never smaller than 480 × 300")
 let playerSecond = CGRect(x: -1920, y: 200, width: 1920, height: 1055)  // a screen to the left
 playerDrop = PlayerGeometry.dropdown(visible: playerSecond, anchorMaxX: nil)
 expect(playerSecond.contains(playerDrop), "another screen: inside it")

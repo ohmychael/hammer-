@@ -62,9 +62,9 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
     static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 "
         + "(KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
 
-    private let anchor: () -> (screen: NSScreen?, maxX: CGFloat?)   // the menu bar icon
+    private let anchor: () -> (screen: NSScreen?, maxX: CGFloat?, iconFrame: NSRect?)   // the menu bar icon
     private let web: WKWebView
-    private let dropdown = PlayerPanel.make(resizable: false, activating: true)
+    private let dropdown = PlayerPanel.make(resizable: true, activating: true)
     private let mini = PlayerPanel.make(resizable: true, activating: false)
     private let webHolder = NSView()                     // the web view's place in the dropdown
     private let overlay = MiniOverlay()
@@ -79,8 +79,15 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
     private var loaded = false
     private var popOutPending = false
     private var idleGeneration = 0
+    private let sizeKey = "playerDropdownSize"
+    /// The dropdown's size as you last left it.
+    private var dropdownSize: CGSize {
+        get { UserDefaults.standard.string(forKey: sizeKey).map { NSSizeFromString($0) }.flatMap { $0.width > 0 ? $0 : nil }
+              ?? PlayerGeometry.dropdownSize }
+        set { UserDefaults.standard.set(NSStringFromSize(newValue), forKey: sizeKey) }
+    }
 
-    init(anchor: @escaping () -> (screen: NSScreen?, maxX: CGFloat?)) {
+    init(anchor: @escaping () -> (screen: NSScreen?, maxX: CGFloat?, iconFrame: NSRect?)) {
         self.anchor = anchor
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()                 // stays signed in between launches
@@ -96,6 +103,11 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         super.init()
         config.userContentController.add(WeakScriptHandler(self), contentWorld: .defaultClient, name: "hammer")
         web.customUserAgent = Self.userAgent
+        // See-through, so the glass shows behind YouTube (the page's own background is cleared too).
+        if web.responds(to: NSSelectorFromString("_setDrawsBackground:")) || web.responds(to: NSSelectorFromString("setDrawsBackground:")) {
+            web.setValue(false, forKey: "drawsBackground")
+        }
+        if #available(macOS 12, *) { web.underPageBackgroundColor = .clear }
         web.allowsBackForwardNavigationGestures = true
         web.navigationDelegate = self
         web.uiDelegate = self
@@ -192,9 +204,9 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         }
         run("window.__hammer && window.__hammer.mini(false)")   // always the full page here
         attachWeb(to: webHolder)
-        let (screen, maxX) = anchor()
+        let (screen, maxX, _) = anchor()
         let visible = (screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let frame = PlayerGeometry.dropdown(visible: visible, anchorMaxX: maxX)
+        let frame = PlayerGeometry.dropdown(size: dropdownSize, visible: visible, anchorMaxX: maxX)
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
         dropdown.setFrame(frame.offsetBy(dx: 0, dy: 10), display: false)
         dropdown.alphaValue = 0
@@ -307,12 +319,23 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         }
     }
 
+    /// Only a click outside the dropdown closes it; one inside it (or on the menu bar
+    /// icon, which has its own menu) never does.
     private func clickedOutside() {
-        if place == .dropdown && !pinned { closeDropdown() }
+        guard place == .dropdown, !pinned, !isOverPlayer(NSEvent.mouseLocation) else { return }
+        closeDropdown()
     }
 
     @objc private func appResigned() {
-        if place == .dropdown && !pinned { closeDropdown() }
+        guard place == .dropdown, !pinned else { return }
+        if NSEvent.pressedMouseButtons != 0 && isOverPlayer(NSEvent.mouseLocation) { return }
+        closeDropdown()
+    }
+
+    private func isOverPlayer(_ point: NSPoint) -> Bool {
+        if dropdown.isVisible && dropdown.frame.insetBy(dx: -6, dy: -6).contains(point) { return true }
+        if let icon = anchor().iconFrame, icon.insetBy(dx: -2, dy: -2).contains(point) { return true }
+        return false
     }
 
     /// A screen plugged in or out: keep both windows on screen.
@@ -322,9 +345,9 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
             if fixed != mini.frame { mini.setFrame(fixed, display: true) }
             miniFrame = fixed
         } else if place == .dropdown {
-            let (screen, maxX) = anchor()
+            let (screen, maxX, _) = anchor()
             if let visible = (screen ?? NSScreen.main)?.visibleFrame {
-                dropdown.setFrame(PlayerGeometry.dropdown(visible: visible, anchorMaxX: maxX), display: true)
+                dropdown.setFrame(PlayerGeometry.dropdown(size: dropdownSize, visible: visible, anchorMaxX: maxX), display: true)
             }
         }
     }
@@ -406,12 +429,14 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
     // MARK: The dropdown
 
     private func buildDropdown() {
-        let size = PlayerGeometry.dropdownSize
-        let background = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
-        background.material = .popover
-        background.blendingMode = .behindWindow
-        background.state = .active
-        dropdown.contentView = background
+        let size = dropdownSize
+        let (glass, background) = Self.glass(size: size)
+        dropdown.contentView = glass
+        dropdown.isOpaque = false
+        dropdown.backgroundColor = .clear
+        dropdown.isMovable = false
+        dropdown.delegate = self
+        dropdown.minSize = PlayerGeometry.minDropdownSize
         dropdown.setContentSize(size)
         dropdown.onEscape = { [weak self] in self?.closeDropdown() }
 
@@ -450,6 +475,40 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         background.addSubview(webHolder)
         background.addSubview(line)
         background.addSubview(header)
+    }
+
+    /// The same glass as macOS's own menus: Liquid Glass on macOS 26 (looked up at
+    /// run time, so Hammer still builds and runs on older systems), frosted glass before.
+    /// Returns the view for the window and the view to put things in.
+    private static func glass(size: CGSize) -> (NSView, NSView) {
+        let frame = NSRect(origin: .zero, size: size)
+        let content = NSView(frame: frame)
+        content.autoresizingMask = [.width, .height]
+        if let type = NSClassFromString("NSGlassEffectView") as? NSView.Type {
+            let glass = type.init(frame: frame)
+            if glass.responds(to: NSSelectorFromString("setContentView:")) {
+                glass.setValue(content, forKey: "contentView")
+                if glass.responds(to: NSSelectorFromString("setCornerRadius:")) {
+                    glass.setValue(NSNumber(value: 16.0), forKey: "cornerRadius")
+                }
+                glass.autoresizingMask = [.width, .height]
+                // A light tint toward YouTube's own theme (it follows the system's), so text stays readable.
+                if glass.responds(to: NSSelectorFromString("setTintColor:")) {
+                    let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                    glass.setValue((dark ? NSColor.black : NSColor.white).withAlphaComponent(0.25), forKey: "tintColor")
+                }
+                return (glass, content)
+            }
+        }
+        let frosted = NSVisualEffectView(frame: frame)
+        frosted.material = .popover
+        frosted.blendingMode = .behindWindow
+        frosted.state = .active
+        frosted.wantsLayer = true
+        frosted.layer?.cornerRadius = 12
+        frosted.layer?.masksToBounds = true
+        frosted.addSubview(content)
+        return (frosted, content)
     }
 
     private func iconButton(_ symbol: String, _ tip: String, _ action: Selector) -> NSButton {
@@ -521,6 +580,10 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
     func windowShouldZoom(_ window: NSWindow, toFrame newFrame: NSRect) -> Bool { window !== mini }
 
     func windowDidEndLiveResize(_ notification: Notification) {
+        if (notification.object as? NSWindow) === dropdown {
+            dropdownSize = dropdown.frame.size
+            return
+        }
         guard (notification.object as? NSWindow) === mini else { return }
         snapMini()
     }
@@ -708,7 +771,7 @@ final class MiniOverlay: NSView {
 final class PlayerCheck: NSObject, NSApplicationDelegate {
     private let folder: URL
     private var failed = false
-    private lazy var player = YouTubePlayer(anchor: { (NSScreen.main, nil) })
+    private lazy var player = YouTubePlayer(anchor: { (NSScreen.main, nil, nil) })
 
     init(folder: URL) { self.folder = folder }
 
@@ -756,9 +819,33 @@ final class PlayerCheck: NSObject, NSApplicationDelegate {
         note("  saved \(name).png")
     }
 
+    /// Which parts of YouTube's page paint a background (for the glass).
+    private func dumpBackgrounds(_ name: String) async {
+        let dump = await player.evaluateString("""
+            (() => {
+              const label = (e) => e.tagName.toLowerCase() + (e.id ? '#' + e.id : '')
+                + (typeof e.className === 'string' && e.className.trim() ? '.' + e.className.trim().split(/\\s+/).slice(0, 3).join('.') : '');
+              const painted = (e) => { const c = getComputedStyle(e).backgroundColor; return c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent' ? c : null; };
+              const points = [[innerWidth / 2, 12], [innerWidth / 2, innerHeight / 2], [innerWidth / 2, innerHeight - 12], [8, innerHeight / 3], [innerWidth - 8, innerHeight * 0.8]];
+              const out = { size: [innerWidth, innerHeight], html: Array.from(document.documentElement.attributes).map(a => a.name + '=' + a.value.slice(0, 30)).join(' ') };
+              out.points = points.map(([x, y]) => { const chain = []; for (let e = document.elementFromPoint(x, y); e; e = e.parentElement) { const c = painted(e); if (c) chain.push(label(e) + ' ' + c); } return [Math.round(x), Math.round(y), chain]; });
+              const root = getComputedStyle(document.documentElement), vars = {};
+              for (const sheet of document.styleSheets) { let rules; try { rules = sheet.cssRules; } catch (e) { continue; }
+                for (const r of rules) { if (!r.style) continue; for (let i = 0; i < r.style.length; i++) { const p = r.style[i];
+                  if (p.startsWith('--yt-spec') && /background|base|raised|menu|brand/.test(p)) vars[p] = root.getPropertyValue(p).trim(); } } }
+              out.vars = vars;
+              return JSON.stringify(out);
+            })()
+            """)
+        note("  backgrounds \(name): \(dump ?? "none")")
+    }
+
     private func steps() async {
         note("YouTube player check")
         expect(YouTubePlayer.scriptURL != nil, "PlayerScript.js found")
+        player.toggle()                                                // the home page
+        _ = await wait(20) { false }
+        await dumpBackgrounds("home")
         player.play((id: "jNQXAC9IVRw", start: nil))                  // "Me at the zoo", 19 s
         expect(player.place == .dropdown, "the dropdown opens")
         let video = await wait(40) { self.player.hasVideo }
@@ -774,6 +861,7 @@ final class PlayerCheck: NSObject, NSApplicationDelegate {
         let playing = await wait(20) { self.player.playing }
         note(playing ? "  ok   it plays" : "  note it didn't start playing here (fine on a server with no sound)")
         try? await Task.sleep(nanoseconds: 2_000_000_000)
+        await dumpBackgrounds("watch")
         await save("dropdown")
 
         player.popOut()
