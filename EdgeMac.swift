@@ -145,10 +145,17 @@ final class MacEdgeDriver: EdgeDriver, @unchecked Sendable {
     static func giveBackFocus(to app: NSRunningApplication) async {
         await handFocus(to: app)
         try? await Task.sleep(nanoseconds: 200_000_000)
+        let arrived = await MainActor.run { () -> Bool in
+            guard NSWorkspace.shared.frontmostApplication != app else { return true }
+            _ = app.activate()
+            return false
+        }
+        guard !arrived else { return }
+        // Switching apps takes a moment: only if it still hasn't happened, step aside
+        // so Hammer (with nothing to type into) never stays in front.
+        try? await Task.sleep(nanoseconds: 150_000_000)
         await MainActor.run {
-            guard NSWorkspace.shared.frontmostApplication != app else { return }
-            if #available(macOS 14, *) { _ = app.activate() } else { _ = app.activate(options: []) }
-            if NSApp.isActive { NSApp.deactivate() }        // never stay in front with nothing to show
+            if NSWorkspace.shared.frontmostApplication != app && NSApp.isActive { NSApp.deactivate() }
         }
     }
 

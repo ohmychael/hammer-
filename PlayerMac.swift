@@ -870,7 +870,7 @@ final class PlayerCheck: NSObject, NSApplicationDelegate {
         }
         expect(video, "the page script sees the video")
         let titled = await wait(20) { self.player.title.lowercased().contains("zoo") }
-        if !titled, await player.evaluateBool("!!document.querySelector('[class*=interstitial]')") == true {
+        if !titled, await player.evaluateBool("!!document.body && /not a bot/i.test(document.body.innerText)") == true {
             // YouTube sometimes asks a server to sign in ("confirm you're not a bot") before the video loads.
             note("  note YouTube asked this server to sign in first, so the title can't be checked here")
         } else {
