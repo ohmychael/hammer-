@@ -9,9 +9,13 @@ const source = fs.readFileSync(path.join(__dirname, '..', '..', 'PlayerScript.js
 let failures = 0, checks = 0;
 const expect = (ok, what) => { checks++; if (!ok) { failures++; console.log('FAIL: ' + what); } };
 
-function makeVideo({ paused = true, width = 100, height = 56, duration = 100, readyState = 4 } = {}) {
+function makeBox(parent) {
+  return { parentElement: parent, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, removeAttribute(k) { delete this.attrs[k]; } };
+}
+
+function makeVideo({ paused = true, width = 100, height = 56, duration = 100, readyState = 4, parent = null } = {}) {
   return {
-    paused, ended: false, currentTime: 0, duration, readyState, attrs: {}, plays: 0,
+    parentElement: parent, paused, ended: false, currentTime: 0, duration, readyState, attrs: {}, plays: 0,
     getBoundingClientRect() { return { width, height }; },
     setAttribute(k, v) { this.attrs[k] = v; },
     removeAttribute(k) { delete this.attrs[k]; },
@@ -23,6 +27,8 @@ function makeVideo({ paused = true, width = 100, height = 56, duration = 100, re
 function makePage(videos, pathname = '/watch') {
   const posted = [], listeners = {}, appended = [], timers = [];
   const classes = new Set();
+  const boxes = [];
+  for (const v of videos) for (let e = v.parentElement; e; e = e.parentElement) if (!boxes.includes(e)) boxes.push(e);
   const document = {
     title: 'Song - YouTube',
     head: { appendChild(n) { appended.push(n); } },
@@ -32,12 +38,15 @@ function makePage(videos, pathname = '/watch') {
     querySelectorAll(selector) {
       if (selector === 'video') return page.videos;
       if (selector === 'video[data-hammer-main]') return page.videos.filter((v) => 'data-hammer-main' in v.attrs);
+      if (selector === '[data-hammer-path]') return boxes.filter((e) => 'data-hammer-path' in e.attrs);
       throw new Error('unexpected selector ' + selector);
     },
   };
   const window = { webkit: { messageHandlers: { hammer: { postMessage(m) { posted.push(m); } } } } };
   const location = { pathname };
-  const page = { videos, posted, listeners, appended, classes, document, window, timers, location };
+  document.body = boxes.find((e) => e.isBody) || null;
+  document.documentElement.parentElement = null;
+  const page = { videos, posted, listeners, appended, classes, document, window, timers, location, boxes };
   page.run = () => vm.runInNewContext(source, {
     window, document, location, Array, Math, Infinity, JSON,
     setInterval: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
@@ -48,8 +57,11 @@ function makePage(videos, pathname = '/watch') {
 }
 
 // Loading twice (YouTube changes pages without reloading) sets up once.
-let main = makeVideo({ width: 420, height: 236 });
-let page = makePage([makeVideo({ width: 160, height: 90 }), main]);
+const body = Object.assign(makeBox(null), { isBody: true });
+const feed = makeBox(body);
+const player = makeBox(makeBox(body));              // two boxes between the video and <body>
+let main = makeVideo({ width: 420, height: 236, parent: player });
+let page = makePage([makeVideo({ width: 160, height: 90, parent: feed }), main]);
 page.run();
 page.run();
 expect(page.listeners.play.length === 1 && page.appended.length === 1, 'set up once');
@@ -100,6 +112,13 @@ expect('data-hammer-main' in preview.attrs && !('data-hammer-main' in main.attrs
 expect(hammer.mini(false) === false && !page.classes.has('hammer-mini')
        && page.videos.every((v) => !('data-hammer-main' in v.attrs)), 'mini off: back to normal');
 expect(/hammer-mini video\[data-hammer-main\]/.test(page.appended[0].textContent), 'the style targets the marked video');
+main.paused = false; preview.paused = true;
+hammer.mini(true);
+expect('data-hammer-path' in player.attrs && 'data-hammer-path' in player.parentElement.attrs
+       && !('data-hammer-path' in body.attrs) && !('data-hammer-path' in feed.attrs), 'the boxes around the video are marked, not <body>');
+hammer.mini(false);
+expect(page.boxes.every((e) => !('data-hammer-path' in e.attrs)), 'and unmarked after');
+expect(/\[data-hammer-path\] \{ display: block !important; \}/.test(page.appended[0].textContent), 'marked boxes are shown');
 
 // A video page counts as having a video before anything has loaded; other pages don't.
 page = makePage([makeVideo({ duration: NaN, readyState: 0 })], '/watch');

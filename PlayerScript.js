@@ -56,15 +56,23 @@
       inset: 0 !important; left: 0 !important; top: 0 !important; width: 100vw !important; height: 100vh !important;
       max-width: none !important; max-height: none !important; margin: 0 !important;
       object-fit: contain !important; background: #000 !important; z-index: 2147483647 !important;
-      pointer-events: auto !important; clip-path: none !important; opacity: 1 !important; }`;
+      pointer-events: auto !important; clip-path: none !important; opacity: 1 !important; }
+    html.hammer-mini [data-hammer-path] { display: block !important; }`;
   (document.head || document.documentElement).appendChild(style);
 
   window.__hammer = {
     // true: show only the video. Returns whether there was one.
     mini(on) {
       for (const v of document.querySelectorAll('video[data-hammer-main]')) v.removeAttribute('data-hammer-main');
+      for (const e of document.querySelectorAll('[data-hammer-path]')) e.removeAttribute('data-hammer-path');
       const v = on ? mainVideo() : null;
-      if (v) v.setAttribute('data-hammer-main', '');
+      if (v) {
+        v.setAttribute('data-hammer-main', '');
+        // A box around the video that isn't displayed would leave it no size at all.
+        for (let e = v.parentElement; e && e !== document.body && e !== document.documentElement; e = e.parentElement) {
+          e.setAttribute('data-hammer-path', '');
+        }
+      }
       document.documentElement.classList.toggle('hammer-mini', !!v);
       return !!v;
     },
