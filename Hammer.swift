@@ -1168,7 +1168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenuSoon()
     }
 
-    @objc private func useEdgeForYouTube() { setYouTubeInEdge(true) }
+    @objc private func useEdgeForYouTube() { if EdgePlayer.isInstalled { setYouTubeInEdge(true) } }
     @objc private func useHammerPlayerForYouTube() { setYouTubeInEdge(false) }
 
     @objc private func toggleYouTube() {
@@ -1216,6 +1216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Where YouTube opens, and whether Command-Y opens it.
     private func youTubeOptions(inEdge: Bool) -> NSMenuItem {
         let options = NSMenu()
+        options.autoenablesItems = false                 // so the Edge choice really is off without Edge
         let edgeItem = action("Open in Microsoft Edge (your account, your extensions)", #selector(useEdgeForYouTube))
         edgeItem.state = inEdge ? .on : .off
         let installed = EdgePlayer.isInstalled
@@ -1232,7 +1233,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if commandYOn && !commandYWorks {
             options.addItem(hint("Another app has ⌘Y everywhere, so use ⌃⌥Y."))
         } else {
-            options.addItem(hint("While on, other apps don't get ⌘Y (Finder's Quick Look, History in Edge)."))
+            options.addItem(hint("While on, other apps don't get ⌘Y:"))
+            options.addItem(hint("Quick Look in Finder, History in browsers, Redo in Office."))
         }
         let item = NSMenuItem(title: "YouTube Options", action: nil, keyEquivalent: "")
         item.submenu = options

@@ -37,8 +37,8 @@ The menu always offers **Check Monitor Connection…**, and says so if the monit
 
 YouTube opens in your own Edge as an *app window*: no tabs, no address bar. It's your Edge profile, so you're signed in to your account and your extensions run there as usual.
 
-- The first time, macOS asks **"Hammer wants access to control Microsoft Edge"**. Choose **Allow**. Hammer only opens, moves and minimizes that one window. It never reads your cookies, passwords or history. If you chose Don't Allow: System Settings → Privacy & Security → Automation → Hammer → turn on Microsoft Edge.
-- **The shortcut toggles it.** In front: it's tucked away (minimized; a playing video keeps playing). Anywhere else (behind other windows, minimized): it comes back to the corner, in front. Closed: a new one opens.
+- The first time, macOS asks **"Hammer wants access to control Microsoft Edge"**. Choose **Allow**. Hammer only finds that one window and opens, moves and minimizes it; its scripts send back window numbers and positions, never your tabs' addresses. It never reads your cookies, passwords or history. If you chose Don't Allow: System Settings → Privacy & Security → Automation → Hammer → turn on Microsoft Edge.
+- **The shortcut toggles it.** In front: it's tucked away (minimized; a playing video keeps playing), and you're back in the app you were using. Anywhere else (behind other windows, minimized): it comes back to the corner, in front. Closed: a new one opens.
 - Resize it and it keeps that size, and goes back to the corner each time.
 - **Play Copied Link** plays the copied YouTube link in that window.
 - For a small floating video, use Edge's own picture-in-picture (right-click the video twice → Picture in picture).
@@ -57,7 +57,7 @@ YouTube opens in your own Edge as an *app window*: no tabs, no address bar. It's
 
 ### ⌘Y
 
-**⌘Y Opens YouTube** (in YouTube Options) is on to start with. While it's on, other apps don't get ⌘Y: Finder's Quick Look (Space still works) and History in Edge, Chrome and Safari (use the History menu). Turn it off and Control-Option-Y still works.
+**⌘Y Opens YouTube** (in YouTube Options) is on to start with. While it's on, other apps don't get ⌘Y: Quick Look in Finder (Space still works), History in Edge, Chrome and Safari (use the History menu), and Redo in Microsoft Office (⌘⇧Z or the Edit menu). Turn it off and Control-Option-Y still works.
 
 ## Bluetooth bulbs and your phone
 

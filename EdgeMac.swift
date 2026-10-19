@@ -3,8 +3,8 @@
 // Hammer's AppleScripts through osascript (never on the main thread, always with
 // a time limit), and asks macOS once whether Hammer may steer Edge.
 //
-// Hammer never reads Edge's cookies, passwords or history: it only opens a
-// YouTube window, moves it, and minimizes it.
+// Hammer never reads Edge's cookies, passwords or history. Its scripts send back
+// only window numbers, positions and whether they're minimized: never addresses.
 
 import AppKit
 import CoreServices
@@ -95,8 +95,12 @@ final class MacEdgeDriver: EdgeDriver, @unchecked Sendable {
         process.waitUntilExit()
         timer.cancel()
         let err = String(decoding: errorText.wait(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        if timedOut.isSet { return .failed(number: nil, message: "Microsoft Edge didn't answer") }
+        if timedOut.isSet {
+            NSLog("Hammer: Microsoft Edge didn't answer a script within %.0f s", timeout)
+            return .failed(number: nil, message: "Microsoft Edge didn't answer")
+        }
         guard process.terminationStatus == 0 else {
+            NSLog("Hammer: Edge script failed: %@", err)               // the details, for Console; you see plain words
             return .failed(number: EdgeYouTube.errorNumber(err), message: err.isEmpty ? "osascript failed" : err)
         }
         return .ok(String(decoding: out, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
@@ -110,29 +114,44 @@ final class MacEdgeDriver: EdgeDriver, @unchecked Sendable {
         // window to the running Edge and quits (the way `open -n` does).
         configuration.createsNewApplicationInstance = true
         configuration.activates = true
-        do {
-            _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
-            return true
-        } catch {
-            return false
+        // If macOS holds Edge back (a question on screen), don't wait forever.
+        return await withCheckedContinuation { continuation in
+            let once = Once()
+            NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
+                if let error { NSLog("Hammer: couldn't open Microsoft Edge: %@", error.localizedDescription) }
+                once.run { continuation.resume(returning: error == nil) }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 30) {
+                once.run { continuation.resume(returning: Self.edgeApp() != nil) }
+            }
         }
     }
 
-    /// Brings Edge to the front: only its front window (the YouTube one), not all of them.
+    /// Brings Edge to the front: if macOS lets Hammer hand over the focus, only
+    /// Edge's front window (the YouTube one) comes forward. Otherwise Edge's own
+    /// activate does it, which may bring Edge's other windows along.
     func bringForward() async {
-        await MainActor.run {
-            guard let edge = Self.edgeApp() else { return }
-            if #available(macOS 14, *) {
-                NSApp.activate()                            // you pressed Hammer's shortcut, so Hammer may pass the focus on
-                _ = edge.activate(from: .current, options: [])
-            } else {
-                _ = edge.activate(options: [])
-            }
-        }
+        guard let edge = Self.edgeApp() else { return }
+        await Self.handFocus(to: edge)
         try? await Task.sleep(nanoseconds: 300_000_000)
         let front = await MainActor.run { NSWorkspace.shared.frontmostApplication?.bundleIdentifier }
         if front != EdgeYouTube.bundleID {
-            _ = await run(EdgeYouTube.activateScript())     // Edge's own activate always works
+            _ = await run(EdgeYouTube.activateScript())
+        }
+    }
+
+    /// Makes `app` the active app. Since macOS 14 an app may only pass the focus on
+    /// while it has it, so Hammer takes it first (you just pressed its shortcut).
+    static func handFocus(to app: NSRunningApplication) async {
+        if #available(macOS 14, *) {
+            await MainActor.run { NSApp.activate() }
+            for _ in 0..<10 {                                // up to a quarter of a second
+                if await MainActor.run(body: { NSApp.isActive }) { break }
+                try? await Task.sleep(nanoseconds: 25_000_000)
+            }
+            _ = await MainActor.run { app.activate(from: .current, options: []) }
+        } else {
+            _ = await MainActor.run { app.activate(options: []) }
         }
     }
 
@@ -158,6 +177,19 @@ private final class PipeReader: @unchecked Sendable {
     func wait() -> Data { done.wait(); return data }
 }
 
+/// Runs its block the first time only (whichever of two callbacks comes first).
+private final class Once: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+    func run(_ block: () -> Void) {
+        lock.lock()
+        let first = !done
+        done = true
+        lock.unlock()
+        if first { block() }
+    }
+}
+
 private final class Flag: @unchecked Sendable {
     private let lock = NSLock()
     private var value = false
@@ -176,6 +208,7 @@ final class EdgePlayer {
     private let useHammerPlayer: () -> Void
     private var busySince: Date?
     private var toldAboutPermission = false
+    private var cameFrom: NSRunningApplication?     // the app you were in before YouTube came forward
 
     /// `screen`: the menu bar icon's screen. `useHammerPlayer`: switch to Hammer's own player.
     init(screen: @escaping () -> NSScreen?, useHammerPlayer: @escaping () -> Void) {
@@ -185,9 +218,14 @@ final class EdgePlayer {
 
     /// Opens, shows or tucks away YouTube's Edge window; with `url`, plays it there.
     func toggle(play url: URL? = nil) {
-        // One press at a time (the first may wait on macOS's question); a stuck one is forgotten after two minutes.
-        if let since = busySince, Date().timeIntervalSince(since) < 120 { return }
+        // One press at a time: the first may wait on macOS's question, and every step has
+        // its own time limit. Only if something got stuck anyway is it forgotten (ten minutes).
+        if let since = busySince, Date().timeIntervalSince(since) < 600 { return }
         busySince = Date()
+        if let front = NSWorkspace.shared.frontmostApplication, front.bundleIdentifier != EdgeYouTube.bundleID,
+           front != NSRunningApplication.current {
+            cameFrom = front
+        }
         driver.prepare(screen: screen())
         let controller = self.controller
         Task { @MainActor in
@@ -199,8 +237,14 @@ final class EdgePlayer {
 
     private func handle(_ outcome: EdgeController.Outcome) {
         switch outcome {
-        case .opened, .shown, .hidden:
+        case .opened, .shown:
             break
+        case .hidden:
+            // Typing goes back to where you were, not to an Edge window you can't see.
+            if let app = cameFrom, !app.isTerminated,
+               NSWorkspace.shared.frontmostApplication?.bundleIdentifier == EdgeYouTube.bundleID {
+                Task { await MacEdgeDriver.handFocus(to: app) }
+            }
         case .notInstalled:
             useHammerPlayer()
         case .notAllowed(let openedAnyway):
@@ -211,7 +255,7 @@ final class EdgePlayer {
             alert.informativeText = "To keep YouTube's Edge window in the corner and tuck it away with the shortcut, "
                 + "Hammer needs your OK: System Settings → Privacy & Security → Automation → Hammer → turn on Microsoft Edge."
                 + (openedAnyway ? "\n\nYouTube opened in Edge anyway." : "")
-                + "\n\nHammer only opens, moves and minimizes that window. It never reads your cookies, passwords or history."
+                + "\n\nHammer only finds that window and opens, moves and minimizes it. It never reads your tabs, cookies, passwords or history."
             alert.addButton(withTitle: "Open Settings")
             alert.addButton(withTitle: "Use Hammer's Player")
             alert.addButton(withTitle: "Not Now")
@@ -269,7 +313,8 @@ enum EdgeCheck {
 
         // Compiling loads Edge's dictionary from its app; nothing is sent to Edge.
         let link = EdgeYouTube.watchURL(id: "jNQXAC9IVRw", start: 5)
-        let scripts = [("list", EdgeYouTube.listScript()), ("state", EdgeYouTube.stateScript(id: 1)),
+        let scripts = [("find", EdgeYouTube.findScript(prefix: EdgeYouTube.matchPrefix(EdgeYouTube.home))),
+                       ("state", EdgeYouTube.stateScript(id: 1)),
                        ("show", EdgeYouTube.showScript(id: 1, bounds: [3080, 25, 3840, 485])),
                        ("hide", EdgeYouTube.hideScript(id: 1)), ("play", EdgeYouTube.goScript(id: 1, url: link)),
                        ("activate", EdgeYouTube.activateScript())]
@@ -287,21 +332,35 @@ enum EdgeCheck {
         // As Hammer does it, plus what a build server needs (a test keychain, no first-run screens).
         let launched = await driver.launch(EdgeYouTube.launchArguments(EdgeYouTube.home)
                                            + ["--use-mock-keychain", "--no-first-run", "--no-default-browser-check"])
-        note((launched ? "  ok   " : "  FAIL ") + "Edge started with a YouTube app window")
-        if !launched { return false }
         var found: (number: Int, bounds: CGRect)?
-        for _ in 0..<60 {
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            if let window = edgeWindows().first(where: { !before.contains($0.number) && $0.bounds.width > 200 }) {
-                found = window
-                break
+        if launched {
+            for _ in 0..<60 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                if let window = edgeWindows().first(where: { !before.contains($0.number) && $0.bounds.width > 200 }) {
+                    found = window
+                    break
+                }
             }
         }
+        if found == nil && macOSIsAsking() {
+            // A copy of Edge nobody has opened yet: macOS asks "Are you sure you want to open it?"
+            // first, and only a person can answer. (On your Mac, you did the first time you used Edge.)
+            note("  SKIPPED opening the window: macOS is asking whether to open Edge for the first time.")
+            note(good ? "All Edge checks that can run here passed." : "Some Edge checks failed.")
+            return good
+        }
+        note((launched ? "  ok   " : "  FAIL ") + "Edge started with a YouTube app window")
         note((found != nil ? "  ok   " : "  FAIL ") + "its window is on screen" + (found.map { ": \($0.bounds)" } ?? ""))
-        if found == nil { good = false }
+        if !launched || found == nil { good = false }
         note("  running as \(driver.running() ?? "nothing")")
         note(good ? "All Edge checks passed." : "Some Edge checks failed.")
         return good
+    }
+
+    /// macOS's "downloaded from the Internet" question is on screen (its window belongs to CoreServicesUIAgent).
+    private static func macOSIsAsking() -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return false }
+        return list.contains { ($0[kCGWindowOwnerName as String] as? String) == "CoreServicesUIAgent" }
     }
 
     /// Edge's ordinary windows on screen (needs no permission: no names, just where they are).

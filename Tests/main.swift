@@ -1046,6 +1046,9 @@ expect(EdgeYouTube.watchURL(id: "jNQXAC9IVRw").absoluteString == "https://www.yo
        && EdgeYouTube.watchURL(id: "jNQXAC9IVRw", start: 90).absoluteString == "https://www.youtube.com/watch?v=jNQXAC9IVRw&t=90s",
        "Edge gets the full YouTube site, with the start time")
 expect(EdgeYouTube.launchArguments(EdgeYouTube.home) == ["--app=https://www.youtube.com/"], "an Edge app window")
+expect(EdgeYouTube.matchPrefix(EdgeYouTube.home) == "https://www.youtube.com/"
+       && EdgeYouTube.matchPrefix(EdgeYouTube.watchURL(id: "jNQXAC9IVRw", start: 90)) == "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+       "its window is known by its address, a video's without the start time")
 
 // The menu bar is 25 points tall on a 3840 × 1600 main screen (visible frame: playerWideScreen).
 var edgeBounds = EdgeYouTube.showBounds(current: nil, visible: playerWideScreen, mainScreenHeight: 1600)
@@ -1067,43 +1070,64 @@ expect(EdgeYouTube.quoted("say \"hi\" \\ bye") == "\"say \\\"hi\\\" \\\\ bye\"",
 expect(EdgeYouTube.quoted("a\"\ndo shell script \"x") == "\"a\\\"do shell script \\\"x\"", "a line break can't start a new command")
 expect(EdgeYouTube.quoted("a\rb\tc\u{0}d\u{2028}e") == "\"abcde\"", "control characters dropped")
 
-let edgeList = EdgeYouTube.listScript()
-expect(edgeList.contains("tell application id \"com.microsoft.edgemac\"") && edgeList.hasPrefix("set sep to character id 9"),
-       "the list script asks Edge (by its ID), separators made outside the tell block")
-let edgeWindows = EdgeYouTube.parseList("12\t3\thttps://www.bing.com/\n57\t1\thttps://www.youtube.com/\n58\t1\thttps://m.youtube.com/watch?v=x\n"
-                                        + "59\t2\thttps://www.youtube.com/\n60\t1\thttps://example.com/?u=youtube.com\n61\t1\t\nbad line\n")
-expect(edgeWindows.count == 6 && edgeWindows[0] == EdgeYouTube.Window(id: 12, tabs: 3, url: "https://www.bing.com/")
-       && edgeWindows[5] == EdgeYouTube.Window(id: 61, tabs: 1, url: ""), "reads Edge's window list: \(edgeWindows)")
-expect(EdgeYouTube.parseList("") == [] && EdgeYouTube.parseList("x\ty\tz") == [], "nothing, or nonsense: no windows")
-expect(EdgeYouTube.newWindow(in: edgeWindows, before: [12]) == 58, "the newest new one-tab YouTube window is Hammer's")
-expect(EdgeYouTube.newWindow(in: edgeWindows, before: [12, 58]) == 57, "…not one that was already open")
-expect(EdgeYouTube.newWindow(in: edgeWindows, before: [12, 57, 58]) == nil,
-       "a two-tab window, another site with youtube in its address, or a blank window isn't it")
+let edgeFind = EdgeYouTube.findScript(prefix: "https://www.youtube.com/")
+expect(edgeFind.contains("tell application id \"com.microsoft.edgemac\"") && edgeFind.contains("mode of w is \"normal\"")
+       && edgeFind.contains("(count of tabs of w) is 1") && edgeFind.contains("starts with \"https://www.youtube.com/\"")
+       && edgeFind.contains("set found to found & ((id of w) as text)") && !edgeFind.contains("& (URL"),
+       "the find script checks inside Edge (ordinary windows, one tab, Hammer's address) and returns only numbers")
+expect(EdgeYouTube.findScript(prefix: "x\" & (do shell script \"y").contains("starts with \"x\\\" & (do shell script \\\"y\""),
+       "an address can't break out of the script")
+expect(EdgeYouTube.parseIDs("57,58,\n") == [57, 58] && EdgeYouTube.parseIDs("") == [] && EdgeYouTube.parseIDs("x,3,,") == [3],
+       "reads window numbers")
+expect(EdgeYouTube.newWindow(after: [12, 57, 58], before: [12]) == 58 && EdgeYouTube.newWindow(after: [12], before: [12]) == nil
+       && EdgeYouTube.newWindow(after: [57], before: []) == 57, "the newest window that wasn't there before")
 
 let edgeState = EdgeYouTube.stateScript(id: 57)
-expect(edgeState.contains("exists window id 57") && edgeState.contains("set w to window id 57"), "the state script asks about that window")
-expect(EdgeYouTube.parseState("missing\n") == .missing, "a closed window")
-expect(EdgeYouTube.parseState("false, 1, 3080, 25, 3840, 485\n")
-       == .found(EdgeYouTube.State(minimized: false, index: 1, bounds: [3080, 25, 3840, 485])), "reads the window's state")
-expect(EdgeYouTube.parseState("true,3,-760,345.0,0,805") == .found(EdgeYouTube.State(minimized: true, index: 3, bounds: [-760, 345, 0, 805])),
-       "minimized, behind, on another screen")
-expect(EdgeYouTube.parseState("") == .unreadable && EdgeYouTube.parseState("yes,1,0,0,1,1") == .unreadable
-       && EdgeYouTube.parseState("false,1,0,0,1") == .unreadable && EdgeYouTube.parseState("false,x,0,0,1,1") == .unreadable
-       && EdgeYouTube.parseState("false,1,0,0,nan,1") == .unreadable, "nonsense isn't read as a window")
+expect(edgeState.contains("exists window id 57") && edgeState.contains("set w to window id 57")
+       && edgeState.hasPrefix("set sep to \",\"") && edgeState.contains("(index of v) as text") && !edgeState.contains("URL"),
+       "the state script: that window, and every window's place in line (no addresses)")
+expect(EdgeYouTube.parseState("missing\n", id: 57) == .missing, "a closed window")
+var edgeParsed = EdgeYouTube.parseState("false,3080,25,3840,485\n57,false,1\n12,false,2\n", id: 57)
+expect(edgeParsed == .found(EdgeYouTube.State(id: 57, minimized: false, bounds: [3080, 25, 3840, 485],
+                                              windows: [EdgeYouTube.Order(id: 57, minimized: false, index: 1),
+                                                        EdgeYouTube.Order(id: 12, minimized: false, index: 2)])), "reads the window's state")
+func edgeFront(_ text: String, _ id: Int = 57) -> Bool? {
+    if case .found(let state) = EdgeYouTube.parseState(text, id: id) { return state.inFront }
+    return nil
+}
+expect(edgeFront("false,0,0,1,1\n57,false,1\n12,false,2") == true, "first in line: in front")
+expect(edgeFront("false,0,0,1,1\n12,false,0\n57,false,1") == false, "another Edge window ahead: not in front")
+expect(edgeFront("false,0,0,1,1\n57,false,0\n12,false,1") == true, "Edge counting from 0: still in front")
+expect(edgeFront("false,0,0,1,1\n12,false,1\n57,false,3") == false && edgeFront("false,0,0,1,1\n57,false,2\n12,false,3") == true,
+       "a window Hammer can't see (picture in picture) in between: judged among Edge's windows")
+expect(edgeFront("false,0,0,1,1\n12,true,0\n57,false,4") == true, "a minimized window ahead doesn't count")
+expect(edgeFront("true,0,0,1,1\n57,true,9.22337203685478E+18\n12,false,1") == false, "minimized (index NSIntegerMax): not in front")
+expect(edgeFront("false,0,0,1,1\n") == true && edgeFront("false,0,0,1,1\nnonsense\n57,false,x") == true,
+       "no order given: not minimized counts as in front")
+expect(EdgeYouTube.parseState("", id: 1) == .unreadable && EdgeYouTube.parseState("yes,0,0,1,1", id: 1) == .unreadable
+       && EdgeYouTube.parseState("false,0,0,1", id: 1) == .unreadable && EdgeYouTube.parseState("false,0,0,nan,1", id: 1) == .unreadable
+       && EdgeYouTube.parseState("missing value", id: 1) == .unreadable, "nonsense isn't read as a window")
+edgeParsed = EdgeYouTube.parseState("true, -760.0, 345, 0, 805", id: 5)
+expect(edgeParsed == .found(EdgeYouTube.State(id: 5, minimized: true, bounds: [-760, 345, 0, 805], windows: [])),
+       "minimized, on another screen, decimals and spaces")
 
-let edgeFront = EdgeYouTube.State(minimized: false, index: 1, bounds: [0, 0, 1, 1])
-expect(EdgeYouTube.decide(.found(edgeFront), edgeIsFrontApp: true) == .hide, "in front: the shortcut tucks it away")
-expect(EdgeYouTube.decide(.found(edgeFront), edgeIsFrontApp: false) == .show, "Edge behind another app: brought forward")
-expect(EdgeYouTube.decide(.found(EdgeYouTube.State(minimized: false, index: 2, bounds: [0, 0, 1, 1])), edgeIsFrontApp: true) == .show,
-       "behind another Edge window: brought forward")
-expect(EdgeYouTube.decide(.found(EdgeYouTube.State(minimized: true, index: 1, bounds: [0, 0, 1, 1])), edgeIsFrontApp: true) == .show,
+let edgeFrontState = EdgeYouTube.State(id: 1, minimized: false, bounds: [0, 0, 1, 1], windows: [EdgeYouTube.Order(id: 1, minimized: false, index: 0)])
+expect(EdgeYouTube.decide(.found(edgeFrontState), edgeIsFrontApp: true) == .hide, "in front: the shortcut tucks it away")
+expect(EdgeYouTube.decide(.found(edgeFrontState), edgeIsFrontApp: false) == .show, "Edge behind another app: brought forward")
+expect(EdgeYouTube.decide(.found(EdgeYouTube.State(id: 1, minimized: true, bounds: [0, 0, 1, 1], windows: [])), edgeIsFrontApp: true) == .show,
        "minimized: brought back")
-expect(EdgeYouTube.decide(.missing, edgeIsFrontApp: true) == .open && EdgeYouTube.decide(.unreadable, edgeIsFrontApp: false) == .open,
-       "closed (or unreadable): a new window")
+expect(EdgeYouTube.decide(.missing, edgeIsFrontApp: true) == .open, "closed: a new window")
+expect(EdgeYouTube.decide(.unreadable, edgeIsFrontApp: true) == .show && EdgeYouTube.decide(.unreadable, edgeIsFrontApp: false) == .show,
+       "there but answered oddly: shown, never a second window")
 
 let edgeShow = EdgeYouTube.showScript(id: 57, bounds: [3080, 25, 3840, 485])
 expect(edgeShow.contains("set bounds of w to {3080, 25, 3840, 485}") && edgeShow.contains("set index of w to 1")
-       && edgeShow.contains("if minimized of w then set minimized of w to false"), "the show script: corner, front, not minimized")
+       && edgeShow.contains("if wasMinimized then set minimized of w to false"), "the show script: corner, front, not minimized")
+if let moved = edgeShow.range(of: "set bounds of w to"), let restored = edgeShow.range(of: "set minimized of w to false") {
+    expect(moved.lowerBound < restored.lowerBound, "moved before it's un-minimized")
+} else { expect(false, "the show script has both steps") }
+expect(edgeShow.contains("delay 0.4") && edgeShow.contains("to set bounds of window id 57 to {3080, 25, 3840, 485}"),
+       "…and moved again once it's back")
 expect(EdgeYouTube.showScript(id: 1, bounds: [1, 2]).contains("{0, 0, 760, 460}"), "bad bounds never make a broken script")
 expect(EdgeYouTube.hideScript(id: 57).contains("set minimized of window id 57 to true"), "the hide script minimizes")
 let edgeGo = EdgeYouTube.goScript(id: 57, url: EdgeYouTube.watchURL(id: "jNQXAC9IVRw", start: 5))
@@ -1113,13 +1137,17 @@ expect(EdgeYouTube.activateScript() == "tell application id \"com.microsoft.edge
 expect(EdgeYouTube.errorNumber("execution error: Not authorized to send Apple events to Microsoft Edge. (-1743)") == -1743
        && EdgeYouTube.errorNumber("27:40: execution error: Microsoft Edge got an error: Can’t get window id 5. (-1728)") == -1728
        && EdgeYouTube.errorNumber("no number here") == nil && EdgeYouTube.errorNumber(") (") == nil, "reads osascript's error numbers")
+expect([nil, -600, -1728, -10000].allSatisfy { !EdgeYouTube.plainError($0).contains("execution error") && EdgeYouTube.plainError($0).hasSuffix(".") }
+       && EdgeYouTube.plainError(-10000).contains("-10000"), "errors in plain words")
 
 // MARK: YouTube in Microsoft Edge: the whole flow, against a stand-in Edge
 
-/// Behaves like Edge answering Hammer's scripts: windows with IDs, a front-to-back
-/// order, minimizing, bounds; and like macOS's Automation question.
+/// Behaves like Edge answering Hammer's scripts: windows with IDs and a front-to-back
+/// order (counting from 0, like AppKit, with minimized windows at the very end, and
+/// an optional picture-in-picture window Hammer can't see), and like macOS's
+/// Automation question.
 final class FakeEdge: EdgeDriver {
-    struct Win { var tabs: Int; var url: String; var minimized = false; var bounds = [100, 100, 900, 700] }
+    struct Win { var tabs: Int; var url: String; var minimized = false; var bounds = [100, 100, 900, 700]; var inPrivate = false }
     var installed = true
     var isRunning = false
     var run = 1                                // which run of Edge (changes when it restarts)
@@ -1127,12 +1155,16 @@ final class FakeEdge: EdgeDriver {
     var order: [Int] = []                      // front to back
     var nextID = 1
     var inFront = false
+    var pictureInPicture = false               // a floating video window in front of everything
     var answer = EdgePermission.allowed        // what you answer when macOS asks
     var asked = false
     var launchWorks = true
     var opensWindow = true                     // false: Edge starts but no window shows up
     var restores: [Win] = []                   // windows Edge brings back when it starts
     var failState: Int?                        // the state script fails with this error number
+    var failFind: Int?                         // the find script fails with this error number
+    var failShow: Int?
+    var stateReply: String?                    // the state script answers this instead
     var log: [String] = []
     var saved: [String: String] = [:]
     var visible = CGRect(x: 0, y: 0, width: 3840, height: 1575)
@@ -1169,26 +1201,46 @@ final class FakeEdge: EdgeDriver {
     func remembered(_ key: String) -> String? { saved[key] }
     func remember(_ value: String?, _ key: String) { saved[key] = value }
 
+    /// AppKit's order: 0 is the front, with picture in picture (if any) ahead of everything;
+    /// minimized windows aren't in the list (NSIntegerMax).
+    func index(_ id: Int) -> String {
+        if windows[id]!.minimized { return "9.22337203685478E+18" }
+        let shown = order.filter { !windows[$0]!.minimized }
+        return "\(shown.firstIndex(of: id)! + (pictureInPicture ? 1 : 0))"
+    }
+
     private func number(after marker: String, in script: String) -> Int? {
         guard let range = script.range(of: marker) else { return nil }
         return Int(script[range.upperBound...].prefix { $0.isNumber || $0 == "-" })
     }
 
+    private func quotedText(after marker: String, in script: String) -> String? {
+        guard let range = script.range(of: marker + "\"") else { return nil }
+        return String(script[range.upperBound...].prefix { $0 != "\"" })
+    }
+
     func run(_ script: String) async -> EdgeScriptResult {
         guard isRunning else { return .failed(number: -600, message: "Edge isn't running (-600)") }
         guard answer == .allowed && asked else { return .failed(number: -1743, message: "Not authorized (-1743)") }
-        if script.contains("repeat with w in windows") {
-            log.append("list")
-            return .ok(order.map { "\($0)\t\(windows[$0]!.tabs)\t\(windows[$0]!.url)\n" }.joined())
+        if script.contains("set found to") {
+            log.append("find")
+            if let failFind { return .failed(number: failFind, message: "error (\(failFind))") }
+            guard let prefix = quotedText(after: "starts with ", in: script) else { return .failed(number: -2741, message: "bad find") }
+            return .ok(order.filter { id in
+                let w = windows[id]!
+                return !w.inPrivate && w.tabs == 1 && w.url.hasPrefix(prefix)
+            }.map { "\($0)," }.joined())
         }
         if script.contains("return \"missing\"") {
             log.append("state")
             if let failState { return .failed(number: failState, message: "error (\(failState))") }
+            if let stateReply { return .ok(stateReply) }
             guard let id = number(after: "exists window id ", in: script), let w = windows[id] else { return .ok("missing") }
             let b = w.bounds
-            return .ok("\(w.minimized),\(order.firstIndex(of: id)! + 1),\(b[0]),\(b[1]),\(b[2]),\(b[3])")
+            return .ok("\(w.minimized),\(b[0]),\(b[1]),\(b[2]),\(b[3])\n" + order.map { "\($0),\(windows[$0]!.minimized),\(index($0))\n" }.joined())
         }
         if script.contains("set index of w to 1") {
+            if let failShow { return .failed(number: failShow, message: "error (\(failShow))") }
             guard let id = number(after: "set w to window id ", in: script), windows[id] != nil,
                   let range = script.range(of: "set bounds of w to {") else { return .failed(number: -1728, message: "no window (-1728)") }
             let b = script[range.upperBound...].prefix { $0 != "}" }.split(separator: ",").compactMap {
@@ -1204,14 +1256,16 @@ final class FakeEdge: EdgeDriver {
             guard let id = number(after: "set minimized of window id ", in: script), windows[id] != nil else {
                 return .failed(number: -1728, message: "no window (-1728)") }
             windows[id]!.minimized = true
+            order.removeAll { $0 == id }
+            order.append(id)
             inFront = false
             log.append("hide \(id)")
             return .ok("")
         }
         if script.contains("set URL of active tab of window id") {
             guard let id = number(after: "active tab of window id ", in: script), windows[id] != nil,
-                  let range = script.range(of: " to \"") else { return .failed(number: -1728, message: "no window (-1728)") }
-            windows[id]!.url = String(script[range.upperBound...].prefix { $0 != "\"" })
+                  let url = quotedText(after: " to ", in: script) else { return .failed(number: -1728, message: "no window (-1728)") }
+            windows[id]!.url = url
             log.append("go \(id)")
             return .ok("")
         }
@@ -1237,55 +1291,82 @@ fakeEdge.installed = false
 expect(edgeToggle(edgeController) == .notInstalled && fakeEdge.log.isEmpty, "no Edge: says so, does nothing")
 fakeEdge.installed = true
 
-// Edge closed: starting it opens just the YouTube window; macOS asks once Edge is running.
-fakeEdge.restores = [FakeEdge.Win(tabs: 4, url: "https://www.bing.com/"), FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/")]
+// Edge closed: starting it opens the YouTube window; macOS asks once Edge is running. Edge also
+// brings back your windows, one of them a single YouTube tab, and an InPrivate one on YouTube.
+fakeEdge.restores = [FakeEdge.Win(tabs: 4, url: "https://www.bing.com/"),
+                     FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/watch?v=abc"),
+                     FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", inPrivate: true)]
 var edgeOutcome = edgeToggle(edgeController)
 expect(edgeOutcome == .opened, "Edge closed: opened (\(edgeOutcome))")
 expect(fakeEdge.log.first == "launch --app=https://www.youtube.com/" && fakeEdge.log.contains("asked"),
        "started Edge with a YouTube app window, then asked to steer it: \(fakeEdge.log)")
-expect(edgeController.savedWindow(for: "edge-1") == 3, "found its own window (not the YouTube tab Edge brought back): \(fakeEdge.saved)")
-expect(fakeEdge.windows[3]!.bounds == [3080, 25, 3840, 485] && fakeEdge.order.first == 3 && fakeEdge.inFront,
-       "in the top-right corner, in front: \(fakeEdge.windows[3]!.bounds)")
+expect(edgeController.savedWindow(for: "edge-1") == 4, "found its own window, not your windows: \(fakeEdge.saved)")
+expect(fakeEdge.windows[4]!.bounds == [3080, 25, 3840, 485] && fakeEdge.order.first == 4 && fakeEdge.inFront,
+       "in the top-right corner, in front: \(fakeEdge.windows[4]!.bounds)")
 
-// The shortcut again, while it's in front: tucked away. Again: back in the corner.
-fakeEdge.log = []
-edgeOutcome = edgeToggle(edgeController)
-expect(edgeOutcome == .hidden && fakeEdge.windows[3]!.minimized && fakeEdge.log == ["state", "hide 3"], "in front: tucked away \(fakeEdge.log)")
-fakeEdge.log = []
-edgeOutcome = edgeToggle(edgeController)
-expect(edgeOutcome == .shown && !fakeEdge.windows[3]!.minimized && fakeEdge.inFront && fakeEdge.log.contains("forward"),
-       "tucked away: back (\(edgeOutcome)) \(fakeEdge.log)")
-expect(!fakeEdge.log.contains { $0.hasPrefix("launch") }, "no second window")
+// The shortcut again, while it's in front: tucked away. Again: back in the corner, every time.
+for round in 1...3 {
+    fakeEdge.log = []
+    edgeOutcome = edgeToggle(edgeController)
+    expect(edgeOutcome == .hidden && fakeEdge.windows[4]!.minimized && fakeEdge.log == ["state", "hide 4"],
+           "round \(round), in front: tucked away \(fakeEdge.log)")
+    fakeEdge.log = []
+    edgeOutcome = edgeToggle(edgeController)
+    expect(edgeOutcome == .shown && !fakeEdge.windows[4]!.minimized && fakeEdge.inFront && fakeEdge.log.contains("forward"),
+           "round \(round), tucked away: back (\(edgeOutcome)) \(fakeEdge.log)")
+}
+expect(fakeEdge.windows.count == 4 && !fakeEdge.log.contains { $0.hasPrefix("launch") }, "hiding and showing never opens a second window")
+
+// A picture-in-picture window in front of it: still counts as in front among Edge's windows.
+fakeEdge.pictureInPicture = true
+expect(edgeToggle(edgeController) == .hidden, "picture in picture in front: the shortcut still tucks it away")
+expect(edgeToggle(edgeController) == .shown, "…and brings it back")
+fakeEdge.pictureInPicture = false
 
 // You resized it and moved it; another app is in front.
-fakeEdge.windows[3]!.bounds = [200, 300, 1100, 820]
+fakeEdge.windows[4]!.bounds = [200, 300, 1100, 820]
 fakeEdge.inFront = false
 edgeOutcome = edgeToggle(edgeController)
-expect(edgeOutcome == .shown && fakeEdge.windows[3]!.bounds == [2940, 25, 3840, 545],
-       "another app in front: brought back to the corner at your size: \(fakeEdge.windows[3]!.bounds)")
+expect(edgeOutcome == .shown && fakeEdge.windows[4]!.bounds == [2940, 25, 3840, 545],
+       "another app in front: brought back to the corner at your size: \(fakeEdge.windows[4]!.bounds)")
 // Another Edge window in front of it.
-let edgeOther = fakeEdge.add(FakeEdge.Win(tabs: 2, url: "https://example.com/"))
+fakeEdge.order.removeAll { $0 == 1 }
+fakeEdge.order.insert(1, at: 0)
 fakeEdge.inFront = true
-expect(edgeToggle(edgeController) == .shown && fakeEdge.order.first == 3, "behind another Edge window: brought to the front")
-_ = edgeOther
+expect(edgeToggle(edgeController) == .shown && fakeEdge.order.first == 4, "behind another Edge window: brought to the front")
+
+// Edge answers oddly about a window that's there: shown, never a second window.
+fakeEdge.stateReply = "false,0,0,1"
+fakeEdge.log = []
+expect(edgeToggle(edgeController) == .shown && !fakeEdge.log.contains { $0.hasPrefix("launch") }, "an odd answer: shown, not reopened")
+fakeEdge.stateReply = nil
 
 // A video to play: shown (never tucked away), and it plays there.
+fakeEdge.inFront = true
 fakeEdge.log = []
 edgeOutcome = edgeToggle(edgeController, play: EdgeYouTube.watchURL(id: "jNQXAC9IVRw"))
-expect(edgeOutcome == .shown && fakeEdge.windows[3]!.url == "https://www.youtube.com/watch?v=jNQXAC9IVRw"
-       && fakeEdge.log.contains("go 3") && !fakeEdge.log.contains("hide 3"), "plays a link in the window: \(fakeEdge.log)")
+expect(edgeOutcome == .shown && fakeEdge.windows[4]!.url == "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+       && fakeEdge.log.contains("go 4") && !fakeEdge.log.contains("hide 4"), "plays a link in the window: \(fakeEdge.log)")
 
 // You closed it: a new one, at the size you last had.
 _ = edgeToggle(edgeController)                                // tuck away (remembers 900 × 520)
-fakeEdge.windows[3] = nil
-fakeEdge.order.removeAll { $0 == 3 }
+fakeEdge.windows[4] = nil
+fakeEdge.order.removeAll { $0 == 4 }
 fakeEdge.inFront = false
 fakeEdge.log = []
 edgeOutcome = edgeToggle(edgeController)
 let edgeNew = edgeController.savedWindow(for: "edge-1")
-expect(edgeOutcome == .opened && edgeNew != nil && edgeNew != 3 && edgeNew != 2, "closed: a new window (\(edgeOutcome), \(String(describing: edgeNew)))")
-expect(edgeNew.flatMap { fakeEdge.windows[$0]?.bounds } == [2940, 25, 3840, 545], "…at the size you last had, in the corner")
-expect(fakeEdge.log.first == "state" && fakeEdge.log.contains("list"), "looked before opening: \(fakeEdge.log)")
+expect(edgeOutcome == .opened && edgeNew == 5, "closed: a new window (\(edgeOutcome), \(String(describing: edgeNew)))")
+expect(fakeEdge.windows[5]?.bounds == [2940, 25, 3840, 545], "…at the size you last had, in the corner")
+expect(fakeEdge.log.prefix(3) == ["state", "find", "launch --app=https://www.youtube.com/"], "looked before opening: \(fakeEdge.log)")
+
+// A link to play with no window open: the window opens on that video, found by its address.
+fakeEdge.windows[5] = nil
+fakeEdge.order.removeAll { $0 == 5 }
+fakeEdge.log = []
+edgeOutcome = edgeToggle(edgeController, play: EdgeYouTube.watchURL(id: "jNQXAC9IVRw", start: 30))
+expect(edgeOutcome == .opened && fakeEdge.log.contains("launch --app=https://www.youtube.com/watch?v=jNQXAC9IVRw&t=30s")
+       && edgeController.savedWindow(for: "edge-1") == 6, "a link with no window: opened on it \(fakeEdge.log)")
 
 // Edge restarted: window IDs start over, so an old ID never steers someone else's window.
 let edgeOldID = edgeController.savedWindow(for: "edge-1")!
@@ -1300,13 +1381,31 @@ edgeOutcome = edgeToggle(edgeController)
 expect(edgeOutcome == .opened && fakeEdge.windows[edgeTheirs]!.bounds == edgeTheirsBefore
        && edgeController.savedWindow(for: "edge-2") != edgeTheirs, "after Edge restarts: your own window is left alone")
 
-// The state script fails because the window just went away: a new one.
+// Script trouble.
 fakeEdge.failState = -1728
-let edgeCount = fakeEdge.windows.count
+var edgeCount = fakeEdge.windows.count
 expect(edgeToggle(edgeController) == .opened && fakeEdge.windows.count == edgeCount + 1, "window gone mid-way: a new one")
 fakeEdge.failState = -10000
-if case .failed = edgeToggle(edgeController) {} else { expect(false, "another script error is reported") }
+expect(edgeToggle(edgeController) == .failed(EdgeYouTube.plainError(-10000)), "another error: said in plain words")
 fakeEdge.failState = nil
+fakeEdge.failShow = -10000
+fakeEdge.inFront = false
+expect(edgeToggle(edgeController) == .failed(EdgeYouTube.plainError(-10000)), "showing fails: said so")
+fakeEdge.failShow = nil
+fakeEdge.saved["edgeYouTubeWindow"] = nil
+fakeEdge.failFind = -10000
+edgeCount = fakeEdge.windows.count
+expect(edgeToggle(edgeController) == .failed(EdgeYouTube.plainError(-10000)) && fakeEdge.windows.count == edgeCount,
+       "can't look at Edge's windows first: no window opened blind")
+fakeEdge.failFind = nil
+
+// Edge quit between the check and the script.
+let quittingEdge = FakeEdge()
+quittingEdge.isRunning = true
+quittingEdge.asked = true
+quittingEdge.saved["edgeYouTubeWindow"] = "edge-1|1"
+quittingEdge.failState = -600
+expect(edgeToggle(EdgeController(driver: quittingEdge)) == .opened, "Edge quit meanwhile: started again with the window")
 
 // You said no in Privacy & Security → Automation.
 let deniedEdge = FakeEdge()
@@ -1314,6 +1413,9 @@ deniedEdge.isRunning = true
 deniedEdge.answer = .denied
 expect(edgeToggle(EdgeController(driver: deniedEdge)) == .notAllowed(openedAnyway: false) && !deniedEdge.log.contains { $0.hasPrefix("launch") },
        "not allowed, Edge open: says so; doesn't pile up windows it can't steer")
+expect(edgeToggle(EdgeController(driver: deniedEdge), play: EdgeYouTube.watchURL(id: "jNQXAC9IVRw")) == .notAllowed(openedAnyway: true)
+       && deniedEdge.log.contains("launch --app=https://www.youtube.com/watch?v=jNQXAC9IVRw"),
+       "not allowed, a link to play: it still plays (Edge places the window)")
 let deniedClosed = FakeEdge()
 deniedClosed.answer = .denied
 expect(edgeToggle(EdgeController(driver: deniedClosed)) == .notAllowed(openedAnyway: true) && deniedClosed.windows.count == 1,
@@ -1322,11 +1424,19 @@ expect(edgeToggle(EdgeController(driver: deniedClosed)) == .notAllowed(openedAny
 // Edge won't start, or its window never shows up.
 let brokenEdge = FakeEdge()
 brokenEdge.launchWorks = false
-expect(edgeToggle(EdgeController(driver: brokenEdge)) == .failed("Microsoft Edge didn't open"), "Edge won't start: says so")
+if case .failed(let text) = edgeToggle(EdgeController(driver: brokenEdge)), text.hasPrefix("Microsoft Edge didn't open") {} else {
+    expect(false, "Edge won't start: says so")
+}
 let windowlessEdge = FakeEdge()
 windowlessEdge.opensWindow = false
 if case .failed = edgeToggle(EdgeController(driver: windowlessEdge)) {} else { expect(false, "no window: says so") }
-expect(windowlessEdge.log.filter { $0 == "list" }.count == 50, "…after looking for about 15 seconds")
+expect(windowlessEdge.log.filter { $0 == "find" }.count == 60, "…after looking about 60 times")
+let slowEdge = FakeEdge()
+slowEdge.opensWindow = false
+let slowController = EdgeController(driver: slowEdge)
+slowController.findFor = 0
+if case .failed = edgeToggle(slowController) {} else { expect(false, "out of time: says so") }
+expect(!slowEdge.log.contains("find"), "…and stops looking when time's up")
 
 // A remembered window from a bad save is ignored.
 let oddEdge = FakeEdge()

@@ -105,7 +105,9 @@ jobs:
           mkdir -p /tmp/player-shots && screencapture -x /tmp/player-shots/edge.png
           cat /tmp/edge.txt
           pkill -x "Microsoft Edge" || true
-          /usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' ~/Applications/Hammer.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' ~/Applications/Hammer.app/Contents/Info.plist \
+            | tee /tmp/edge-usage.txt
+          grep -q "Microsoft Edge" /tmp/edge-usage.txt         # without it, macOS would refuse without asking
           grep -q "^exit 0$" /tmp/edge.txt
 
       - name: Keep the pictures (on the ci-screenshots branch)

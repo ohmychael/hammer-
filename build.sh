@@ -46,7 +46,7 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
   <key>LSUIElement</key><true/>
   <key>NSLocalNetworkUsageDescription</key><string>Hammer looks for your Govee lights on your Wi-Fi network.</string>
   <key>NSBluetoothAlwaysUsageDescription</key><string>Hammer controls your Govee bulbs over Bluetooth.</string>
-  <key>NSAppleEventsUsageDescription</key><string>Hammer opens YouTube in your Microsoft Edge and keeps its window in the top-right corner. It never reads your cookies, passwords or history.</string>
+  <key>NSAppleEventsUsageDescription</key><string>Hammer opens YouTube in your Microsoft Edge and keeps its window in the top-right corner. It never reads your tabs, cookies, passwords or history.</string>
 </dict>
 </plist>
 PLIST
