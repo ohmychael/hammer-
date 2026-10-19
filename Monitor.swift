@@ -435,9 +435,12 @@ struct MonitorPort: Equatable {
     var looksLikeHDMI: Bool {
         throughHDMIConverter || (transport?.uppercased().contains("HDMI") ?? false)
     }
-    /// The Mac sends DisplayPort, the monitor gets HDMI: a USB-C to HDMI cable,
-    /// adapter or hub converts it on the way, and most of those drop DDC.
-    var throughHDMIAdapter: Bool { monitorInput == .hdmi && !looksLikeHDMI }
+    /// The monitor gets HDMI from a USB-C port: a USB-C to HDMI cable, adapter or
+    /// hub (or a USB-C to DisplayPort adapter with a DisplayPort to HDMI cable)
+    /// converts it on the way, and most of those drop DDC. macOS may report the link
+    /// as DisplayPort or as HDMI then. Not the M1-era Macs' own HDMI port, whose
+    /// converter Hammer talks through.
+    var throughHDMIAdapter: Bool { monitorInput == .hdmi && !throughHDMIConverter }
 }
 
 enum MonitorDiscovery {
@@ -839,6 +842,7 @@ struct MonitorCheck {
         let name = monitorName
         let Name = name.prefix(1).uppercased() + name.dropFirst()
         let hdmi = ports.contains { $0.port.attached && $0.port.looksLikeHDMI }
+        let macHDMI = ports.contains { $0.port.attached && $0.port.throughHDMIConverter }
         switch verdict {
         case .working:
             return ["Result: Working. Hammer can read and change \(name)'s brightness."]
@@ -867,14 +871,17 @@ struct MonitorCheck {
                     "If that doesn't help, send this report along."]
         case .cantSend:
             return ["Result: macOS wouldn't let Hammer send anything to \(name).",
-                    hdmi ? "This Mac's HDMI port doesn't pass monitor control. Plug the monitor's USB-C (or DisplayPort) cable straight into the Mac instead."
-                         : "Plug its USB-C cable straight into the Mac (not through a hub, dock or adapter), then check again."]
+                    macHDMI ? "This Mac's HDMI port doesn't pass monitor control. Plug the monitor's USB-C (or DisplayPort) cable straight into the Mac instead."
+                    : hdmi ? "HDMI doesn't pass monitor control here. Connect to the monitor's DisplayPort or USB-C port instead (not HDMI)."
+                    : "Plug its USB-C cable straight into the Mac (not through a hub, dock or adapter), then check again."]
         case .hdmiAdapter:
-            return ["Result: \(Name) is plugged in with HDMI on its side, through a USB-C to HDMI cable,",
-                    "adapter or hub. Those convert the signal and usually drop brightness control (DDC/CI).",
-                    "Use a USB-C to USB-C cable from the Mac to the monitor's USB-C port instead",
-                    "(the Dell U3818DW comes with one), or USB-C to DisplayPort. Then, on the monitor,",
-                    "choose Menu → Input Source → USB Type-C (or DP), and check again."]
+            return ["Result: \(Name) is plugged into one of its HDMI ports (its ID info says so).",
+                    "Going from the Mac's USB-C to HDMI, through a cable, adapter or hub, usually drops",
+                    "brightness control (DDC/CI). The cable has to go into the monitor's DisplayPort or USB-C port:",
+                    "  • a USB-C to USB-C cable from the Mac to the monitor's USB-C port (the Dell U3818DW comes with one), or",
+                    "  • a USB-C to DisplayPort adapter or cable, with a DisplayPort cable into the monitor's DP port",
+                    "    (one comes with the Dell too). A DisplayPort to HDMI cable still lands on HDMI.",
+                    "Then, on the monitor, choose Menu → Input Source → USB Type-C (or DP), and check again."]
         case .noAnswer where wireReads == true:
             return ["Result: Hammer can read \(name)'s ID info (EDID) over this connection,",
                     "but its control channel (DDC/CI) doesn't answer. Try these, checking again after each:",
@@ -967,8 +974,8 @@ struct MonitorMenu: Equatable {
         if connections == 0 && answers != true {
             menu.hints.append("Can't find the Dell's port; trying the Mac's default.")
         } else if answers == false && hdmiAdapter {
-            menu.hints += ["The Dell is on HDMI through a USB-C adapter or cable,",
-                           "which blocks control. Use USB-C to USB-C instead."]
+            menu.hints += ["The Dell is on one of its HDMI ports, which blocks",
+                           "control. Use its DisplayPort or USB-C port instead."]
         } else if answers == false {
             menu.hints.append("The Dell isn't answering Hammer.")
         }

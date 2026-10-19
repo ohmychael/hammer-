@@ -22,7 +22,7 @@ Hammer finds which of the Mac's display connections the monitor is actually on (
 
 - **USB-C or DisplayPort, straight into the Mac**, works best.
 - **HDMI** works on most Macs. On M1-era Macs the HDMI port goes through a converter chip, and Hammer talks through it the way m1ddc does.
-- **USB-C to HDMI cables, adapters and hubs** usually don't pass brightness control: the converter inside drops it. Hammer spots this from the monitor's ID info (EDID) and says so. Use a USB-C to USB-C cable into the monitor's USB-C port instead (the U3818DW comes with one), then choose Menu → Input Source → USB Type-C on the Dell.
+- **USB-C to HDMI cables, adapters and hubs** usually don't pass brightness control: the converter inside drops it. Hammer spots this from the monitor's ID info (EDID) and says so. What matters is which port on the *monitor* the cable goes into: use its DisplayPort or USB-C port, never HDMI. Either a USB-C to USB-C cable into the monitor's USB-C port (the U3818DW comes with one; then Menu → Input Source → USB Type-C), or a USB-C to DisplayPort adapter with a DisplayPort cable into the monitor's DP port (one comes in the box too; then Input Source → DP). A DisplayPort to HDMI cable still lands on HDMI.
 - **DisplayLink docks, AirPlay and Sidecar** can't carry brightness control. Hammer says so in the menu.
 - **DDC/CI** has to be on in the monitor's own menu. On the Dell U3818DW: Menu → Others → DDC/CI → On.
 - **Locked brightness:** on the U3818DW, Uniformity Compensation (Menu → Display) locks Brightness and Contrast in the Standard and Color Temp. modes, and Dynamic Contrast locks Brightness in Game and Movie. The monitor then ignores Hammer as it does its own buttons (its Brightness/Contrast item is grayed out). Turn them off.

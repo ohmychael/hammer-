@@ -939,9 +939,29 @@ empty = FakeMonitor(); empty.writeStatus = Int32(bitPattern: 0xE00002C0)
 check = runCheck(proEntries, proScreens, [301: empty, 401: dell])
 expect(check.verdict == .noAnswer && !check.ports[0].port.throughHDMIAdapter, "the Mac's own HDMI port isn't \"an adapter\"")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, hdmiAdapter: true)
-expect(state.sliders && state.hints.first == "The Dell is on HDMI through a USB-C adapter or cable,", "menu: names the adapter")
+expect(state.sliders && state.hints == ["The Dell is on one of its HDMI ports, which blocks",
+                                        "control. Use its DisplayPort or USB-C port instead."], "menu: says to leave HDMI")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: true, hdmiAdapter: true)
 expect(state.hints.isEmpty, "menu: an adapter that works isn't mentioned")
+
+// What the user had next: a USB-C to DisplayPort adapter, then HDMI into the Dell. macOS calls
+// the link "DP → HDMI" (no M1 converter) and refuses to send (e0114000).
+let belkinEntries = [framebuffer(300, "DELL U3818DW", display: true, transport: "DP → HDMI"),
+                     proxy(301, path: "IOService:/x/dcpext0@1/y")]
+dell = FakeMonitor(); dell.writeStatus = Int32(bitPattern: 0xE0114000); dell.edid = makeEDID("DELL U3818DW", hdmi: true)
+check = runCheck(belkinEntries, lidClosed, [301: dell])
+let belkinAdvice = check.advice.joined(separator: "\n")
+expect(check.verdict == .hdmiAdapter && check.ports[0].port.throughHDMIAdapter
+       && check.text.contains("DELL U3818DW (dcpext0, DP → HDMI)") && check.text.contains("Sent: no (error e0114000)"),
+       "USB-C, then HDMI into the monitor, reported as DP → HDMI: the adapter case\n\(check.text)")
+expect(belkinAdvice.contains("plugged into one of its HDMI ports") && belkinAdvice.contains("DisplayPort cable into the monitor's DP port")
+       && belkinAdvice.contains("A DisplayPort to HDMI cable still lands on HDMI") && !belkinAdvice.contains("This Mac's HDMI port"),
+       "says to use the monitor's DP or USB-C port, not that the Mac's own HDMI port is the problem:\n\(belkinAdvice)")
+// The same, but the monitor's ID info doesn't say which input: no guessing about adapters.
+dell = FakeMonitor(); dell.writeStatus = Int32(bitPattern: 0xE0114000); dell.edid = makeEDID("DELL U3818DW")
+check = runCheck(belkinEntries, lidClosed, [301: dell])
+expect(check.verdict == .cantSend && check.advice.joined().contains("Connect to the monitor's DisplayPort or USB-C port instead (not HDMI)")
+       && !check.advice.joined().contains("This Mac's HDMI port"), "HDMI link, input unknown: still points at DP or USB-C\n\(check.text)")
 
 
 // MARK: YouTube player: links
