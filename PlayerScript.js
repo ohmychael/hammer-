@@ -50,11 +50,13 @@
   style.textContent = `
     html.hammer-mini, html.hammer-mini body { background: #000 !important; overflow: hidden !important; }
     html.hammer-mini body * { visibility: hidden !important; transform: none !important; filter: none !important;
-      contain: none !important; perspective: none !important; backdrop-filter: none !important; }
+      contain: none !important; perspective: none !important; backdrop-filter: none !important;
+      will-change: auto !important; container-type: normal !important; content-visibility: visible !important; }
     html.hammer-mini video[data-hammer-main] { visibility: visible !important; position: fixed !important;
       inset: 0 !important; left: 0 !important; top: 0 !important; width: 100vw !important; height: 100vh !important;
       max-width: none !important; max-height: none !important; margin: 0 !important;
-      object-fit: contain !important; background: #000 !important; z-index: 2147483647 !important; }`;
+      object-fit: contain !important; background: #000 !important; z-index: 2147483647 !important;
+      pointer-events: auto !important; clip-path: none !important; opacity: 1 !important; }`;
   (document.head || document.documentElement).appendChild(style);
 
   window.__hammer = {

@@ -116,6 +116,13 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         }
     }
 
+    /// Runs JavaScript in the page and returns a text result (for the self-test).
+    func evaluateString(_ script: String) async -> String? {
+        await withCheckedContinuation { continuation in
+            web.evaluateJavaScript(script) { result, _ in continuation.resume(returning: result as? String) }
+        }
+    }
+
     /// Pictures of the dropdown or the mini player, for the self-test.
     func snapshot(completion: @escaping (NSImage?) -> Void) {
         let window = place == .mini ? mini : dropdown
@@ -671,6 +678,24 @@ final class PlayerCheck: NSObject, NSApplicationDelegate {
                 && at(innerWidth / 2, innerHeight / 2) && at(5, 5) && at(innerWidth - 5, innerHeight - 5); })()
             """)
         expect(fills == true, "the video fills the mini player, nothing on top")
+        if fills != true {
+            let details = await player.evaluateString("""
+                (() => { const v = document.querySelector('video[data-hammer-main]'); if (!v) return 'no marked video';
+                  const r = v.getBoundingClientRect(), cs = getComputedStyle(v);
+                  const name = (e) => e ? e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') + (e.className && e.className.baseVal === undefined ? '.' + String(e.className).split(' ').slice(0, 2).join('.') : '') : 'none';
+                  const traps = [];
+                  for (let e = v.parentElement; e; e = e.parentElement) { const s = getComputedStyle(e);
+                    const t = [s.transform !== 'none' && 'transform', s.filter !== 'none' && 'filter', s.contain !== 'none' && 'contain:' + s.contain,
+                      s.willChange !== 'auto' && 'will-change:' + s.willChange, s.containerType && s.containerType !== 'normal' && 'container:' + s.containerType,
+                      s.perspective !== 'none' && 'perspective'].filter(Boolean);
+                    if (t.length) traps.push(name(e) + '(' + t.join(',') + ')'); }
+                  return JSON.stringify({ rect: [r.x, r.y, r.width, r.height].map(Math.round), viewport: [innerWidth, innerHeight],
+                    position: cs.position, visibility: cs.visibility, pointer: cs.pointerEvents, display: cs.display,
+                    center: name(document.elementFromPoint(innerWidth / 2, innerHeight / 2)),
+                    corner: name(document.elementFromPoint(5, 5)), traps }); })()
+                """)
+            note("       details: \(details ?? "none")")
+        }
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         await save("mini")
 
