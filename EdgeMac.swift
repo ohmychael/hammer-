@@ -363,7 +363,9 @@ enum EdgeCheck {
                 }
             }
         }
-        if !launched && found == nil && macOSIsAsking() {      // Edge never started, and macOS has a question up
+        // Edge put no window on screen at all, and macOS has its question up (Edge's process
+        // can exist meanwhile, waiting for the answer).
+        if found == nil && edgeWindows().isEmpty && macOSIsAsking() {
             // A copy of Edge nobody has opened yet: macOS asks "Are you sure you want to open it?"
             // first, and only a person can answer. (On your Mac, you did the first time you used Edge.)
             note("  SKIPPED opening the window: macOS is asking whether to open Edge for the first time.")
