@@ -132,16 +132,12 @@ enum PlayerGeometry {
     static let miniWidth: CGFloat = 400
     static let minMiniWidth: CGFloat = 240
 
-    /// Just under the menu bar, its right edge lined up with the menu bar icon
-    /// (or the screen's right edge), shrunk to fit and kept on screen.
-    static func dropdown(size: CGSize = dropdownSize, visible: CGRect, anchorMaxX: CGFloat?,
-                         margin: CGFloat = 8) -> CGRect {
-        let width = min(max(size.width, minDropdownSize.width), visible.width - 2 * margin)
-        let height = min(max(size.height, minDropdownSize.height), visible.height - 2 * margin)
-        let right = min(anchorMaxX ?? visible.maxX - margin, visible.maxX - margin)
-        let x = max(visible.minX + margin, right - width)
-        let y = visible.maxY - 4 - height
-        return CGRect(x: x, y: y, width: width, height: height)
+    /// Flush in the screen's top-right corner, right under the menu bar (the
+    /// visible frame's top-right corner), shrunk to fit a small screen.
+    static func dropdown(size: CGSize = dropdownSize, visible: CGRect) -> CGRect {
+        let width = min(max(size.width, minDropdownSize.width), visible.width)
+        let height = min(max(size.height, minDropdownSize.height), visible.height)
+        return CGRect(x: visible.maxX - width, y: visible.maxY - height, width: width, height: height)
     }
 
     /// The mini player's first place: the bottom-right corner, 16:9.
