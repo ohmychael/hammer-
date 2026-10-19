@@ -22,14 +22,20 @@
 
   // A video page: the player's video can be there before it has loaded anything.
   const onVideoPage = () => /^\/(watch|shorts\/|live\/|embed\/)/.test(location.pathname || '');
+  // Muted previews in the feed don't count; a video with sound does, on any page.
+  const counts = (v) => !!v && (onVideoPage() || !v.muted);
+  // YouTube marks its player while an ad plays. Hammer never skips or seeks ads.
+  const adShowing = () => !!document.querySelector('.ad-showing, .ad-interrupting');
 
   // Tells Hammer what's going on, when it changes.
   let last = '';
   const report = () => {
     const v = mainVideo();
+    const real = counts(v);
     const state = {
-      playing: !!v && !v.paused && !v.ended,
-      hasVideo: !!v && (onVideoPage() || v.duration > 0 || v.readyState > 0),
+      playing: real && !v.paused && !v.ended,
+      hasVideo: real && (onVideoPage() || v.duration > 0 || v.readyState > 0),
+      ad: real && adShowing(),
       title: document.title || '',
     };
     const key = JSON.stringify(state);
@@ -51,7 +57,8 @@
     html.hammer-mini, html.hammer-mini body { background: #000 !important; overflow: hidden !important; }
     html.hammer-mini body * { visibility: hidden !important; transform: none !important; filter: none !important;
       contain: none !important; perspective: none !important; backdrop-filter: none !important;
-      will-change: auto !important; container-type: normal !important; content-visibility: visible !important; }
+      will-change: auto !important; container-type: normal !important; content-visibility: visible !important;
+      opacity: 1 !important; clip-path: none !important; mask: none !important; -webkit-mask: none !important; }
     html.hammer-mini video[data-hammer-main] { visibility: visible !important; position: fixed !important;
       inset: 0 !important; left: 0 !important; top: 0 !important; width: 100vw !important; height: 100vh !important;
       max-width: none !important; max-height: none !important; margin: 0 !important;
@@ -83,11 +90,13 @@
       return true;
     },
     pause() { const v = mainVideo(); if (v) v.pause(); },
+    // Not during an ad: the mini player hides YouTube's own ad controls, so it mustn't skip one.
     seek(seconds) {
       const v = mainVideo();
-      if (!v) return;
+      if (!v || adShowing()) return false;
       const end = v.duration > 0 ? v.duration : Infinity;
       v.currentTime = Math.min(end, Math.max(0, v.currentTime + seconds));
+      return true;
     },
     hasVideo() { return !!mainVideo(); },
     report,

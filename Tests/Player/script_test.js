@@ -13,9 +13,9 @@ function makeBox(parent) {
   return { parentElement: parent, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, removeAttribute(k) { delete this.attrs[k]; } };
 }
 
-function makeVideo({ paused = true, width = 100, height = 56, duration = 100, readyState = 4, parent = null } = {}) {
+function makeVideo({ paused = true, width = 100, height = 56, duration = 100, readyState = 4, parent = null, muted = false } = {}) {
   return {
-    parentElement: parent, paused, ended: false, currentTime: 0, duration, readyState, attrs: {}, plays: 0,
+    parentElement: parent, paused, muted, ended: false, currentTime: 0, duration, readyState, attrs: {}, plays: 0,
     getBoundingClientRect() { return { width, height }; },
     setAttribute(k, v) { this.attrs[k] = v; },
     removeAttribute(k) { delete this.attrs[k]; },
@@ -35,6 +35,10 @@ function makePage(videos, pathname = '/watch') {
     documentElement: { classList: { toggle(c, on) { if (on) classes.add(c); else classes.delete(c); } } },
     createElement(tag) { return { tag }; },
     addEventListener(type, fn, capture) { (listeners[type] = listeners[type] || []).push({ fn, capture }); },
+    querySelector(selector) {
+      if (selector === '.ad-showing, .ad-interrupting') return page.ad ? {} : null;
+      throw new Error('unexpected selector ' + selector);
+    },
     querySelectorAll(selector) {
       if (selector === 'video') return page.videos;
       if (selector === 'video[data-hammer-main]') return page.videos.filter((v) => 'data-hammer-main' in v.attrs);
@@ -130,6 +134,27 @@ expect(page.posted[0].hasVideo === false, 'an unloaded preview on the home page 
 page = makePage([makeVideo({ duration: NaN, readyState: 0 })], '/shorts/abc');
 page.run();
 expect(page.posted[0].hasVideo === true, 'shorts count');
+
+// The home feed: a muted preview playing doesn't count; a video with sound does (YouTube's own little player).
+page = makePage([makeVideo({ paused: false, muted: true })], '/');
+page.run();
+expect(page.posted[0].playing === false && page.posted[0].hasVideo === false, 'a muted feed preview is ignored');
+page.videos[0].muted = false;
+page.tick();
+expect(page.posted[1].playing === true && page.posted[1].hasVideo === true, 'a video with sound counts on any page');
+
+// Ads: reported, and never skipped.
+const adVideo = makeVideo({ paused: false });
+page = makePage([adVideo], '/watch');
+page.ad = true;
+page.run();
+adVideo.currentTime = 3;
+expect(page.posted[0].ad === true, 'an ad playing is reported');
+expect(page.window.__hammer.seek(10) === false && adVideo.currentTime === 3, 'no seeking during an ad');
+page.ad = false;
+expect(page.window.__hammer.seek(10) === true && adVideo.currentTime === 13, 'seeking works again after it');
+page.tick();
+expect(page.posted[page.posted.length - 1].ad === false, 'the end of the ad is reported');
 
 // No video on the page (search results, home): nothing breaks.
 page = makePage([], '/results');

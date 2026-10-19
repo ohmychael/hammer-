@@ -1028,6 +1028,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var colorTargetID: String?
     private var hotKeyRef: EventHotKeyRef?
     private var playerHotKeyRef: EventHotKeyRef?
+    private var playerHotKeyWorks = true                 // false if another app has Control-Option-Y
     // YouTube mini player (Player.swift, PlayerMac.swift), made the first time it's used.
     private var youTube: YouTubePlayer?
 
@@ -1095,8 +1096,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RegisterEventHotKey(UInt32(kVK_ANSI_H), UInt32(controlKey | optionKey), id,
                             GetApplicationEventTarget(), 0, &hotKeyRef)
         let playerID = EventHotKeyID(signature: OSType(0x484D_4D52), id: 2)
-        RegisterEventHotKey(UInt32(kVK_ANSI_Y), UInt32(controlKey | optionKey), playerID,
-                            GetApplicationEventTarget(), 0, &playerHotKeyRef)
+        playerHotKeyWorks = RegisterEventHotKey(UInt32(kVK_ANSI_Y), UInt32(controlKey | optionKey), playerID,
+                                                GetApplicationEventTarget(), 0, &playerHotKeyRef) == noErr
     }
 
     func handleHotKey(_ id: UInt32) {
@@ -1137,9 +1138,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(label("YouTube"))
         let open = action(youTube?.place == .mini ? "Back to the YouTube Player" : "YouTube Player",
                           #selector(toggleYouTube))
-        open.keyEquivalent = "y"
-        open.keyEquivalentModifierMask = [.control, .option]
+        if playerHotKeyWorks {
+            open.keyEquivalent = "y"
+            open.keyEquivalentModifierMask = [.control, .option]
+        }
         menu.addItem(open)
+        if !playerHotKeyWorks { menu.addItem(hint("Another app has Control-Option-Y, so it's menu only.")) }
         menu.addItem(action("Play Copied Link", #selector(playCopiedLink)))
         if let youTube, youTube.place != .hidden, !youTube.title.isEmpty {
             menu.addItem(hint((youTube.playing ? "Playing: " : "Paused: ") + truncated(youTube.title, 44)))

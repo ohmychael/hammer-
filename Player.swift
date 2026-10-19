@@ -60,15 +60,16 @@ enum YouTubeLink {
         text.count == 11 && text.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
     }
 
-    /// "90", "90s", "1m30s", "1h2m3s" → seconds.
+    /// "90", "90s", "1m30s", "1h2m3s" → seconds. Absurd numbers give nil, never a crash.
     static func parseTime(_ text: String) -> Int? {
-        if let seconds = Int(text), seconds >= 0 { return seconds }
+        guard text.count <= 24 else { return nil }
+        if text.allSatisfy(\.isNumber) { return text.count <= 7 ? Int(text) : nil }
         var total = 0, number = "", sawUnit = false
         for character in text.lowercased() {
-            if character.isNumber {
+            if character.isASCII && character.isNumber {
                 number.append(character)
             } else {
-                guard let value = Int(number) else { return nil }
+                guard number.count <= 7, let value = Int(number) else { return nil }     // up to 9,999,999
                 switch character {
                 case "h": total += value * 3600
                 case "m": total += value * 60
@@ -92,17 +93,32 @@ enum YouTubeLink {
 
 enum PlayerNavigation: Equatable {
     case stay            // YouTube, and Google's sign-in and consent pages
-    case openInBrowser   // anything else (links in video descriptions, ads)
+    case openInBrowser   // a web link you clicked (in a video description, an ad)
+    case block           // anything else: links to other apps, files, pages nobody clicked
 
-    static func decide(_ url: URL) -> PlayerNavigation {
-        guard let scheme = url.scheme?.lowercased() else { return .stay }
+    /// `clicked`: you clicked a link (or a button that opens a window), rather
+    /// than the page going there by itself.
+    static func decide(_ url: URL, clicked: Bool) -> PlayerNavigation {
+        guard let scheme = url.scheme?.lowercased() else { return .block }
         if scheme == "about" || scheme == "blob" || scheme == "data" { return .stay }
-        guard scheme == "https" || scheme == "http", let host = url.host?.lowercased() else { return .openInBrowser }
-        if YouTubeLink.isYouTubeHost(host) || host == "youtu.be" { return .stay }
+        guard scheme == "https" || scheme == "http", let host = url.host?.lowercased() else { return .block }
+        if staysInside(host) { return .stay }
+        return clicked ? .openInBrowser : .block
+    }
+
+    static func staysInside(_ host: String) -> Bool {
+        if YouTubeLink.isYouTubeHost(host) || host == "youtu.be" { return true }
         // Signing in to YouTube goes through these.
-        let google = ["accounts.google.com", "consent.google.com", "myaccount.google.com", "www.google.com"]
-        if google.contains(host) || host.hasPrefix("accounts.google.") { return .stay }
-        return .openInBrowser
+        let google = ["accounts.google.com", "consent.google.com", "myaccount.google.com", "gds.google.com", "www.google.com"]
+        if google.contains(host) { return true }
+        // Google's sign-in in other countries: accounts.google.de, .co.uk, .com.au …
+        let parts = host.split(separator: ".").map(String.init)
+        guard parts.count >= 3, parts[0] == "accounts", parts[1] == "google" else { return false }
+        let country = Array(parts.dropFirst(2))
+        let isCountry = { (code: String) in code.count == 2 && code.allSatisfy { $0.isASCII && $0.isLetter } }
+        if country.count == 1 { return isCountry(country[0]) }
+        if country.count == 2 { return ["co", "com"].contains(country[0]) && isCountry(country[1]) }
+        return false
     }
 }
 

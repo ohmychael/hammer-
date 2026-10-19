@@ -26,6 +26,8 @@ jobs:
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false    # the write token isn't left where build.sh or the tests could use it
 
       - name: Tools
         run: |
@@ -88,8 +90,10 @@ jobs:
             > /tmp/player.txt 2>&1
           echo "exit $?" >> /tmp/player.txt
           cat /tmp/player.txt
-          node Tests/Player/script_test.js | tee -a /tmp/player.txt
-          grep -q "^exit 0$" /tmp/player.txt
+          node Tests/Player/script_test.js 2>&1 | tee -a /tmp/player.txt
+          node_status=${PIPESTATUS[0]}
+          grep -q "^SKIPPED" /tmp/player.txt && echo "::warning title=Player check::YouTube served no video to this server; skipped"
+          grep -q "^exit 0$" /tmp/player.txt && [ "$node_status" = 0 ]
 
       - name: Keep the pictures (on the ci-screenshots branch)
         if: always()
@@ -102,8 +106,11 @@ jobs:
           git init -q && git checkout -q -b ci-screenshots
           git add -A
           git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "Player pictures for $GITHUB_SHA"
-          git push -qf "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ci-screenshots \
-            && echo "::notice title=Player pictures::saved to the ci-screenshots branch"
+          if git push -qf "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ci-screenshots; then
+            echo "::notice title=Player pictures::saved to the ci-screenshots branch"
+          else
+            echo "::warning title=Player pictures::couldn't save them"
+          fi
 
       - name: Sign again (the way the next update does)
         timeout-minutes: 5

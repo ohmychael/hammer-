@@ -969,6 +969,10 @@ expect(YouTubeLink.parseTime("90") == 90 && YouTubeLink.parseTime("1h2m3s") == 3
        && YouTubeLink.parseTime("90s") == 90, "times")
 expect(YouTubeLink.parseTime("") == nil && YouTubeLink.parseTime("1x") == nil && YouTubeLink.parseTime("1m30") == nil
        && YouTubeLink.parseTime("-5") == nil && YouTubeLink.parseTime("m") == nil, "bad times")
+expect(YouTubeLink.parseTime("9999999999999999h") == nil && YouTubeLink.parseTime("99999999999999999999") == nil
+       && YouTubeLink.parseTime("9999999h9999999m9999999s") == 9999999 * 3661 && YouTubeLink.parseTime("١٢") == nil,
+       "absurd times give nil, never a crash")
+expect(playerVideo("https://youtu.be/dQw4w9WgXcQ?t=9999999999999999h") == "dQw4w9WgXcQ", "a link with an absurd time still plays")
 expect(YouTubeLink.watchURL(id: "dQw4w9WgXcQ").absoluteString == "https://m.youtube.com/watch?v=dQw4w9WgXcQ"
        && YouTubeLink.watchURL(id: "dQw4w9WgXcQ", start: 90).absoluteString == "https://m.youtube.com/watch?v=dQw4w9WgXcQ&t=90s",
        "watch URLs")
@@ -977,15 +981,26 @@ expect(YouTubeLink.searchURL("lofi & chill").absoluteString == "https://m.youtub
 
 // MARK: YouTube player: which pages stay inside it
 
-func playerDecide(_ text: String) -> PlayerNavigation { PlayerNavigation.decide(URL(string: text)!) }
+func playerDecide(_ text: String, clicked: Bool = true) -> PlayerNavigation {
+    PlayerNavigation.decide(URL(string: text)!, clicked: clicked)
+}
 expect(playerDecide("https://m.youtube.com/watch?v=x") == .stay && playerDecide("https://www.youtube.com/") == .stay
-       && playerDecide("https://youtu.be/dQw4w9WgXcQ") == .stay, "YouTube stays")
+       && playerDecide("https://youtu.be/dQw4w9WgXcQ") == .stay && playerDecide("https://m.youtube.com/", clicked: false) == .stay,
+       "YouTube stays")
 expect(playerDecide("https://accounts.google.com/ServiceLogin") == .stay && playerDecide("https://consent.youtube.com/m") == .stay
-       && playerDecide("https://accounts.google.co.uk/x") == .stay, "signing in stays")
+       && playerDecide("https://accounts.google.co.uk/x") == .stay && playerDecide("https://accounts.google.de/x") == .stay
+       && playerDecide("https://accounts.google.com.au/x") == .stay && playerDecide("https://gds.google.com/web/x") == .stay
+       && playerDecide("https://accounts.youtube.com/x") == .stay, "signing in stays")
+expect(playerDecide("https://accounts.google.evil.example/") == .openInBrowser
+       && playerDecide("https://accounts.google.co.evil/") == .openInBrowser
+       && playerDecide("https://accounts.google.c0m.au/") == .openInBrowser, "look-alike sign-in pages don't stay")
 expect(playerDecide("about:blank") == .stay, "blank pages stay")
 expect(playerDecide("https://example.com/merch") == .openInBrowser && playerDecide("https://www.youtube.com.evil.example/") == .openInBrowser
-       && playerDecide("http://amzn.to/x") == .openInBrowser, "other sites open in your browser")
-expect(playerDecide("mailto:a@b.c") == .openInBrowser && playerDecide("itms-apps://x") == .openInBrowser, "other kinds of links too")
+       && playerDecide("http://amzn.to/x") == .openInBrowser, "web links you click open in your browser")
+expect(playerDecide("https://example.com/", clicked: false) == .block, "a page going elsewhere by itself is stopped")
+expect(playerDecide("mailto:a@b.c") == .block && playerDecide("itms-apps://x") == .block && playerDecide("zoommtg://join") == .block
+       && playerDecide("file:///etc/hosts") == .block && playerDecide("youtube://watch?v=x") == .block
+       && playerDecide("x-apple.systempreferences:com.apple.preference") == .block, "links to other apps or files never open")
 
 // MARK: YouTube player: where the windows go
 
