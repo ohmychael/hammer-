@@ -20,8 +20,8 @@ function makeVideo({ paused = true, width = 100, height = 56, duration = 100, re
   };
 }
 
-function makePage(videos) {
-  const posted = [], listeners = {}, appended = [];
+function makePage(videos, pathname = '/watch') {
+  const posted = [], listeners = {}, appended = [], timers = [];
   const classes = new Set();
   const document = {
     title: 'Song - YouTube',
@@ -36,8 +36,13 @@ function makePage(videos) {
     },
   };
   const window = { webkit: { messageHandlers: { hammer: { postMessage(m) { posted.push(m); } } } } };
-  const page = { videos, posted, listeners, appended, classes, document, window };
-  page.run = () => vm.runInNewContext(source, { window, document, Array, Math, Infinity });
+  const location = { pathname };
+  const page = { videos, posted, listeners, appended, classes, document, window, timers, location };
+  page.run = () => vm.runInNewContext(source, {
+    window, document, location, Array, Math, Infinity, JSON,
+    setInterval: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+  });
+  page.tick = () => timers.forEach((t) => t.fn());
   page.fire = (type) => (listeners[type] || []).forEach((l) => l.fn());
   return page;
 }
@@ -51,6 +56,13 @@ expect(page.listeners.play.length === 1 && page.appended.length === 1, 'set up o
 expect(page.listeners.play[0].capture === true, 'listens on the way down (media events do not bubble)');
 expect(page.posted.length === 1 && page.posted[0].playing === false && page.posted[0].hasVideo === true
        && page.posted[0].title === 'Song - YouTube', 'reports when it starts: ' + JSON.stringify(page.posted[0]));
+
+expect(page.timers.length === 1 && page.timers[0].ms === 1500, 'looks again every 1.5 s');
+page.tick();
+expect(page.posted.length === 1, 'nothing changed: nothing sent');
+page.document.title = 'Next song - YouTube';
+page.tick();
+expect(page.posted.length === 2 && page.posted[1].title === 'Next song - YouTube', 'a new title is sent');
 
 // Picks the biggest video when none plays, the playing one when one does.
 const hammer = page.window.__hammer;
@@ -89,8 +101,19 @@ expect(hammer.mini(false) === false && !page.classes.has('hammer-mini')
        && page.videos.every((v) => !('data-hammer-main' in v.attrs)), 'mini off: back to normal');
 expect(/hammer-mini video\[data-hammer-main\]/.test(page.appended[0].textContent), 'the style targets the marked video');
 
+// A video page counts as having a video before anything has loaded; other pages don't.
+page = makePage([makeVideo({ duration: NaN, readyState: 0 })], '/watch');
+page.run();
+expect(page.posted[0].hasVideo === true, 'a watch page has a video before it loads');
+page = makePage([makeVideo({ duration: NaN, readyState: 0 })], '/');
+page.run();
+expect(page.posted[0].hasVideo === false, 'an unloaded preview on the home page does not count');
+page = makePage([makeVideo({ duration: NaN, readyState: 0 })], '/shorts/abc');
+page.run();
+expect(page.posted[0].hasVideo === true, 'shorts count');
+
 // No video on the page (search results, home): nothing breaks.
-page = makePage([]);
+page = makePage([], '/results');
 page.run();
 const empty = page.window.__hammer;
 expect(empty.toggle() === false && empty.hasVideo() === false && empty.mini(true) === false

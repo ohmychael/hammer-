@@ -20,18 +20,29 @@
     return pool.reduce((best, v) => (area(v) > area(best) ? v : best));
   };
 
+  // A video page: the player's video can be there before it has loaded anything.
+  const onVideoPage = () => /^\/(watch|shorts\/|live\/|embed\/)/.test(location.pathname || '');
+
+  // Tells Hammer what's going on, when it changes.
+  let last = '';
   const report = () => {
     const v = mainVideo();
-    post({
+    const state = {
       playing: !!v && !v.paused && !v.ended,
-      hasVideo: !!v && (v.duration > 0 || v.readyState > 0),
+      hasVideo: !!v && (onVideoPage() || v.duration > 0 || v.readyState > 0),
       title: document.title || '',
-    });
+    };
+    const key = JSON.stringify(state);
+    if (key === last) return;
+    last = key;
+    post(state);
   };
   // Media events don't bubble, but listeners on the way down (capture) see them.
-  for (const type of ['play', 'playing', 'pause', 'ended', 'emptied', 'loadedmetadata']) {
+  for (const type of ['play', 'playing', 'pause', 'ended', 'emptied', 'loadedmetadata', 'loadstart']) {
     document.addEventListener(type, report, true);
   }
+  // YouTube changes pages and titles without reloading: look again now and then.
+  setInterval(report, 1500);
 
   // Mini player: hide everything but the video, and make it fill the window.
   // Effects that would trap a fixed-position video inside its box are turned off.

@@ -649,7 +649,8 @@ final class PlayerCheck: NSObject, NSApplicationDelegate {
         expect(player.place == .dropdown, "the dropdown opens")
         let video = await wait(40) { self.player.hasVideo }
         expect(video, "the page script sees the video")
-        expect(!player.title.isEmpty, "it knows the title: \(player.title)")
+        let titled = await wait(10) { self.player.title.lowercased().contains("zoo") }
+        expect(titled, "it knows the title: \(player.title)")
         _ = await player.evaluateBool("window.__hammer ? window.__hammer.toggle() : false")
         let playing = await wait(20) { self.player.playing }
         note(playing ? "  ok   it plays" : "  note it didn't start playing here (fine on a server with no sound)")
@@ -661,6 +662,15 @@ final class PlayerCheck: NSObject, NSApplicationDelegate {
         expect(popped, "it pops out into the mini player")
         let onlyVideo = await player.evaluateBool("document.documentElement.classList.contains('hammer-mini')")
         expect(onlyVideo == true, "the mini player shows only the video")
+        // On YouTube's real page: the video fills the window and nothing covers it.
+        let fills = await player.evaluateBool("""
+            (() => { const v = document.querySelector('video[data-hammer-main]'); if (!v) return false;
+              const r = v.getBoundingClientRect();
+              const at = (x, y) => document.elementFromPoint(x, y) === v;
+              return r.width >= innerWidth - 1 && r.height >= innerHeight - 1
+                && at(innerWidth / 2, innerHeight / 2) && at(5, 5) && at(innerWidth - 5, innerHeight - 5); })()
+            """)
+        expect(fills == true, "the video fills the mini player, nothing on top")
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         await save("mini")
 
