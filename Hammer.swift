@@ -933,6 +933,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var monitorAttached = 0                  // ...with a monitor plugged in
     private var monitorHasDefault = false            // macOS's default connection is tried too
     private var monitorViaHDMIAdapter = false        // on HDMI through a USB-C adapter (blocks control)
+    private lazy var macModel = MacMonitors.mac().model   // e.g. "MacBookPro18,1"
     private var monitorMisses = 0                    // reads in a row with no answer
     private var monitorScreens: [MonitorScreen] = []
     private var monitorAnswers: Bool?                // nil until asked
@@ -1783,7 +1784,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         monitorCount = monitors.members.filter { !$0.port.isDefault }.count
         monitorHasDefault = monitors.members.contains { $0.port.isDefault }
         monitorAttached = monitors.members.filter { $0.port.attached }.count
-        monitorViaHDMIAdapter = monitors.members.contains { $0.port.attached && $0.port.throughHDMIAdapter }
+        let model = macModel
+        monitorViaHDMIAdapter = monitors.members.contains { $0.port.attached && $0.port.throughHDMIAdapter(onMac: model) }
         monitorScreens = scan.screens
         monitorGeneration += 1
         monitorAnswers = nil
