@@ -1117,13 +1117,15 @@ expect(EdgeYouTube.quoted("say \"hi\" \\ bye") == "\"say \\\"hi\\\" \\\\ bye\"",
 expect(EdgeYouTube.quoted("a\"\ndo shell script \"x") == "\"a\\\"do shell script \\\"x\"", "a line break can't start a new command")
 expect(EdgeYouTube.quoted("a\rb\tc\u{0}d\u{2028}e") == "\"abcde\"", "control characters dropped")
 
-let edgeFind = EdgeYouTube.findScript(prefix: "https://www.youtube.com/")
+let edgeFind = EdgeYouTube.findScript(prefixes: ["https://www.youtube.com/"] + EdgeYouTube.detours)
 expect(edgeFind.contains("tell application id \"com.microsoft.edgemac\"") && edgeFind.contains("mode of w is \"normal\"")
-       && edgeFind.contains("(count of tabs of w) is 1") && edgeFind.contains("starts with \"https://www.youtube.com/\"")
-       && edgeFind.contains("set found to found & ((id of w) as text)") && !edgeFind.contains("& (URL"),
-       "the find script checks inside Edge (ordinary windows, one tab, Hammer's address) and returns only numbers")
-expect(EdgeYouTube.findScript(prefix: "x\" & (do shell script \"y").contains("starts with \"x\\\" & (do shell script \\\"y\""),
+       && edgeFind.contains("(count of tabs of w) is 1")
+       && edgeFind.contains("if (u starts with \"https://www.youtube.com/\") or (u starts with \"https://consent.youtube.com/\") then")
+       && edgeFind.contains("set found to found & ((id of w) as text)") && !edgeFind.contains("& u"),
+       "the find script: ordinary windows, one tab, Hammer's address (or YouTube's cookie question); only numbers come back")
+expect(EdgeYouTube.findScript(prefixes: ["x\" & (do shell script \"y"]).contains("(u starts with \"x\\\" & (do shell script \\\"y\")"),
        "an address can't break out of the script")
+expect(EdgeYouTube.findScript(prefixes: []).contains("if false then"), "no addresses: matches nothing")
 expect(EdgeYouTube.parseIDs("57,58,\n") == [57, 58] && EdgeYouTube.parseIDs("") == [] && EdgeYouTube.parseIDs("x,3,,") == [3],
        "reads window numbers")
 expect(EdgeYouTube.newWindow(after: [12, 57, 58], before: [12]) == 58 && EdgeYouTube.newWindow(after: [12], before: [12]) == nil
@@ -1211,6 +1213,9 @@ final class FakeEdge: EdgeDriver {
     var failState: Int?                        // the state script fails with this error number
     var failFind: Int?                         // the find script fails with this error number
     var failShow: Int?
+    var failHide: Int?
+    var permissionOverride: EdgePermission?    // what macOS says, whatever the state
+    var redirect: String?                      // where YouTube sends a new window
     var stateReply: String?                    // the state script answers this instead
     var log: [String] = []
     var saved: [String: String] = [:]
@@ -1219,6 +1224,7 @@ final class FakeEdge: EdgeDriver {
     func running() -> String? { isRunning ? "edge-\(run)" : nil }
     func edgeInFront() -> Bool { inFront }
     func permission(ask: Bool) async -> EdgePermission {
+        if let permissionOverride { return permissionOverride }
         guard isRunning else { return .notRunning }
         if !asked && ask { asked = true; log.append("asked") }
         return asked ? answer : .notAsked
@@ -1231,7 +1237,7 @@ final class FakeEdge: EdgeDriver {
             for w in restores { add(w) }
         }
         if opensWindow, let app = arguments.first(where: { $0.hasPrefix("--app=") }) {
-            add(Win(tabs: 1, url: String(app.dropFirst(6))))
+            add(Win(tabs: 1, url: redirect ?? String(app.dropFirst(6))))
         }
         return true
     }
@@ -1272,10 +1278,16 @@ final class FakeEdge: EdgeDriver {
         if script.contains("set found to") {
             log.append("find")
             if let failFind { return .failed(number: failFind, message: "error (\(failFind))") }
-            guard let prefix = quotedText(after: "starts with ", in: script) else { return .failed(number: -2741, message: "bad find") }
+            var prefixes: [String] = []
+            var rest = Substring(script)
+            while let range = rest.range(of: "starts with \"") {
+                let text = rest[range.upperBound...].prefix { $0 != "\"" }
+                prefixes.append(String(text))
+                rest = rest[range.upperBound...]
+            }
             return .ok(order.filter { id in
                 let w = windows[id]!
-                return !w.inPrivate && w.tabs == 1 && w.url.hasPrefix(prefix)
+                return !w.inPrivate && w.tabs == 1 && prefixes.contains { w.url.hasPrefix($0) }
             }.map { "\($0)," }.joined())
         }
         if script.contains("return \"missing\"") {
@@ -1300,6 +1312,7 @@ final class FakeEdge: EdgeDriver {
             return .ok("")
         }
         if script.contains("to true") && script.contains("set minimized of window id") {
+            if let failHide { return .failed(number: failHide, message: "error (\(failHide))") }
             guard let id = number(after: "set minimized of window id ", in: script), windows[id] != nil else {
                 return .failed(number: -1728, message: "no window (-1728)") }
             windows[id]!.minimized = true
@@ -1355,7 +1368,7 @@ expect(fakeEdge.windows[4]!.bounds == [3080, 25, 3840, 485] && fakeEdge.order.fi
 for round in 1...3 {
     fakeEdge.log = []
     edgeOutcome = edgeToggle(edgeController)
-    expect(edgeOutcome == .hidden && fakeEdge.windows[4]!.minimized && fakeEdge.log == ["state", "hide 4"],
+    expect(edgeOutcome == .hidden(othersShown: true) && fakeEdge.windows[4]!.minimized && fakeEdge.log == ["state", "hide 4"],
            "round \(round), in front: tucked away \(fakeEdge.log)")
     fakeEdge.log = []
     edgeOutcome = edgeToggle(edgeController)
@@ -1366,7 +1379,7 @@ expect(fakeEdge.windows.count == 4 && !fakeEdge.log.contains { $0.hasPrefix("lau
 
 // A picture-in-picture window in front of it: still counts as in front among Edge's windows.
 fakeEdge.pictureInPicture = true
-expect(edgeToggle(edgeController) == .hidden, "picture in picture in front: the shortcut still tucks it away")
+expect(edgeToggle(edgeController) == .hidden(othersShown: true), "picture in picture in front: the shortcut still tucks it away")
 expect(edgeToggle(edgeController) == .shown, "…and brings it back")
 fakeEdge.pictureInPicture = false
 
@@ -1484,6 +1497,40 @@ let slowController = EdgeController(driver: slowEdge)
 slowController.findFor = 0
 if case .failed = edgeToggle(slowController) {} else { expect(false, "out of time: says so") }
 expect(!slowEdge.log.contains("find"), "…and stops looking when time's up")
+
+// Only Hammer's window open in Edge: after tucking it away you go back to your app (others shown: no).
+let loneEdge = FakeEdge()
+let loneController = EdgeController(driver: loneEdge)
+expect(edgeToggle(loneController) == .opened && edgeToggle(loneController) == .hidden(othersShown: false),
+       "the only Edge window: tucked away, nothing else of Edge's showing")
+loneEdge.add(FakeEdge.Win(tabs: 3, url: "https://www.bing.com/", minimized: true))
+expect(edgeToggle(loneController) == .shown && edgeToggle(loneController) == .hidden(othersShown: false),
+       "a minimized Edge window doesn't count as showing")
+
+// YouTube sends the new window to its cookie question before Hammer looks: still found.
+let consentEdge = FakeEdge()
+consentEdge.redirect = "https://consent.youtube.com/m?continue=https%3A%2F%2Fwww.youtube.com%2F"
+expect(edgeToggle(EdgeController(driver: consentEdge)) == .opened && EdgeController(driver: consentEdge).savedWindow(for: "edge-1") == 1,
+       "redirected to YouTube's cookie question: still Hammer's window")
+let elsewhereEdge = FakeEdge()
+elsewhereEdge.redirect = "https://example.com/"
+if case .failed = edgeToggle(EdgeController(driver: elsewhereEdge)) {} else { expect(false, "a window somewhere else entirely isn't taken") }
+
+// macOS says Edge isn't running though it seemed to be (it just quit): started again.
+let flickerEdge = FakeEdge()
+flickerEdge.isRunning = true
+flickerEdge.asked = true
+flickerEdge.permissionOverride = .notRunning
+flickerEdge.log = []
+_ = edgeToggle(EdgeController(driver: flickerEdge))
+expect(flickerEdge.log.first == "launch --app=https://www.youtube.com/", "Edge quit just then: opened again \(flickerEdge.log)")
+
+// Tucking away fails: said so.
+let stuckEdge = FakeEdge()
+let stuckController = EdgeController(driver: stuckEdge)
+_ = edgeToggle(stuckController)
+stuckEdge.failHide = -10000
+expect(edgeToggle(stuckController) == .failed(EdgeYouTube.plainError(-10000)), "hiding fails: said in plain words")
 
 // A remembered window from a bad save is ignored.
 let oddEdge = FakeEdge()

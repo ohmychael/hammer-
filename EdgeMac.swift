@@ -140,6 +140,18 @@ final class MacEdgeDriver: EdgeDriver, @unchecked Sendable {
         }
     }
 
+    /// Back to `app` after the YouTube window is tucked away, making sure Hammer
+    /// (which has no window to type into) isn't left in front.
+    static func giveBackFocus(to app: NSRunningApplication) async {
+        await handFocus(to: app)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        await MainActor.run {
+            guard NSWorkspace.shared.frontmostApplication != app else { return }
+            if #available(macOS 14, *) { _ = app.activate() } else { _ = app.activate(options: []) }
+            if NSApp.isActive { NSApp.deactivate() }        // never stay in front with nothing to show
+        }
+    }
+
     /// Makes `app` the active app. Since macOS 14 an app may only pass the focus on
     /// while it has it, so Hammer takes it first (you just pressed its shortcut).
     static func handFocus(to app: NSRunningApplication) async {
@@ -208,7 +220,7 @@ final class EdgePlayer {
     private let useHammerPlayer: () -> Void
     private var busySince: Date?
     private var toldAboutPermission = false
-    private var cameFrom: NSRunningApplication?     // the app you were in before YouTube came forward
+    private var cameFrom: NSRunningApplication?     // the app you were in when YouTube last came forward
 
     /// `screen`: the menu bar icon's screen. `useHammerPlayer`: switch to Hammer's own player.
     init(screen: @escaping () -> NSScreen?, useHammerPlayer: @escaping () -> Void) {
@@ -222,15 +234,14 @@ final class EdgePlayer {
         // its own time limit. Only if something got stuck anyway is it forgotten (ten minutes).
         if let since = busySince, Date().timeIntervalSince(since) < 600 { return }
         busySince = Date()
-        if let front = NSWorkspace.shared.frontmostApplication, front.bundleIdentifier != EdgeYouTube.bundleID,
-           front != NSRunningApplication.current {
-            cameFrom = front
-        }
+        let front = NSWorkspace.shared.frontmostApplication
+        let from = front?.bundleIdentifier == EdgeYouTube.bundleID || front == NSRunningApplication.current ? nil : front
         driver.prepare(screen: screen())
         let controller = self.controller
         Task { @MainActor in
             let outcome = await controller.toggle(play: url)
             self.busySince = nil
+            if outcome == .opened || outcome == .shown { self.cameFrom = from }   // where to go back to on the next hide
             self.handle(outcome)
         }
     }
@@ -239,11 +250,14 @@ final class EdgePlayer {
         switch outcome {
         case .opened, .shown:
             break
-        case .hidden:
-            // Typing goes back to where you were, not to an Edge window you can't see.
-            if let app = cameFrom, !app.isTerminated,
+        case .hidden(let othersShown):
+            // Typing goes back to the app you came from, not to an Edge window you can't
+            // see. If Edge still shows other windows, you were working in Edge: stay there.
+            let app = cameFrom
+            cameFrom = nil
+            if let app, !app.isTerminated, !othersShown,
                NSWorkspace.shared.frontmostApplication?.bundleIdentifier == EdgeYouTube.bundleID {
-                Task { await MacEdgeDriver.handFocus(to: app) }
+                Task { await MacEdgeDriver.giveBackFocus(to: app) }
             }
         case .notInstalled:
             useHammerPlayer()
@@ -313,7 +327,7 @@ enum EdgeCheck {
 
         // Compiling loads Edge's dictionary from its app; nothing is sent to Edge.
         let link = EdgeYouTube.watchURL(id: "jNQXAC9IVRw", start: 5)
-        let scripts = [("find", EdgeYouTube.findScript(prefix: EdgeYouTube.matchPrefix(EdgeYouTube.home))),
+        let scripts = [("find", EdgeYouTube.findScript(prefixes: [EdgeYouTube.matchPrefix(EdgeYouTube.home)] + EdgeYouTube.detours)),
                        ("state", EdgeYouTube.stateScript(id: 1)),
                        ("show", EdgeYouTube.showScript(id: 1, bounds: [3080, 25, 3840, 485])),
                        ("hide", EdgeYouTube.hideScript(id: 1)), ("play", EdgeYouTube.goScript(id: 1, url: link)),
@@ -342,7 +356,7 @@ enum EdgeCheck {
                 }
             }
         }
-        if found == nil && macOSIsAsking() {
+        if !launched && found == nil && macOSIsAsking() {      // Edge never started, and macOS has a question up
             // A copy of Edge nobody has opened yet: macOS asks "Are you sure you want to open it?"
             // first, and only a person can answer. (On your Mac, you did the first time you used Edge.)
             note("  SKIPPED opening the window: macOS is asking whether to open Edge for the first time.")

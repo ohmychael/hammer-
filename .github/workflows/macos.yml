@@ -96,6 +96,7 @@ jobs:
           grep -q "^exit 0$" /tmp/player.txt && [ "$node_status" = 0 ]
 
       - name: YouTube in Edge check (scripts compile against Edge, an app window opens)
+        if: ${{ !cancelled() }}            # also when YouTube was difficult in the step before
         timeout-minutes: 3
         run: |
           set +e
@@ -107,8 +108,8 @@ jobs:
           pkill -x "Microsoft Edge" || true
           /usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' ~/Applications/Hammer.app/Contents/Info.plist \
             | tee /tmp/edge-usage.txt
-          grep -q "Microsoft Edge" /tmp/edge-usage.txt         # without it, macOS would refuse without asking
-          grep -q "^exit 0$" /tmp/edge.txt
+          # Without the usage text, macOS would refuse Hammer without asking. (set +e above: check both.)
+          grep -q "Microsoft Edge" /tmp/edge-usage.txt && grep -q "^exit 0$" /tmp/edge.txt
 
       - name: Keep the pictures (on the ci-screenshots branch)
         if: always()

@@ -253,17 +253,24 @@ enum EdgeYouTube {
 
     private static let tellEdge = "tell application id \(quoted(bundleID))"
 
+    /// Where YouTube may send a new window before Hammer looks (its cookie
+    /// question, in some countries): still Hammer's window.
+    static let detours = ["https://consent.youtube.com/"]
+
     /// The windows that could be Hammer's: ordinary (not InPrivate) Edge windows
-    /// with one tab whose address starts with `prefix`. The check happens inside
-    /// Edge's script; only their numbers come back, as "3,7,".
-    static func findScript(prefix: String) -> String {
-        """
+    /// with one tab whose address starts with one of `prefixes`. The script does
+    /// the checking; only the windows' numbers come back to Hammer, as "3,7,".
+    static func findScript(prefixes: [String]) -> String {
+        let address = prefixes.isEmpty ? "false"
+            : prefixes.map { "(u starts with \(quoted($0)))" }.joined(separator: " or ")
+        return """
         \(tellEdge)
             set found to ""
             repeat with w in windows
                 try
-                    if (mode of w is "normal") and ((count of tabs of w) is 1) and ((URL of active tab of w) starts with \(quoted(prefix))) then
-                        set found to found & ((id of w) as text) & ","
+                    if (mode of w is "normal") and ((count of tabs of w) is 1) then
+                        set u to URL of active tab of w
+                        if \(address) then set found to found & ((id of w) as text) & ","
                     end if
                 end try
             end repeat
@@ -356,6 +363,12 @@ enum EdgeYouTube {
             return Order(id: wid, minimized: min, index: index)
         }
         return .found(State(id: id, minimized: minimized, bounds: bounds, windows: windows))
+    }
+
+    /// Edge has other windows showing besides Hammer's (so after tucking it away
+    /// you're still in Edge, on purpose).
+    static func othersShown(_ state: State) -> Bool {
+        state.windows.contains { $0.id != state.id && !$0.minimized }
     }
 
     enum Action: Equatable {
@@ -469,7 +482,8 @@ enum EdgeScriptResult: Equatable {
 /// the corner, brings it back there, or tucks it away.
 final class EdgeController {
     enum Outcome: Equatable {
-        case opened, shown, hidden
+        case opened, shown
+        case hidden(othersShown: Bool)           // whether Edge still shows other windows
         case notInstalled
         case notAllowed(openedAnyway: Bool)      // you said no in Privacy & Security → Automation
         case failed(String)                      // plain words, for you
@@ -539,8 +553,9 @@ final class EdgeController {
         case .open:
             return await open(target, edgeWasRunning: true)
         case .hide:
-            if case .found(let state) = answer { rememberSize(state.bounds) }
-            return outcome(await driver.run(EdgeYouTube.hideScript(id: id)), success: .hidden)
+            var others = false
+            if case .found(let state) = answer { rememberSize(state.bounds); others = EdgeYouTube.othersShown(state) }
+            return outcome(await driver.run(EdgeYouTube.hideScript(id: id)), success: .hidden(othersShown: others))
         case .show:
             var current: [Int]?
             if case .found(let state) = answer { current = state.bounds; rememberSize(state.bounds) }
@@ -562,7 +577,10 @@ final class EdgeController {
 
     /// Opens a new app window, finds it among Edge's windows, remembers it and puts it in the corner.
     private func open(_ url: URL, edgeWasRunning: Bool) async -> Outcome {
-        let find = EdgeYouTube.findScript(prefix: EdgeYouTube.matchPrefix(url))
+        // Known by the address Hammer opened. When Edge starts with this window it
+        // doesn't bring back your other windows, and when it's running, windows that
+        // were already there don't count; of several new ones, the newest wins.
+        let find = EdgeYouTube.findScript(prefixes: [EdgeYouTube.matchPrefix(url)] + EdgeYouTube.detours)
         var before = Set<Int>()
         if edgeWasRunning {
             // Windows that already look like it aren't the new one. If Edge can't say, don't guess.
@@ -578,7 +596,9 @@ final class EdgeController {
         }
         var asked = edgeWasRunning
         let deadline = Date().addingTimeInterval(findFor)
-        for _ in 0..<60 where Date() < deadline {               // about 15 seconds, more if Edge is slow
+        var tries = 0
+        while tries < 60 && Date() < deadline {                 // about 15 seconds, more if Edge is slow
+            tries += 1
             await driver.pause(0.3)
             guard let edge = driver.running() else { continue }
             if !asked {
