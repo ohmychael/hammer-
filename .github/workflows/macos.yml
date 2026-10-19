@@ -23,21 +23,24 @@ defaults:
 jobs:
   edge-probe:
     runs-on: macos-15
-    timeout-minutes: 10
+    timeout-minutes: 14
     steps:
       - name: Probe Microsoft Edge (app window, AppleScript)
+        timeout-minutes: 9
         run: |
           set +e
-          ls -d "/Applications/Microsoft Edge.app" && defaults read "/Applications/Microsoft Edge.app/Contents/Info" CFBundleShortVersionString
-          defaults read "/Applications/Microsoft Edge.app/Contents/Info" NSAppleScriptEnabled
-          open -na "Microsoft Edge" --args --no-first-run --app=https://www.youtube.com/ --window-size=760,460 --window-position=100,40
-          sleep 15
-          run() { echo "\$ $1"; perl -e 'alarm 20; exec @ARGV' osascript -e "$1" 2>&1; echo "(exit $?)"; }
+          note() { echo "::notice title=$1::$(printf '%s' "$2" | tail -c 900 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"; }
+          lim() { perl -e '$t = shift; $p = fork; if (!$p) { exec @ARGV } $SIG{ALRM} = sub { kill 9, $p; print "TIMEOUT\n"; exit 124 }; alarm $t; waitpid $p, 0; exit $? >> 8' "$@"; }
+          note "edge" "$(ls -d /Applications/*Edge* 2>&1; defaults read '/Applications/Microsoft Edge.app/Contents/Info' CFBundleShortVersionString 2>&1; defaults read '/Applications/Microsoft Edge.app/Contents/Info' NSAppleScriptEnabled 2>&1; defaults read '/Applications/Microsoft Edge.app/Contents/Info' CFBundleIdentifier 2>&1)"
+          note "open1" "$(lim 20 open -na 'Microsoft Edge' --args --no-first-run --no-default-browser-check --app=https://www.youtube.com/ 2>&1; echo exit $?)"
+          sleep 12
+          note "ps" "$(ps -ax -o pid=,command= | grep -i 'Edge' | grep -v -e grep -e Helper | cut -c1-200 | head -4)"
+          n=0
+          run() { n=$((n+1)); note "as$n" "$1 => $(lim 25 osascript -e "$1" 2>&1; echo "(exit $?)")"; }
           run 'tell application "Microsoft Edge" to count windows'
-          run 'tell application "Microsoft Edge" to get {id, name, bounds, mode} of every window'
-          run 'tell application "Microsoft Edge" to get URL of active tab of every window'
-          run 'tell application "Microsoft Edge" to get minimized of every window'
-          run 'tell application "Microsoft Edge" to get frontmost'
+          run 'tell application "Microsoft Edge" to get {id, bounds, mode, minimized, visible} of every window'
+          run 'tell application "Microsoft Edge" to get {URL, title} of active tab of every window'
+          run 'tell application "Microsoft Edge" to get count of tabs of every window'
           run 'tell application "Microsoft Edge" to set bounds of window 1 to {300, 60, 1060, 520}'
           run 'tell application "Microsoft Edge" to get bounds of window 1'
           run 'tell application "Microsoft Edge" to set minimized of window 1 to true'
@@ -45,14 +48,18 @@ jobs:
           run 'tell application "Microsoft Edge" to get minimized of every window'
           run 'tell application "Microsoft Edge" to set minimized of window 1 to false'
           run 'tell application "Microsoft Edge" to set index of window 1 to 1'
-          run 'tell application "Microsoft Edge" to activate'
-          open -na "Microsoft Edge" --args --app=https://www.youtube.com/
+          run 'tell application "Microsoft Edge" to set URL of active tab of window 1 to "https://www.youtube.com/watch?v=jNQXAC9IVRw"'
+          sleep 3
+          run 'tell application "Microsoft Edge" to get URL of active tab of window 1'
+          note "open2" "$(lim 20 open -na 'Microsoft Edge' --args --app=https://www.youtube.com/ 2>&1; echo exit $?)"
           sleep 6
-          run 'tell application "Microsoft Edge" to get {id, name} of every window'
-          ps -ax | grep -i "Microsoft Edge" | grep -v grep | cut -c1-150 | head -5
-        shell: bash
+          run 'tell application "Microsoft Edge" to get {id, mode} of every window'
+          run 'tell application "System Events" to get name of every window of process "Microsoft Edge"'
+          screencapture -x /tmp/edge.png 2>&1; ls -la /tmp/edge.png
+          note "done" "probe finished"
 
   build:
+    if: github.ref != 'refs/heads/edge-probe'
     runs-on: macos-15
     timeout-minutes: 50
     steps:
