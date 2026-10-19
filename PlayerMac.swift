@@ -576,8 +576,8 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         }
     }
 
-    /// A double-click on its top edge mustn't blow it up to full screen.
-    func windowShouldZoom(_ window: NSWindow, toFrame newFrame: NSRect) -> Bool { window !== mini }
+    /// A double-click on either window's top edge mustn't blow it up to full screen.
+    func windowShouldZoom(_ window: NSWindow, toFrame newFrame: NSRect) -> Bool { false }
 
     func windowDidEndLiveResize(_ notification: Notification) {
         if (notification.object as? NSWindow) === dropdown {

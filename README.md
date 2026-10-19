@@ -31,14 +31,14 @@ The menu always offers **Check Monitor Connection…**, and says so if the monit
 
 ## YouTube player
 
-**Control-Option-Y** opens it; press it again (or Esc, or click anywhere else) to close it. It's YouTube's own mobile site in a panel under the menu bar, so search, your recommendations and signing in work as usual, and ads play as YouTube serves them. Hammer doesn't download or block anything.
+**Control-Option-Y** opens it; press it again, press Esc, or click anywhere outside it to close it (clicks inside it never do). It's YouTube's own mobile site on the same glass as macOS's menus, in a wide panel under the menu bar: drag its edges to resize it, and it remembers the size. Search, recommendations and signing in work as usual, and ads play as YouTube serves them. Hammer doesn't download or block anything.
 
 - **Pop out** (the ⧉ button) moves the playing video into a mini player in the corner of the screen. It floats above every window and over full-screen apps. Drag it anywhere and it settles into the nearest corner; drag its edges to resize it. Point at it for play/pause, 10 seconds back or forward, back to the dropdown, and close. Double-click it to go back to the dropdown.
 - Closing the dropdown while a video plays pops it out by itself; closing the mini player pauses it.
 - **Pin** (📌) keeps the dropdown open when you click into other apps.
 - **Play Copied Link** in the menu plays the YouTube link you copied (from Share → Copy link, a message, anywhere).
 - Links to other sites open in your browser. The safari button opens the current video there.
-- Signing in: Google sometimes refuses to sign in inside apps. Everything works signed out too.
+- Signing in: tap **You → Sign in** once and it stays signed in. It can't use your browser's sign-in: browsers keep theirs to themselves, and a copied sign-in looks to Google like a stolen one. Google sometimes refuses to sign in inside apps; everything works signed out too.
 
 ## Bluetooth bulbs and your phone
 
