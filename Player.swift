@@ -5,6 +5,9 @@
 // inside the YouTube page is PlayerScript.js.
 
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics          // on a Mac, CGRect's helpers (width, maxX…) live here, not in Foundation
+#endif
 
 // MARK: - YouTube links
 
