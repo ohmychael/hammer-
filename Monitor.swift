@@ -435,12 +435,29 @@ struct MonitorPort: Equatable {
     var looksLikeHDMI: Bool {
         throughHDMIConverter || (transport?.uppercased().contains("HDMI") ?? false)
     }
-    /// The monitor gets HDMI from a USB-C port: a USB-C to HDMI cable, adapter or
-    /// hub (or a USB-C to DisplayPort adapter with a DisplayPort to HDMI cable)
-    /// converts it on the way, and most of those drop DDC. macOS may report the link
-    /// as DisplayPort or as HDMI then. Not the M1-era Macs' own HDMI port, whose
-    /// converter Hammer talks through.
-    var throughHDMIAdapter: Bool { monitorInput == .hdmi && !throughHDMIConverter }
+    /// The monitor gets HDMI from one of the Mac's USB-C ports: a USB-C to HDMI
+    /// cable, adapter or hub (or a USB-C to DisplayPort adapter with a DisplayPort
+    /// to HDMI cable) converts it on the way, and most of those drop DDC.
+    /// macOS calls such a link DisplayPort, or sometimes HDMI. Newer Macs' own HDMI
+    /// ports are called HDMI too, so an HDMI link counts only on Macs whose own HDMI
+    /// port (if any) is the M1-era one with the converter Hammer talks through.
+    func throughHDMIAdapter(onMac model: String) -> Bool {
+        monitorInput == .hdmi && !throughHDMIConverter && (!looksLikeHDMI || Self.hdmiLinkIsAdapter(onMac: model))
+    }
+
+    /// Macs with no HDMI port of their own, or only the M1-era one (with the converter):
+    /// on these, an HDMI link without the converter can only come from a USB-C port.
+    /// A Mac missing from this list just gets the general advice, never a wrong guess.
+    static func hdmiLinkIsAdapter(onMac model: String) -> Bool {
+        let noHDMIPort: Set<String> = [
+            "MacBookPro17,1", "Mac14,7",                      // 13-inch MacBook Pro, M1 and M2
+            "Mac14,2", "Mac14,15", "Mac15,12", "Mac15,13",    // MacBook Air, M2 and M3
+            "Mac16,12", "Mac16,13",                           // MacBook Air, M4
+            "Mac15,4", "Mac15,5", "Mac16,2", "Mac16,3",       // iMac, M3 and M4
+        ]
+        return model.hasPrefix("MacBookPro18,")               // 14- and 16-inch M1 Pro/Max: HDMI has the converter
+            || model.hasPrefix("MacBookAir") || model.hasPrefix("iMac") || noHDMIPort.contains(model)
+    }
 }
 
 enum MonitorDiscovery {
@@ -730,7 +747,7 @@ struct MonitorCheck {
         // Nothing known to have a monitor: every connection is a candidate.
         let candidates = attached.isEmpty ? ports : attached
         if candidates.allSatisfy({ $0.port.isDefault }) { return .notFound }   // only macOS's guess was left
-        if candidates.contains(where: { $0.port.throughHDMIAdapter }) { return .hdmiAdapter }
+        if candidates.contains(where: { $0.port.throughHDMIAdapter(onMac: mac.model) }) { return .hdmiAdapter }
         if candidates.allSatisfy({ $0.noService || !$0.brightness.sent }) { return .cantSend }
         return .noAnswer
     }
@@ -841,7 +858,8 @@ struct MonitorCheck {
     var advice: [String] {
         let name = monitorName
         let Name = name.prefix(1).uppercased() + name.dropFirst()
-        let hdmi = ports.contains { $0.port.attached && $0.port.looksLikeHDMI }
+        // On HDMI, unless the monitor itself says it's on its DisplayPort input.
+        let hdmi = ports.contains { $0.port.attached && $0.port.looksLikeHDMI && $0.port.monitorInput != .displayPort }
         let macHDMI = ports.contains { $0.port.attached && $0.port.throughHDMIConverter }
         switch verdict {
         case .working:
@@ -875,12 +893,12 @@ struct MonitorCheck {
                     : hdmi ? "HDMI doesn't pass monitor control here. Connect to the monitor's DisplayPort or USB-C port instead (not HDMI)."
                     : "Plug its USB-C cable straight into the Mac (not through a hub, dock or adapter), then check again."]
         case .hdmiAdapter:
-            return ["Result: \(Name) is plugged into one of its HDMI ports (its ID info says so).",
-                    "Going from the Mac's USB-C to HDMI, through a cable, adapter or hub, usually drops",
-                    "brightness control (DDC/CI). The cable has to go into the monitor's DisplayPort or USB-C port:",
-                    "  • a USB-C to USB-C cable from the Mac to the monitor's USB-C port (the Dell U3818DW comes with one), or",
-                    "  • a USB-C to DisplayPort adapter or cable, with a DisplayPort cable into the monitor's DP port",
-                    "    (one comes with the Dell too). A DisplayPort to HDMI cable still lands on HDMI.",
+            return ["Result: \(Name) is plugged into one of its HDMI ports (its ID info says so), from a USB-C port on the Mac.",
+                    "Converting USB-C to HDMI, in a cable, adapter or hub, usually drops brightness control (DDC/CI).",
+                    "Connect to the monitor's DisplayPort or USB-C port instead:",
+                    "• a USB-C to USB-C cable into the monitor's USB-C port (the Dell U3818DW comes with one), or",
+                    "• a USB-C to DisplayPort cable, or a USB-C to DisplayPort adapter plus the DisplayPort cable from the Dell's box, into its DP port.",
+                    "Not a DisplayPort to HDMI cable: it still ends in an HDMI port.",
                     "Then, on the monitor, choose Menu → Input Source → USB Type-C (or DP), and check again."]
         case .noAnswer where wireReads == true:
             return ["Result: Hammer can read \(name)'s ID info (EDID) over this connection,",
@@ -974,8 +992,8 @@ struct MonitorMenu: Equatable {
         if connections == 0 && answers != true {
             menu.hints.append("Can't find the Dell's port; trying the Mac's default.")
         } else if answers == false && hdmiAdapter {
-            menu.hints += ["The Dell is on one of its HDMI ports, which blocks",
-                           "control. Use its DisplayPort or USB-C port instead."]
+            menu.hints += ["The Dell is on HDMI from USB-C, which usually",
+                           "blocks control. Use its DisplayPort or USB-C port."]
         } else if answers == false {
             menu.hints.append("The Dell isn't answering Hammer.")
         }

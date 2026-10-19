@@ -533,8 +533,9 @@ expect(MonitorSet([]).read(code: 0x10) == nil && MonitorSet([]).targets.isEmpty,
 // MARK: Monitor: the check
 
 let mac = MonitorCheck.Mac(model: "MacBookPro18,3", chip: "Apple M1 Pro", system: "Version 15.1 (Build 24B83)")
-func runCheck(_ entries: [RegistryEntry], _ screens: [MonitorScreen], _ buses: [UInt64: FakeMonitor]) -> MonitorCheck {
-    MonitorCheck.run(mac: mac, screens: screens, entries: entries, bus: { buses[$0] }, sleep: { _ in })
+func runCheck(_ entries: [RegistryEntry], _ screens: [MonitorScreen], _ buses: [UInt64: FakeMonitor],
+              on thisMac: MonitorCheck.Mac = mac) -> MonitorCheck {
+    MonitorCheck.run(mac: thisMac, screens: screens, entries: entries, bus: { buses[$0] }, sleep: { _ in })
 }
 let airEntries = [framebuffer(100, display: true), proxy(101, "Embedded"),
                   framebuffer(200, "DELL U3818DW", display: true, transport: "DP → DP"), proxy(201)]
@@ -924,9 +925,9 @@ expect(EDID.name(makeEDID("DELL U3818DW", hdmi: true)) == "DELL U3818DW", "name 
 
 dell = FakeMonitor(); dell.readStatus = avError; dell.edid = makeEDID("DELL U3818DW", hdmi: true)
 check = runCheck(proUSBC, lidClosed, [301: dell])
-expect(check.verdict == .hdmiAdapter && check.ports[0].port.throughHDMIAdapter
+expect(check.verdict == .hdmiAdapter && check.ports[0].port.throughHDMIAdapter(onMac: mac.model)
        && check.text.contains("Its ID info (EDID), from macOS: DELL U3818DW, on its HDMI input")
-       && check.advice.joined(separator: " ").contains("USB-C to USB-C cable from the Mac to the monitor's USB-C port")
+       && check.advice.joined(separator: " ").contains("a USB-C to USB-C cable into the monitor's USB-C port")
        && check.advice.joined(separator: " ").contains("Input Source → USB Type-C"), "USB-C to HDMI cable:\n\(check.text)")
 dell = FakeMonitor(); dell.edid = makeEDID("DELL U3818DW", hdmi: true)
 check = runCheck(proUSBC, lidClosed, [301: dell])
@@ -937,10 +938,10 @@ expect(check.verdict == .noAnswer && check.text.contains("on its DisplayPort/USB
 dell = FakeMonitor(); dell.chip = 0xB7; dell.ddcOn = false; dell.edid = makeEDID("DELL U3818DW", hdmi: true)
 empty = FakeMonitor(); empty.writeStatus = Int32(bitPattern: 0xE00002C0)
 check = runCheck(proEntries, proScreens, [301: empty, 401: dell])
-expect(check.verdict == .noAnswer && !check.ports[0].port.throughHDMIAdapter, "the Mac's own HDMI port isn't \"an adapter\"")
+expect(check.verdict == .noAnswer && !check.ports[0].port.throughHDMIAdapter(onMac: mac.model), "the Mac's own HDMI port isn't \"an adapter\"")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, hdmiAdapter: true)
-expect(state.sliders && state.hints == ["The Dell is on one of its HDMI ports, which blocks",
-                                        "control. Use its DisplayPort or USB-C port instead."], "menu: says to leave HDMI")
+expect(state.sliders && state.hints == ["The Dell is on HDMI from USB-C, which usually",
+                                        "blocks control. Use its DisplayPort or USB-C port."], "menu: says to leave HDMI")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: true, hdmiAdapter: true)
 expect(state.hints.isEmpty, "menu: an adapter that works isn't mentioned")
 
@@ -951,17 +952,43 @@ let belkinEntries = [framebuffer(300, "DELL U3818DW", display: true, transport: 
 dell = FakeMonitor(); dell.writeStatus = Int32(bitPattern: 0xE0114000); dell.edid = makeEDID("DELL U3818DW", hdmi: true)
 check = runCheck(belkinEntries, lidClosed, [301: dell])
 let belkinAdvice = check.advice.joined(separator: "\n")
-expect(check.verdict == .hdmiAdapter && check.ports[0].port.throughHDMIAdapter
+expect(check.verdict == .hdmiAdapter && check.ports[0].port.throughHDMIAdapter(onMac: mac.model)
        && check.text.contains("DELL U3818DW (dcpext0, DP → HDMI)") && check.text.contains("Sent: no (error e0114000)"),
        "USB-C, then HDMI into the monitor, reported as DP → HDMI: the adapter case\n\(check.text)")
-expect(belkinAdvice.contains("plugged into one of its HDMI ports") && belkinAdvice.contains("DisplayPort cable into the monitor's DP port")
-       && belkinAdvice.contains("A DisplayPort to HDMI cable still lands on HDMI") && !belkinAdvice.contains("This Mac's HDMI port"),
+expect(belkinAdvice.contains("plugged into one of its HDMI ports") && belkinAdvice.contains("plus the DisplayPort cable from the Dell's box, into its DP port")
+       && belkinAdvice.contains("Not a DisplayPort to HDMI cable") && !belkinAdvice.contains("This Mac's HDMI port")
+       && !belkinAdvice.contains("\n    "), // no indented lines: the check's window doesn't use a fixed-width font
        "says to use the monitor's DP or USB-C port, not that the Mac's own HDMI port is the problem:\n\(belkinAdvice)")
 // The same, but the monitor's ID info doesn't say which input: no guessing about adapters.
 dell = FakeMonitor(); dell.writeStatus = Int32(bitPattern: 0xE0114000); dell.edid = makeEDID("DELL U3818DW")
 check = runCheck(belkinEntries, lidClosed, [301: dell])
 expect(check.verdict == .cantSend && check.advice.joined().contains("Connect to the monitor's DisplayPort or USB-C port instead (not HDMI)")
        && !check.advice.joined().contains("This Mac's HDMI port"), "HDMI link, input unknown: still points at DP or USB-C\n\(check.text)")
+
+// A newer Mac's own HDMI port (no M1 converter) looks the same to macOS: no adapter claimed there.
+let newerMac = MonitorCheck.Mac(model: "Mac14,6", chip: "Apple M2 Max", system: "Version 15.1 (Build 24B83)")
+dell = FakeMonitor(); dell.ddcOn = false; dell.edid = makeEDID("DELL U3818DW", hdmi: true)
+check = runCheck(belkinEntries, lidClosed, [301: dell], on: newerMac)
+expect(check.verdict == .noAnswer && check.advice.joined().contains("Menu → Others → DDC/CI → On")
+       && !check.advice.joined().contains("from a USB-C port on the Mac"), "a newer Mac's own HDMI port: the DDC/CI advice\n\(check.text)")
+dell = FakeMonitor(); dell.writeStatus = Int32(bitPattern: 0xE0114000); dell.edid = makeEDID("DELL U3818DW", hdmi: true)
+check = runCheck(belkinEntries, lidClosed, [301: dell], on: newerMac)
+expect(check.verdict == .cantSend && check.advice.joined().contains("HDMI doesn't pass monitor control here")
+       && !check.advice.joined().contains("This Mac's HDMI port"), "…and if nothing can be sent there: use DP or USB-C, no blame")
+// The M1-era HDMI port (converter) refusing to send: the Mac's own port is named.
+dell = FakeMonitor(); dell.chip = 0xB7; dell.writeStatus = Int32(bitPattern: 0xE0114000); dell.edid = makeEDID("DELL U3818DW", hdmi: true)
+check = runCheck(proEntries, proScreens, [301: empty, 401: dell])
+expect(check.verdict == .cantSend && check.advice.joined().contains("This Mac's HDMI port doesn't pass monitor control"),
+       "M1 HDMI port refuses: says so\n\(check.text)")
+// The monitor says it's on DisplayPort, though the link is called HDMI: never told to leave HDMI.
+dell = FakeMonitor(); dell.writeStatus = Int32(bitPattern: 0xE0114000); dell.edid = makeEDID("DELL U3818DW", interface: 0x5)
+check = runCheck(belkinEntries, lidClosed, [301: dell])
+expect(check.verdict == .cantSend && !check.advice.joined().contains("HDMI"), "on its DisplayPort input: no HDMI advice\n\(check.text)")
+// Which Macs can only mean an adapter.
+expect(MonitorPort.hdmiLinkIsAdapter(onMac: "MacBookPro18,1") && MonitorPort.hdmiLinkIsAdapter(onMac: "MacBookAir10,1")
+       && MonitorPort.hdmiLinkIsAdapter(onMac: "Mac15,13") && !MonitorPort.hdmiLinkIsAdapter(onMac: "Mac14,6")
+       && !MonitorPort.hdmiLinkIsAdapter(onMac: "Mac16,10") && !MonitorPort.hdmiLinkIsAdapter(onMac: "")
+       && !MonitorPort.hdmiLinkIsAdapter(onMac: "Macmini9,1"), "Macs whose HDMI links can only be adapters")
 
 
 // MARK: YouTube player: links
