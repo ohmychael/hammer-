@@ -84,7 +84,37 @@ jobs:
             | while IFS= read -r line; do echo "$(date +%T) $line"; done | tee /tmp/install1.log
           grep -q "Signed with Hammer Local Signing" /tmp/install1.log
           codesign -d -r- ~/Applications/Hammer.app 2>&1 | grep designated | tee /tmp/req1.txt
+
+      - name: The menu bar app starts and keeps running
+        timeout-minutes: 3
+        run: |
+          set +e
+          # build.sh opened it, as at login. It must still be running after 30 s
+          # (it reads monitors, builds its menu, registers its shortcuts).
+          sleep 30
+          if pgrep -x Hammer >/dev/null; then
+            echo "Hammer is running" | tee /tmp/launch.txt
+          else
+            echo "Hammer stopped after launching" | tee /tmp/launch.txt
+            latest=$(ls -t ~/Library/Logs/DiagnosticReports/Hammer*.ips 2>/dev/null | head -1)
+            if [ -n "$latest" ]; then
+              python3 - "$latest" <<'EOF' | tee -a /tmp/launch.txt
+          import json, sys
+          body = json.loads(open(sys.argv[1]).read().split('\n', 1)[1])
+          print(body.get('exception')); print(body.get('asi'))
+          images = body.get('usedImages', [])
+          for f in body['threads'][body.get('faultingThread', 0)]['frames'][:15]:
+              print(images[f['imageIndex']].get('name', '?') if f.get('imageIndex') is not None else '?', f.get('symbol', '?'))
+          EOF
+            fi
+          fi
+          # Started the way the login item does it, from scratch.
+          pkill -x Hammer; sleep 2
+          /usr/bin/open ~/Applications/Hammer.app; sleep 20
+          pgrep -x Hammer >/dev/null && echo "…and again from open: running" | tee -a /tmp/launch.txt \
+            || echo "…and again from open: stopped" | tee -a /tmp/launch.txt
           pkill -x Hammer || true
+          ! grep -q "stopped" /tmp/launch.txt
 
       - name: YouTube player check (loads a real video, pops it out, takes pictures)
         timeout-minutes: 4
@@ -152,7 +182,7 @@ jobs:
             [ -f "$log" ] || continue
             { grep -E "error:" "$log" || true; } | head -10 | while IFS= read -r line; do echo "::error::$line"; done
           done
-          for file in /tmp/player.txt /tmp/edge.txt /tmp/dim.txt /tmp/check.txt /tmp/install1.log /tmp/req1.txt /tmp/sign2.log /tmp/req2.txt /tmp/ps.log; do
+          for file in /tmp/launch.txt /tmp/player.txt /tmp/edge.txt /tmp/dim.txt /tmp/check.txt /tmp/install1.log /tmp/req1.txt /tmp/sign2.log /tmp/req2.txt /tmp/ps.log; do
             [ -f "$file" ] || continue
             body="$(tail -40 "$file" | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
             echo "::notice title=$(basename "$file")::$body"
