@@ -991,6 +991,34 @@ expect(MonitorPort.hdmiLinkIsAdapter(onMac: "MacBookPro18,1") && MonitorPort.hdm
        && !MonitorPort.hdmiLinkIsAdapter(onMac: "Macmini9,1"), "Macs whose HDMI links can only be adapters")
 
 
+// MARK: Monitor: dimming the picture in software
+
+expect(SoftwareDim.factor(level: 100) == 1 && SoftwareDim.factor(level: 0) == SoftwareDim.floor
+       && abs(SoftwareDim.factor(level: 50) - 0.575) < 1e-9, "slider 0–100 → 15%–100% of the light")
+expect(SoftwareDim.factor(level: -20) == SoftwareDim.floor && SoftwareDim.factor(level: 250) == 1, "out-of-range levels are clamped")
+expect(SoftwareDim.floor >= 0.1, "never dark enough to lose the screen")
+let dimCurve: [Float] = [0, 0.25, 0.5, 1]
+expect(SoftwareDim.scaled(dimCurve, by: 0.5) == [0, 0.125, 0.25, 0.5], "the curve scales down")
+expect(SoftwareDim.scaled(dimCurve, by: 1) == dimCurve, "100%: the curve as it was")
+expect(SoftwareDim.scaled([1.2, -0.1], by: 2) == [1, 0], "never outside 0…1, whatever comes in")
+expect(SoftwareDim.key(vendor: 0x10AC, model: 0xD0D1, serial: 0x4C4C) == "softwareDim.10ac-d0d1-4c4c", "saved per monitor")
+expect(SoftwareDim.applies(answers: false, misses: 1, hdmiAdapter: true), "HDMI adapter, no answer: at once")
+expect(!SoftwareDim.applies(answers: false, misses: 1, hdmiAdapter: false)
+       && SoftwareDim.applies(answers: false, misses: 2, hdmiAdapter: false), "otherwise after two misses in a row")
+expect(SoftwareDim.applies(answers: false, misses: 1, hdmiAdapter: false, wasDimming: true)
+       && !SoftwareDim.applies(answers: true, misses: 0, hdmiAdapter: false, wasDimming: true),
+       "already dimming before a wake or replug: carries on at the first miss, stops once it answers")
+expect(!SoftwareDim.applies(answers: true, misses: 0, hdmiAdapter: true) && !SoftwareDim.applies(answers: nil, misses: 5, hdmiAdapter: true),
+       "answers (or not asked yet): the monitor's own brightness")
+state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, hdmiAdapter: true, software: true)
+expect(state.sliders && !state.contrast && state.offerCheck
+       && state.hints == ["Dimming the picture: HDMI from USB-C blocks", "the Dell's own brightness. Use DP or USB-C."],
+       "menu, adapter: Brightness dims the picture, no Contrast, says why")
+state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, software: true)
+expect(state.sliders && !state.contrast && state.hints.first == "Dimming the picture: the Dell isn't", "menu, no answer: the same")
+state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: true)
+expect(state.sliders && state.contrast && state.hints.isEmpty, "menu, working: both sliders, no hint")
+
 // MARK: YouTube player: links
 
 func playerVideo(_ text: String) -> String? {

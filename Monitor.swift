@@ -963,14 +963,17 @@ struct MonitorCheck {
 struct MonitorMenu: Equatable {
     var title: String?               // shown instead of the sliders
     var sliders = false
+    var contrast = true              // the Contrast slider too (not when dimming in software)
     var hints: [String] = []
     var offerCheck = false
 
     /// `connections`: external DDC connections found (not counting macOS's default);
     /// `hasDefault`: macOS's default connection is being tried too; `attached`: ports
     /// with a monitor seen; `answers`: whether one gave a value when last asked.
+    /// `software`: the monitor can't be told to dim itself, so the Brightness slider
+    /// dims the picture (SoftwareDim).
     static func make(connections: Int, hasDefault: Bool = false, attached: Int, screens: [MonitorScreen],
-                     answers: Bool?, hdmiAdapter: Bool = false) -> MonitorMenu {
+                     answers: Bool?, hdmiAdapter: Bool = false, software: Bool = false) -> MonitorMenu {
         let external = screens.filter { !$0.builtIn }
         let virtualOnly = !external.isEmpty && external.allSatisfy { $0.direct == false }
         if attached == 0 && external.isEmpty {
@@ -989,6 +992,13 @@ struct MonitorMenu: Equatable {
             return MonitorMenu(title: "Can't find the Dell's connection", offerCheck: true)
         }
         var menu = MonitorMenu(sliders: true, offerCheck: true)
+        if software {
+            menu.contrast = false
+            menu.hints += hdmiAdapter
+                ? ["Dimming the picture: HDMI from USB-C blocks", "the Dell's own brightness. Use DP or USB-C."]
+                : ["Dimming the picture: the Dell isn't", "answering Hammer about its own brightness."]
+            return menu
+        }
         if connections == 0 && answers != true {
             menu.hints.append("Can't find the Dell's port; trying the Mac's default.")
         } else if answers == false && hdmiAdapter {
@@ -1018,5 +1028,43 @@ final class SliderMoves: @unchecked Sendable {
     func movedSince(_ date: Date) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return last > date
+    }
+}
+
+// MARK: - Dimming the picture in software
+
+/// When the monitor can't be told to dim itself (an HDMI adapter, DDC/CI off),
+/// Hammer dims the picture instead, by scaling the screen's color curves (what
+/// Night Shift and f.lux adjust too). It can only go darker than the monitor's
+/// own setting, and the backlight stays as it is. MonitorMac.swift applies it;
+/// macOS undoes it when Hammer quits, so nothing can leave a screen dark.
+enum SoftwareDim {
+    /// Never darker than this, so you can always see the screen (and Hammer's menu).
+    static let floor = 0.15
+
+    /// The Brightness slider's 0–100 as how much of the picture's light is kept.
+    static func factor(level: Int) -> Double {
+        let clamped = Double(min(100, max(0, level)))
+        return floor + (1 - floor) * clamped / 100
+    }
+
+    /// A color curve scaled down, kept between 0 and 1.
+    static func scaled(_ table: [Float], by factor: Double) -> [Float] {
+        let f = Float(min(1, max(0, factor)))
+        return table.map { min(1, max(0, $0 * f)) }
+    }
+
+    /// The saved level for a monitor (the same monitor gets a new display number
+    /// when it's plugged in again; its maker, model and serial don't change).
+    static func key(vendor: UInt32, model: UInt32, serial: UInt32) -> String {
+        "softwareDim." + [vendor, model, serial].map { String($0, radix: 16) }.joined(separator: "-")
+    }
+
+    /// Dim in software only once the monitor is known not to answer: at once if
+    /// it's behind an HDMI adapter, otherwise after two reads in a row (one miss
+    /// can be a slow monitor). `wasDimming`: it already was before Hammer looked
+    /// again (after a wake or a replug), so one miss is enough to carry on.
+    static func applies(answers: Bool?, misses: Int, hdmiAdapter: Bool, wasDimming: Bool = false) -> Bool {
+        answers == false && (hdmiAdapter || wasDimming || misses >= 2)
     }
 }

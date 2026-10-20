@@ -240,3 +240,107 @@ enum MacMonitors {
                          defaultBus: scan.defaultService.map { AVServiceBus($0) })    // run() decides whether to use it
     }
 }
+
+// MARK: - Dimming the picture in software (SoftwareDim in Monitor.swift)
+
+/// Scales a screen's color curves to dim its picture. Each screen's own curves
+/// are kept from before the first change and put back exactly at 100%. macOS
+/// resets them after sleep, a display change, or when Hammer quits; `reapply()`
+/// puts the dimming back.
+@MainActor
+final class SoftwareDimmer {
+    static let shared = SoftwareDimmer()
+    private var original: [CGDirectDisplayID: (r: [CGGammaValue], g: [CGGammaValue], b: [CGGammaValue])] = [:]
+    private var applied: [CGDirectDisplayID: Int] = [:]   // level per screen while dimmed
+
+    /// The level saved for this screen's monitor (100: not dimmed).
+    func savedLevel(_ display: CGDirectDisplayID) -> Int {
+        UserDefaults.standard.object(forKey: Self.key(display)) as? Int ?? 100
+    }
+
+    private static func key(_ display: CGDirectDisplayID) -> String {
+        SoftwareDim.key(vendor: CGDisplayVendorNumber(display), model: CGDisplayModelNumber(display),
+                        serial: CGDisplaySerialNumber(display))
+    }
+
+    /// Dims `display` to `level` (0–100) and saves it. false if this screen can't be dimmed this way.
+    @discardableResult
+    func set(_ level: Int, on display: CGDirectDisplayID, save: Bool = true) -> Bool {
+        if save { UserDefaults.standard.set(min(100, max(0, level)), forKey: Self.key(display)) }
+        guard let base = curves(display) else { return false }
+        let factor = SoftwareDim.factor(level: level)
+        let r = SoftwareDim.scaled(base.r, by: factor), g = SoftwareDim.scaled(base.g, by: factor)
+        let b = SoftwareDim.scaled(base.b, by: factor)
+        let status = CGSetDisplayTransferByTable(display, UInt32(r.count), r, g, b)
+        if status == .success { applied[display] = level }
+        return status == .success
+    }
+
+    /// Puts the saved level on each of these screens (after a wake, a display change, or launch).
+    func reapply(on displays: [CGDirectDisplayID]) {
+        for display in displays { set(savedLevel(display), on: display, save: false) }
+    }
+
+    /// Undoes the dimming on every screen Hammer dimmed (the monitor answers again).
+    func undoAll() {
+        for (display, _) in applied {
+            if let base = original[display] {
+                CGSetDisplayTransferByTable(display, UInt32(base.r.count), base.r, base.g, base.b)
+            }
+        }
+        applied = [:]
+    }
+
+    /// The screen's own curves, read once before Hammer first changes them.
+    private func curves(_ display: CGDirectDisplayID) -> (r: [CGGammaValue], g: [CGGammaValue], b: [CGGammaValue])? {
+        if let known = original[display] { return known }
+        let capacity = CGDisplayGammaTableCapacity(display)
+        guard capacity > 0 else { return nil }
+        var r = [CGGammaValue](repeating: 0, count: Int(capacity))
+        var g = r, b = r
+        var count: UInt32 = 0
+        guard CGGetDisplayTransferByTable(display, capacity, &r, &g, &b, &count) == .success, count > 1 else { return nil }
+        let read = (Array(r.prefix(Int(count))), Array(g.prefix(Int(count))), Array(b.prefix(Int(count))))
+        // A curve that's already very dark wasn't left by macOS: don't take it as the original.
+        guard (read.0.last ?? 0) > 0.5 else { return nil }
+        original[display] = read
+        return read
+    }
+
+    /// For the self-test: the curve's top value now (1 = full light).
+    func currentTop(_ display: CGDirectDisplayID) -> Float? {
+        let capacity = CGDisplayGammaTableCapacity(display)
+        guard capacity > 0 else { return nil }
+        var r = [CGGammaValue](repeating: 0, count: Int(capacity))
+        var g = r, b = r
+        var count: UInt32 = 0
+        guard CGGetDisplayTransferByTable(display, capacity, &r, &g, &b, &count) == .success, count > 0 else { return nil }
+        return r[Int(count) - 1]
+    }
+}
+
+/// `Hammer dim-check`: dims the main screen to half for a moment, checks the
+/// curve changed, and puts it back. Run by the macOS build check.
+@MainActor
+func runDimCheck() -> Int32 {
+    let display = CGMainDisplayID()
+    print("Software dimming check (display \(display))")
+    let dimmer = SoftwareDimmer.shared
+    guard let before = dimmer.currentTop(display) else {
+        print("SKIPPED: this screen has no color curves Hammer can change.")
+        return 0
+    }
+    guard dimmer.set(50, on: display, save: false) else {
+        print("SKIPPED: macOS didn't take a new color curve for this screen.")
+        return 0
+    }
+    let dimmed = dimmer.currentTop(display) ?? before
+    let expected = before * Float(SoftwareDim.factor(level: 50))
+    let ok1 = abs(dimmed - expected) < 0.02
+    print((ok1 ? "  ok   " : "  FAIL ") + "dimmed to half: top of the curve \(before) → \(dimmed) (expected \(expected))")
+    dimmer.undoAll()
+    let after = dimmer.currentTop(display) ?? -1
+    let ok2 = abs(after - before) < 0.001
+    print((ok2 ? "  ok   " : "  FAIL ") + "put back exactly: \(after)")
+    return ok1 && ok2 ? 0 : 1
+}

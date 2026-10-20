@@ -71,6 +71,10 @@ jobs:
           cat /tmp/check.txt
           # Exit 1 means "no working monitor" (expected here); a crash or hang gives 128 or more.
           if grep -qE "^exit (1[2-9][0-9]|2[0-9][0-9])$" /tmp/check.txt; then exit 1; fi
+          # Dimming the picture in software: dims the runner's screen to half, checks, puts it back.
+          limit 30 /tmp/Hammer dim-check > /tmp/dim.txt 2>&1; echo "exit $?" >> /tmp/dim.txt
+          cat /tmp/dim.txt
+          grep -q "^exit 0$" /tmp/dim.txt
 
       - name: Install with signing
         timeout-minutes: 20
@@ -148,7 +152,7 @@ jobs:
             [ -f "$log" ] || continue
             { grep -E "error:" "$log" || true; } | head -10 | while IFS= read -r line; do echo "::error::$line"; done
           done
-          for file in /tmp/player.txt /tmp/edge.txt /tmp/check.txt /tmp/install1.log /tmp/req1.txt /tmp/sign2.log /tmp/req2.txt /tmp/ps.log; do
+          for file in /tmp/player.txt /tmp/edge.txt /tmp/dim.txt /tmp/check.txt /tmp/install1.log /tmp/req1.txt /tmp/sign2.log /tmp/req2.txt /tmp/ps.log; do
             [ -f "$file" ] || continue
             body="$(tail -40 "$file" | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
             echo "::notice title=$(basename "$file")::$body"

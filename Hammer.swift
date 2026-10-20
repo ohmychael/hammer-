@@ -1278,6 +1278,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenuSoon()
     }
 
+    // MARK: Dimming the picture in software (when the monitor can't dim itself)
+
+    private var dimmingInSoftware = false               // as last applied
+
+    private var dimsInSoftware: Bool {
+        SoftwareDim.applies(answers: monitorAnswers, misses: monitorMisses, hdmiAdapter: monitorViaHDMIAdapter,
+                            wasDimming: dimmingInSoftware)
+    }
+
+    /// External screens with a real cable (not DisplayLink or AirPlay, which have no color curves to change).
+    private var dimmableScreens: [CGDirectDisplayID] {
+        monitorScreens.filter { !$0.builtIn && $0.direct != false }.map { CGDirectDisplayID($0.id) }
+    }
+
+    /// Dims (or undims) the picture to match: after each read, a display change or a wake.
+    private func updateSoftwareDimming() {
+        guard monitorAnswers != nil else { return }        // not asked yet (just after a wake or replug): leave it
+        dimmingInSoftware = dimsInSoftware
+        if dimmingInSoftware { SoftwareDimmer.shared.reapply(on: dimmableScreens) } else { SoftwareDimmer.shared.undoAll() }
+    }
+
+    @objc private func softwareDimMoved(_ slider: NSSlider) {
+        let level = Int(slider.doubleValue.rounded())
+        for display in dimmableScreens { SoftwareDimmer.shared.set(level, on: display) }
+    }
+
     // MARK: Menu
 
     private func rebuildMenu() {
@@ -1840,18 +1866,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             monitorValues[code] = value
             if let slider = monitorSliders[code] { show(value, on: slider) }
         }
-        if before != answers { rebuildMenuSoon() }                   // show or hide "isn't answering"
+        updateSoftwareDimming()
+        if before != answers || monitorMisses == 2 { rebuildMenuSoon() }   // "isn't answering", or dimming in software
     }
 
     private func addMonitor(to menu: NSMenu) {
         monitorSliders = [:]
+        let software = dimsInSoftware && !dimmableScreens.isEmpty
         let state = MonitorMenu.make(connections: monitorCount, hasDefault: monitorHasDefault,
                                      attached: monitorAttached, screens: monitorScreens, answers: monitorAnswers,
-                                     hdmiAdapter: monitorViaHDMIAdapter)
+                                     hdmiAdapter: monitorViaHDMIAdapter, software: software)
         if let title = state.title { menu.addItem(label(title)) }
-        if state.sliders {
+        if state.sliders && software {
+            let level = dimmableScreens.first.map { SoftwareDimmer.shared.savedLevel($0) } ?? 100
+            menu.addItem(sliderItem("Brightness", range: 0...100, value: Double(level),
+                                    action: #selector(softwareDimMoved(_:))) { _ in })
+        } else if state.sliders {
             menu.addItem(monitorSlider("Brightness", code: DDCCode.brightness))
-            menu.addItem(monitorSlider("Contrast", code: DDCCode.contrast))
+            if state.contrast { menu.addItem(monitorSlider("Contrast", code: DDCCode.contrast)) }
         }
         for line in state.hints { menu.addItem(hint(line)) }
         if state.offerCheck { menu.addItem(checkMonitorItem()) }
@@ -2317,6 +2349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Task { @MainActor in
                 delegate.checkTurnOn()
                 delegate.checkTimer()
+                delegate.updateSoftwareDimming()            // macOS resets screens' color curves on wake
             }
         }
     }
@@ -2556,6 +2589,7 @@ enum Hammer {
             switch command {
             case "get", "set": exit(runMonitorCommand(args))
             case "monitor": exit(runMonitorCheck(args))
+            case "dim-check": exit(runDimCheck())
             case "player-check": PlayerCheck.run(args)
             case "edge-check": EdgeCheck.run()
             case "govee": exit(runGoveeCommand(Array(args.dropFirst())))
