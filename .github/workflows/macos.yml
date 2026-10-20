@@ -47,7 +47,8 @@ jobs:
         timeout-minutes: 10
         run: |
           start=$(date +%s)
-          swiftc -O HammerCore.swift Monitor.swift Player.swift Deliveries.swift Tests/main.swift \
+          target="$(uname -m)-apple-macosx$(sw_vers -productVersion | cut -d. -f1).0"    # as build.sh does
+          swiftc -O -target "$target" HammerCore.swift Monitor.swift Player.swift Deliveries.swift Tests/main.swift \
             -o /tmp/hammer-tests 2>&1 | tee /tmp/tests-build.log
           /tmp/hammer-tests | tee /tmp/tests.log
           echo "::notice title=Tests::$(tail -1 /tmp/tests.log) (built and run in $(( $(date +%s) - start )) s)"
@@ -56,7 +57,8 @@ jobs:
         timeout-minutes: 15
         run: |
           start=$(date +%s)
-          swiftc -parse-as-library -O Hammer.swift HammerCore.swift Monitor.swift MonitorMac.swift \
+          target="$(uname -m)-apple-macosx$(sw_vers -productVersion | cut -d. -f1).0"    # as build.sh does
+          swiftc -parse-as-library -O -target "$target" Hammer.swift HammerCore.swift Monitor.swift MonitorMac.swift \
             Player.swift PlayerMac.swift EdgeMac.swift Deliveries.swift DeliveryAlerts.swift -o /tmp/Hammer 2>&1 | tee /tmp/app-build.log
           echo "::notice title=App::built in $(( $(date +%s) - start )) s"
 
@@ -83,6 +85,7 @@ jobs:
           perl -e 'alarm shift; exec @ARGV' 1100 bash build.sh 2>&1 \
             | while IFS= read -r line; do echo "$(date +%T) $line"; done | tee /tmp/install1.log
           grep -q "Signed with Hammer Local Signing" /tmp/install1.log
+          grep -q "installed (built for macOS" /tmp/install1.log      # macOS opened it; says which macOS it's for
           codesign -d -r- ~/Applications/Hammer.app 2>&1 | grep designated | tee /tmp/req1.txt
 
       - name: The menu bar app starts and keeps running

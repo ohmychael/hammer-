@@ -55,9 +55,16 @@ fi
 
 echo "$(date): updating $installed -> $latest"
 git reset --hard --quiet origin/main
-if /bin/bash "$REPO/build.sh"; then
+/bin/bash "$REPO/build.sh"
+status=$?
+if [ $status -eq 0 ]; then
   rm -f "$FAILED"
   notify "Hammer updated to $latest."
+elif [ $status -eq 3 ]; then
+  # Installed, but macOS wouldn't start it (build.sh said why, above).
+  rm -f "$FAILED"
+  echo "$(date): $latest installed, but macOS wouldn't open it"
+  notify "Hammer $latest is installed, but macOS wouldn't open it. Try opening Hammer from Applications."
 else
   echo "$latest" > "$FAILED"
   echo "$(date): build failed for $latest; still running $installed"
