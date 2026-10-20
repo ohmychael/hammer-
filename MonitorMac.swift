@@ -253,8 +253,12 @@ final class SoftwareDimmer {
     private var original: [CGDirectDisplayID: GammaCurves] = [:]
     private var written: [CGDirectDisplayID: GammaCurves] = [:]   // what Hammer last put on each screen
     private var resets: [CGDirectDisplayID: Int] = [:]            // times in a row something else changed them
-    /// Another app keeps changing a screen's curves (f.lux, another dimmer): Hammer stopped fighting it.
-    private(set) var contested = false
+    private static let giveUpAfter = 3
+
+    /// Another app keeps changing a screen's curves (f.lux, another dimmer), so
+    /// Hammer has stopped putting its dimming back on that screen.
+    var contested: Bool { resets.values.contains { $0 > Self.giveUpAfter } }
+    private func gaveUp(_ display: CGDirectDisplayID) -> Bool { (resets[display] ?? 0) > Self.giveUpAfter }
 
     /// The level saved for this screen's monitor (100: not dimmed).
     func savedLevel(_ display: CGDirectDisplayID) -> Int {
@@ -286,7 +290,6 @@ final class SoftwareDimmer {
         if save {
             UserDefaults.standard.set(level, forKey: Self.key(display))
             resets[display] = 0                          // you chose it: try again even if something fought it
-            contested = false
         }
         guard level < 100 else {
             undo(display)
@@ -299,27 +302,27 @@ final class SoftwareDimmer {
         return true
     }
 
-    /// Puts the saved level on each of these screens (after a wake, a display change, or launch).
+    /// Puts the saved level on each of these screens (after a wake, a display change, or launch),
+    /// except where Hammer gave up because another app keeps changing the curves.
     func reapply(on displays: [CGDirectDisplayID]) {
-        for display in displays { set(savedLevel(display), on: display, save: false) }
+        for display in displays where !gaveUp(display) { set(savedLevel(display), on: display, save: false) }
     }
 
     /// While dimming: if something reset a screen's curves (display sleep, a new color
     /// profile), dim it again. If something keeps changing them (another app that
     /// adjusts colors), stop after three times in a row rather than fight it.
     func keepApplied(on displays: [CGDirectDisplayID]) {
-        for display in displays where savedLevel(display) < 100 {
-            if let mine = written[display], let now = read(display), now.matches(mine) {
+        for display in displays where savedLevel(display) < 100 && !gaveUp(display) {
+            guard let mine = written[display] else {
+                set(savedLevel(display), on: display, save: false)   // never got to write yet: not anyone's fault
+                continue
+            }
+            if let now = read(display), now.matches(mine) {
                 resets[display] = 0
                 continue
             }
-            let count = (resets[display] ?? 0) + 1
-            resets[display] = count
-            if count > 3 {
-                contested = true
-                continue
-            }
-            set(savedLevel(display), on: display, save: false)
+            resets[display] = (resets[display] ?? 0) + 1
+            if !gaveUp(display) { set(savedLevel(display), on: display, save: false) }
         }
     }
 
@@ -336,6 +339,7 @@ final class SoftwareDimmer {
     /// Undoes the dimming on every screen Hammer dimmed (the monitor answers again).
     func undoAll() {
         for display in Array(written.keys) { undo(display) }
+        resets = [:]
     }
 
     private func currentOriginal(_ display: CGDirectDisplayID) -> GammaCurves? {

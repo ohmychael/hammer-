@@ -1338,7 +1338,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard dimWatch == nil else { return }
             let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
                 guard let delegate = self else { return }
-                Task { @MainActor in SoftwareDimmer.shared.keepApplied(on: delegate.dimmableScreens) }
+                Task { @MainActor in
+                    let before = SoftwareDimmer.shared.contested
+                    SoftwareDimmer.shared.keepApplied(on: delegate.dimmableScreens)
+                    if SoftwareDimmer.shared.contested != before { delegate.rebuildMenuSoon() }   // show or drop the note
+                }
             }
             RunLoop.main.add(timer, forMode: .common)
             dimWatch = timer
@@ -1350,9 +1354,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func softwareDimMoved(_ slider: NSSlider) {
         guard softwareSliderShowing else { return }        // the monitor answers again: this slider is stale
+        let wasContested = SoftwareDimmer.shared.contested
         dimmingInSoftware = true
+        watchDimming()
         let level = Int(slider.doubleValue.rounded())
         for display in dimmableScreens { SoftwareDimmer.shared.set(level, on: display) }
+        if wasContested { rebuildMenuSoon() }              // moving it tries again: drop the note
     }
 
     @objc private func screensWoke() { reapplyIfDimming() }
