@@ -312,7 +312,15 @@ final class SoftwareDimmer {
     /// profile), dim it again. If something keeps changing them (another app that
     /// adjusts colors), stop after three times in a row rather than fight it.
     func keepApplied(on displays: [CGDirectDisplayID]) {
-        for display in displays where savedLevel(display) < 100 && !gaveUp(display) {
+        resets = resets.filter { displays.contains($0.key) }     // screens that are gone
+        for display in displays where savedLevel(display) < 100 {
+            if gaveUp(display) {
+                // Look, don't touch: once the other app lets go (its curves are gone), dim again.
+                guard let now = read(display), now.isScreensOwn else { continue }
+                resets[display] = 0
+                set(savedLevel(display), on: display, save: false)
+                continue
+            }
             guard let mine = written[display] else {
                 set(savedLevel(display), on: display, save: false)   // never got to write yet: not anyone's fault
                 continue
