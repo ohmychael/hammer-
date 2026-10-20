@@ -1275,16 +1275,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func screensChanged() {
         findMonitors()
+        reapplyIfDimming()
         rebuildMenuSoon()
     }
 
     // MARK: Dimming the picture in software (when the monitor can't dim itself)
 
     private var dimmingInSoftware = false               // as last applied
+    private var dimWatch: Timer?                         // while dimming: puts it back if something resets it
+
+    /// Dimming in software before (this run, or a level saved from an earlier one).
+    private var wasDimming: Bool {
+        dimmingInSoftware || dimmableScreens.contains { SoftwareDimmer.shared.savedLevel($0) < 100 }
+    }
 
     private var dimsInSoftware: Bool {
         SoftwareDim.applies(answers: monitorAnswers, misses: monitorMisses, hdmiAdapter: monitorViaHDMIAdapter,
-                            wasDimming: dimmingInSoftware)
+                            wasDimming: wasDimming)
     }
 
     /// External screens with a real cable (not DisplayLink or AirPlay, which have no color curves to change).
@@ -1292,17 +1299,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         monitorScreens.filter { !$0.builtIn && $0.direct != false }.map { CGDirectDisplayID($0.id) }
     }
 
-    /// Dims (or undims) the picture to match: after each read, a display change or a wake.
+    /// Dims (or undims) the picture to match what the monitor said, after each read.
     private func updateSoftwareDimming() {
-        guard monitorAnswers != nil else { return }        // not asked yet (just after a wake or replug): leave it
+        guard monitorAnswers != nil else { return }        // not asked yet: reapplyIfDimming covers that time
         dimmingInSoftware = dimsInSoftware
         if dimmingInSoftware { SoftwareDimmer.shared.reapply(on: dimmableScreens) } else { SoftwareDimmer.shared.undoAll() }
+        watchDimming()
+    }
+
+    /// After a wake, display sleep or a display change macOS resets screens' curves:
+    /// dim again straight away (and a moment later, as screens settle), without
+    /// waiting to ask the monitor.
+    private func reapplyIfDimming() {
+        guard dimmingInSoftware else { return }
+        for delay in [0.0, 1.0, 3.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let delegate = self else { return }
+                Task { @MainActor in
+                    guard delegate.dimmingInSoftware else { return }
+                    SoftwareDimmer.shared.reapply(on: delegate.dimmableScreens)
+                }
+            }
+        }
+    }
+
+    /// While dimming, checks every 10 seconds that the curves are still Hammer's.
+    private func watchDimming() {
+        if dimmingInSoftware {
+            guard dimWatch == nil else { return }
+            let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
+                guard let delegate = self else { return }
+                Task { @MainActor in SoftwareDimmer.shared.keepApplied(on: delegate.dimmableScreens) }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            dimWatch = timer
+        } else {
+            dimWatch?.invalidate()
+            dimWatch = nil
+        }
     }
 
     @objc private func softwareDimMoved(_ slider: NSSlider) {
+        guard dimmingInSoftware else { return }            // the monitor answers again: this slider is stale
         let level = Int(slider.doubleValue.rounded())
         for display in dimmableScreens { SoftwareDimmer.shared.set(level, on: display) }
     }
+
+    @objc private func screensWoke() { reapplyIfDimming() }
 
     // MARK: Menu
 
@@ -1872,7 +1915,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func addMonitor(to menu: NSMenu) {
         monitorSliders = [:]
-        let software = dimsInSoftware && !dimmableScreens.isEmpty
+        let software = SoftwareDim.showing(answers: monitorAnswers, misses: monitorMisses,
+                                           hdmiAdapter: monitorViaHDMIAdapter, wasDimming: wasDimming)
+            && dimmableScreens.contains { SoftwareDimmer.shared.canDim($0) }
         let state = MonitorMenu.make(connections: monitorCount, hasDefault: monitorHasDefault,
                                      attached: monitorAttached, screens: monitorScreens, answers: monitorAnswers,
                                      hdmiAdapter: monitorViaHDMIAdapter, software: software)
@@ -2339,6 +2384,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         clock = tick
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(macWoke),
                                                           name: NSWorkspace.didWakeNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(screensWoke),
+                                                          name: NSWorkspace.screensDidWakeNotification, object: nil)
         checkTurnOn()
     }
 
@@ -2349,7 +2396,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Task { @MainActor in
                 delegate.checkTurnOn()
                 delegate.checkTimer()
-                delegate.updateSoftwareDimming()            // macOS resets screens' color curves on wake
+                delegate.reapplyIfDimming()                 // macOS resets screens' color curves on wake
             }
         }
     }

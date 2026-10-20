@@ -995,8 +995,8 @@ struct MonitorMenu: Equatable {
         if software {
             menu.contrast = false
             menu.hints += hdmiAdapter
-                ? ["Dimming the picture: HDMI from USB-C blocks", "the Dell's own brightness. Use DP or USB-C."]
-                : ["Dimming the picture: the Dell isn't", "answering Hammer about its own brightness."]
+                ? ["Dimming the picture: Hammer can't reach the", "Dell through a USB-C to HDMI adapter."]
+                : ["Dimming the picture: the Dell isn't answering Hammer."]
             return menu
         }
         if connections == 0 && answers != true {
@@ -1034,9 +1034,9 @@ final class SliderMoves: @unchecked Sendable {
 // MARK: - Dimming the picture in software
 
 /// When the monitor can't be told to dim itself (an HDMI adapter, DDC/CI off),
-/// Hammer dims the picture instead, by scaling the screen's color curves (what
-/// Night Shift and f.lux adjust too). It can only go darker than the monitor's
-/// own setting, and the backlight stays as it is. MonitorMac.swift applies it;
+/// Hammer dims the picture instead, by scaling the screen's color curves (the
+/// way f.lux adjusts them). It can only go darker than the monitor's own
+/// setting, and the backlight stays as it is. MonitorMac.swift applies it;
 /// macOS undoes it when Hammer quits, so nothing can leave a screen dark.
 enum SoftwareDim {
     /// Never darker than this, so you can always see the screen (and Hammer's menu).
@@ -1062,9 +1062,62 @@ enum SoftwareDim {
 
     /// Dim in software only once the monitor is known not to answer: at once if
     /// it's behind an HDMI adapter, otherwise after two reads in a row (one miss
-    /// can be a slow monitor). `wasDimming`: it already was before Hammer looked
-    /// again (after a wake or a replug), so one miss is enough to carry on.
+    /// can be a slow monitor). `wasDimming`: it already was (before a wake, a
+    /// replug or a restart), so one miss is enough to carry on.
     static func applies(answers: Bool?, misses: Int, hdmiAdapter: Bool, wasDimming: Bool = false) -> Bool {
         answers == false && (hdmiAdapter || wasDimming || misses >= 2)
+    }
+
+    /// Which Brightness slider the menu shows: before the monitor has been asked
+    /// again (just after a wake or a replug), whatever was in use.
+    static func showing(answers: Bool?, misses: Int, hdmiAdapter: Bool, wasDimming: Bool) -> Bool {
+        answers == nil ? wasDimming : applies(answers: answers, misses: misses, hdmiAdapter: hdmiAdapter, wasDimming: wasDimming)
+    }
+
+    /// What to dim from. The screen's curves as they are now, unless they're the
+    /// ones Hammer wrote (then the original it kept), or don't look like a
+    /// screen's own (another app has changed them: keep the original, if any).
+    /// This way a new color profile, or macOS resetting the curves, is picked up,
+    /// and dimming never stacks on top of dimming.
+    static func base(live: GammaCurves?, written: GammaCurves?, previous: GammaCurves?) -> GammaCurves? {
+        guard let live else { return previous }
+        if let written, live.matches(written) { return previous }
+        return live.isScreensOwn ? live : previous
+    }
+}
+
+/// A screen's three color curves (red, green, blue), each from dark (0) to light (1).
+struct GammaCurves: Equatable {
+    var r: [Float]
+    var g: [Float]
+    var b: [Float]
+
+    /// Looks like a screen's own (from its color profile): every color runs from
+    /// near dark to near full light. A dimmed curve, or one zeroed by a glitch, doesn't.
+    var isScreensOwn: Bool {
+        [r, g, b].allSatisfy { curve in
+            guard curve.count > 1, let first = curve.first, let last = curve.last else { return false }
+            return first <= 0.1 && last >= 0.9
+        }
+    }
+
+    func scaled(by factor: Double) -> GammaCurves {
+        GammaCurves(r: SoftwareDim.scaled(r, by: factor), g: SoftwareDim.scaled(g, by: factor),
+                    b: SoftwareDim.scaled(b, by: factor))
+    }
+
+    /// The same curves, allowing for macOS handing them back with a different
+    /// number of steps: compared at the same points along the way.
+    func matches(_ other: GammaCurves) -> Bool {
+        func at(_ curve: [Float], _ p: Double) -> Float? {
+            curve.isEmpty ? nil : curve[Int((Double(curve.count - 1) * p).rounded())]
+        }
+        let points = [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1]
+        for (mine, theirs) in [(r, other.r), (g, other.g), (b, other.b)] {
+            for p in points {
+                guard let x = at(mine, p), let y = at(theirs, p), abs(x - y) < 0.01 else { return false }
+            }
+        }
+        return true
     }
 }

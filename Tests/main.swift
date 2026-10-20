@@ -1012,12 +1012,56 @@ expect(!SoftwareDim.applies(answers: true, misses: 0, hdmiAdapter: true) && !Sof
        "answers (or not asked yet): the monitor's own brightness")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, hdmiAdapter: true, software: true)
 expect(state.sliders && !state.contrast && state.offerCheck
-       && state.hints == ["Dimming the picture: HDMI from USB-C blocks", "the Dell's own brightness. Use DP or USB-C."],
+       && state.hints == ["Dimming the picture: Hammer can't reach the", "Dell through a USB-C to HDMI adapter."],
        "menu, adapter: Brightness dims the picture, no Contrast, says why")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, software: true)
-expect(state.sliders && !state.contrast && state.hints.first == "Dimming the picture: the Dell isn't", "menu, no answer: the same")
+expect(state.sliders && !state.contrast && state.hints == ["Dimming the picture: the Dell isn't answering Hammer."],
+       "menu, no answer: the same")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: true)
 expect(state.sliders && state.contrast && state.hints.isEmpty, "menu, working: both sliders, no hint")
+
+// Which slider shows: before the monitor is asked again (after a wake or replug), whatever was in use.
+expect(SoftwareDim.showing(answers: nil, misses: 0, hdmiAdapter: false, wasDimming: true)
+       && !SoftwareDim.showing(answers: nil, misses: 0, hdmiAdapter: true, wasDimming: false),
+       "not asked yet: the slider that was in use")
+expect(SoftwareDim.showing(answers: false, misses: 1, hdmiAdapter: true, wasDimming: false)
+       && !SoftwareDim.showing(answers: true, misses: 0, hdmiAdapter: true, wasDimming: true), "asked: what it said")
+
+// The curves to dim from.
+func ramp(_ n: Int, top: Float = 1) -> [Float] { (0..<n).map { Float($0) / Float(n - 1) * top } }
+let ownCurves = GammaCurves(r: ramp(256), g: ramp(256), b: ramp(256))
+let profile2 = GammaCurves(r: ramp(256, top: 0.98), g: ramp(256, top: 0.97), b: ramp(256, top: 0.96))
+let halfDim = ownCurves.scaled(by: SoftwareDim.factor(level: 50))
+expect(ownCurves.isScreensOwn && profile2.isScreensOwn, "a screen's own curves look like its own")
+expect(!halfDim.isScreensOwn && !ownCurves.scaled(by: 0.85).isScreensOwn, "a dimmed curve doesn't")
+expect(!GammaCurves(r: ramp(256), g: [Float](repeating: 0, count: 256), b: ramp(256)).isScreensOwn
+       && !GammaCurves(r: [1], g: [1], b: [1]).isScreensOwn && !GammaCurves(r: [], g: [], b: []).isScreensOwn,
+       "nor a zeroed or empty one")
+let resampled = GammaCurves(r: ramp(1024), g: ramp(1024), b: ramp(1024)).scaled(by: SoftwareDim.factor(level: 50))
+expect(halfDim.matches(resampled), "the same curves handed back with more steps still match")
+expect(!halfDim.matches(ownCurves) && !halfDim.matches(ownCurves.scaled(by: 0.6)), "different curves don't")
+expect(SoftwareDim.base(live: ownCurves, written: nil, previous: nil) == ownCurves, "first time: the screen's curves")
+expect(SoftwareDim.base(live: resampled, written: halfDim, previous: ownCurves) == ownCurves,
+       "the curves are Hammer's own dimming: the original, so dimming never stacks")
+expect(SoftwareDim.base(live: profile2, written: halfDim, previous: ownCurves) == profile2,
+       "macOS reset them or a new color profile: picked up")
+let otherApp = ownCurves.scaled(by: 0.6)
+expect(SoftwareDim.base(live: otherApp, written: halfDim, previous: ownCurves) == ownCurves
+       && SoftwareDim.base(live: otherApp, written: nil, previous: nil) == nil,
+       "another app dimmed them: never taken as the original (and with nothing known, no dimming)")
+expect(SoftwareDim.base(live: nil, written: nil, previous: ownCurves) == ownCurves && SoftwareDim.base(live: nil, written: nil, previous: nil) == nil,
+       "can't read them: the original kept, if any")
+// Re-applying over and over (every wake, every 10 seconds) never darkens it further.
+var dimScreen = ownCurves
+var dimOriginal: GammaCurves?
+var dimWritten: GammaCurves?
+for _ in 0..<20 {
+    dimOriginal = SoftwareDim.base(live: dimScreen, written: dimWritten, previous: dimOriginal)
+    dimWritten = dimOriginal!.scaled(by: SoftwareDim.factor(level: 95))
+    dimScreen = GammaCurves(r: ramp(1024, top: dimWritten!.r.last!), g: ramp(1024, top: dimWritten!.g.last!),
+                            b: ramp(1024, top: dimWritten!.b.last!))      // as macOS hands it back
+}
+expect(abs(dimScreen.r.last! - Float(SoftwareDim.factor(level: 95))) < 0.001, "re-applied 20 times at 95%: still 95%, no stacking")
 
 // MARK: YouTube player: links
 
