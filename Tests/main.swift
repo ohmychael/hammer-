@@ -1034,6 +1034,10 @@ let profile2 = GammaCurves(r: ramp(256, top: 0.98), g: ramp(256, top: 0.97), b: 
 let halfDim = ownCurves.scaled(by: SoftwareDim.factor(level: 50))
 expect(ownCurves.isScreensOwn && profile2.isScreensOwn, "a screen's own curves look like its own")
 expect(!halfDim.isScreensOwn && !ownCurves.scaled(by: 0.85).isScreensOwn, "a dimmed curve doesn't")
+expect(GammaCurves(r: ramp(256), g: ramp(256, top: 0.93), b: ramp(256, top: 0.78)).isScreensOwn,
+       "a calibrated profile with a warm white point is the screen's own")
+expect(!GammaCurves(r: ramp(256), g: ramp(256, top: 0.8), b: ramp(256, top: 0.5)).isScreensOwn,
+       "a color-shifting app's curves (blue held down) aren't")
 expect(!GammaCurves(r: ramp(256), g: [Float](repeating: 0, count: 256), b: ramp(256)).isScreensOwn
        && !GammaCurves(r: [1], g: [1], b: [1]).isScreensOwn && !GammaCurves(r: [], g: [], b: []).isScreensOwn,
        "nor a zeroed or empty one")

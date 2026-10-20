@@ -1284,9 +1284,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var dimmingInSoftware = false               // as last applied
     private var dimWatch: Timer?                         // while dimming: puts it back if something resets it
 
-    /// Dimming in software before (this run, or a level saved from an earlier one).
+    /// Dimming in software before (this run, or before a restart, until the monitor answers again).
     private var wasDimming: Bool {
-        dimmingInSoftware || dimmableScreens.contains { SoftwareDimmer.shared.savedLevel($0) < 100 }
+        dimmingInSoftware || dimmableScreens.contains { SoftwareDimmer.shared.wasActive($0) }
+    }
+
+    /// The menu's Brightness slider is the software one (the same rule as the menu).
+    private var softwareSliderShowing: Bool {
+        SoftwareDim.showing(answers: monitorAnswers, misses: monitorMisses, hdmiAdapter: monitorViaHDMIAdapter,
+                            wasDimming: wasDimming)
     }
 
     private var dimsInSoftware: Bool {
@@ -1303,6 +1309,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateSoftwareDimming() {
         guard monitorAnswers != nil else { return }        // not asked yet: reapplyIfDimming covers that time
         dimmingInSoftware = dimsInSoftware
+        if dimmingInSoftware || monitorAnswers == true {
+            for display in dimmableScreens { SoftwareDimmer.shared.setActive(dimmingInSoftware, for: display) }
+        }
         if dimmingInSoftware { SoftwareDimmer.shared.reapply(on: dimmableScreens) } else { SoftwareDimmer.shared.undoAll() }
         watchDimming()
     }
@@ -1340,7 +1349,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func softwareDimMoved(_ slider: NSSlider) {
-        guard dimmingInSoftware else { return }            // the monitor answers again: this slider is stale
+        guard softwareSliderShowing else { return }        // the monitor answers again: this slider is stale
+        dimmingInSoftware = true
         let level = Int(slider.doubleValue.rounded())
         for display in dimmableScreens { SoftwareDimmer.shared.set(level, on: display) }
     }
@@ -1915,9 +1925,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func addMonitor(to menu: NSMenu) {
         monitorSliders = [:]
-        let software = SoftwareDim.showing(answers: monitorAnswers, misses: monitorMisses,
-                                           hdmiAdapter: monitorViaHDMIAdapter, wasDimming: wasDimming)
-            && dimmableScreens.contains { SoftwareDimmer.shared.canDim($0) }
+        let software = softwareSliderShowing && dimmableScreens.contains { SoftwareDimmer.shared.canDim($0) }
         let state = MonitorMenu.make(connections: monitorCount, hasDefault: monitorHasDefault,
                                      attached: monitorAttached, screens: monitorScreens, answers: monitorAnswers,
                                      hdmiAdapter: monitorViaHDMIAdapter, software: software)
@@ -1931,6 +1939,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if state.contrast { menu.addItem(monitorSlider("Contrast", code: DDCCode.contrast)) }
         }
         for line in state.hints { menu.addItem(hint(line)) }
+        if software && SoftwareDimmer.shared.contested {
+            menu.addItem(hint("Another app keeps changing the screen's colors"))
+            menu.addItem(hint("(f.lux?), so Hammer stopped. Move the slider to retry."))
+        }
         if state.offerCheck { menu.addItem(checkMonitorItem()) }
     }
 

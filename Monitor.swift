@@ -1092,13 +1092,15 @@ struct GammaCurves: Equatable {
     var g: [Float]
     var b: [Float]
 
-    /// Looks like a screen's own (from its color profile): every color runs from
-    /// near dark to near full light. A dimmed curve, or one zeroed by a glitch, doesn't.
+    /// Looks like a screen's own (from its color profile): every color starts near
+    /// dark, the brightest reaches near full light, and none is held far down (a
+    /// warm white point is fine). A dimmed curve, a color-shifting app's, or one
+    /// zeroed by a glitch, doesn't.
     var isScreensOwn: Bool {
-        [r, g, b].allSatisfy { curve in
-            guard curve.count > 1, let first = curve.first, let last = curve.last else { return false }
-            return first <= 0.1 && last >= 0.9
-        }
+        let curves = [r, g, b]
+        guard curves.allSatisfy({ $0.count > 1 && ($0.first ?? 1) <= 0.1 }) else { return false }
+        let tops = curves.compactMap(\.last)
+        return (tops.max() ?? 0) >= 0.9 && (tops.min() ?? 0) >= 0.6
     }
 
     func scaled(by factor: Double) -> GammaCurves {

@@ -252,6 +252,9 @@ final class SoftwareDimmer {
     static let shared = SoftwareDimmer()
     private var original: [CGDirectDisplayID: GammaCurves] = [:]
     private var written: [CGDirectDisplayID: GammaCurves] = [:]   // what Hammer last put on each screen
+    private var resets: [CGDirectDisplayID: Int] = [:]            // times in a row something else changed them
+    /// Another app keeps changing a screen's curves (f.lux, another dimmer): Hammer stopped fighting it.
+    private(set) var contested = false
 
     /// The level saved for this screen's monitor (100: not dimmed).
     func savedLevel(_ display: CGDirectDisplayID) -> Int {
@@ -263,6 +266,16 @@ final class SoftwareDimmer {
                         serial: CGDisplaySerialNumber(display))
     }
 
+    /// Whether this monitor was being dimmed in software (kept across restarts,
+    /// cleared once it answers Hammer again).
+    func wasActive(_ display: CGDirectDisplayID) -> Bool {
+        UserDefaults.standard.bool(forKey: Self.key(display) + ".active")
+    }
+
+    func setActive(_ on: Bool, for display: CGDirectDisplayID) {
+        UserDefaults.standard.set(on, forKey: Self.key(display) + ".active")
+    }
+
     /// Whether this screen's picture can be dimmed (its curves can be read, and look like its own).
     func canDim(_ display: CGDirectDisplayID) -> Bool { currentOriginal(display) != nil }
 
@@ -270,7 +283,11 @@ final class SoftwareDimmer {
     @discardableResult
     func set(_ level: Int, on display: CGDirectDisplayID, save: Bool = true) -> Bool {
         let level = min(100, max(0, level))
-        if save { UserDefaults.standard.set(level, forKey: Self.key(display)) }
+        if save {
+            UserDefaults.standard.set(level, forKey: Self.key(display))
+            resets[display] = 0                          // you chose it: try again even if something fought it
+            contested = false
+        }
         guard level < 100 else {
             undo(display)
             return true
@@ -287,18 +304,31 @@ final class SoftwareDimmer {
         for display in displays { set(savedLevel(display), on: display, save: false) }
     }
 
-    /// While dimming: if something reset a screen's curves (display sleep, another app,
-    /// a new color profile), dim it again.
+    /// While dimming: if something reset a screen's curves (display sleep, a new color
+    /// profile), dim it again. If something keeps changing them (another app that
+    /// adjusts colors), stop after three times in a row rather than fight it.
     func keepApplied(on displays: [CGDirectDisplayID]) {
         for display in displays where savedLevel(display) < 100 {
-            if let mine = written[display], let now = read(display), now.matches(mine) { continue }
+            if let mine = written[display], let now = read(display), now.matches(mine) {
+                resets[display] = 0
+                continue
+            }
+            let count = (resets[display] ?? 0) + 1
+            resets[display] = count
+            if count > 3 {
+                contested = true
+                continue
+            }
             set(savedLevel(display), on: display, save: false)
         }
     }
 
-    /// Puts back a screen's original curves, if Hammer dimmed it.
+    /// Puts back a screen's original curves, if Hammer dimmed it and they're still
+    /// Hammer's (if macOS or another app has changed them since, they're left alone).
     func undo(_ display: CGDirectDisplayID) {
-        if written[display] != nil, let base = original[display] { _ = write(base, to: display) }
+        if let mine = written[display], let base = original[display], let now = read(display), now.matches(mine) {
+            _ = write(base, to: display)
+        }
         written[display] = nil
         original[display] = nil                          // read afresh next time
     }
@@ -325,7 +355,8 @@ final class SoftwareDimmer {
         return GammaCurves(r: Array(r.prefix(n)), g: Array(g.prefix(n)), b: Array(b.prefix(n)))
     }
 
-    private func write(_ curves: GammaCurves, to display: CGDirectDisplayID) -> Bool {
+    /// Writes curves as they are (the self-test uses it to stand in for macOS or another app).
+    func write(_ curves: GammaCurves, to display: CGDirectDisplayID) -> Bool {
         guard curves.r.count > 1, curves.g.count == curves.r.count, curves.b.count == curves.r.count else { return false }
         return CGSetDisplayTransferByTable(display, UInt32(curves.r.count), curves.r, curves.g, curves.b) == .success
     }
@@ -334,10 +365,11 @@ final class SoftwareDimmer {
     func curvesNow(_ display: CGDirectDisplayID) -> GammaCurves? { read(display) }
 }
 
-/// `Hammer dim-check`: dims the main screen to half for a moment, checks the curves
-/// took it, dims "again" (it mustn't stack), and puts everything back. Run by the macOS
-/// build check. macOS can report curves it didn't actually show, so the screen itself
-/// still needs a look on a real Mac.
+/// `Hammer dim-check`: dims the main screen to half, then stands in for the things
+/// that change a screen's curves (macOS resetting them, another app dimming them)
+/// and checks Hammer dims from the right curves each time, never stacking; then
+/// puts everything back exactly. Run by the macOS build check. macOS can report
+/// curves it didn't actually show, so the screen itself still needs a look on a real Mac.
 @MainActor
 func runDimCheck() -> Int32 {
     let display = CGMainDisplayID()
@@ -357,9 +389,16 @@ func runDimCheck() -> Int32 {
     check(dimmer.curvesNow(display).map { $0.matches(expected) } == true,
           "dimmed to half: top of the curve \(before.r.last ?? 0) → \(dimmer.curvesNow(display)?.r.last ?? -1)")
     dimmer.set(50, on: display, save: false)
-    dimmer.keepApplied(on: [display])
-    check(dimmer.curvesNow(display).map { $0.matches(expected) } == true, "setting it again doesn't stack")
+    check(dimmer.curvesNow(display).map { $0.matches(expected) } == true, "dimmed again: doesn't stack")
+    _ = dimmer.write(before, to: display)                          // as macOS does after a wake
+    dimmer.set(50, on: display, save: false)
+    check(dimmer.curvesNow(display).map { $0.matches(expected) } == true, "after macOS resets the curves: half again")
+    _ = dimmer.write(before.scaled(by: 0.5), to: display)          // as another dimming app would
+    dimmer.set(50, on: display, save: false)
+    check(dimmer.curvesNow(display).map { $0.matches(expected) } == true,
+          "after another app dims them: half of the original, not of the other app's")
     dimmer.set(100, on: display, save: false)
-    check(dimmer.curvesNow(display).map { $0.matches(before) } == true, "100%: put back exactly")
+    check(dimmer.curvesNow(display) == before, "100%: put back exactly")
+    if dimmer.curvesNow(display) != before { _ = dimmer.write(before, to: display) }
     return good ? 0 : 1
 }
