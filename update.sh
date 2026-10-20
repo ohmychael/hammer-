@@ -61,10 +61,10 @@ if [ $status -eq 0 ]; then
   rm -f "$FAILED"
   notify "Hammer updated to $latest."
 elif [ $status -eq 3 ]; then
-  # Installed, but macOS wouldn't start it (build.sh said why, above).
-  rm -f "$FAILED"
-  echo "$(date): $latest installed, but macOS wouldn't open it"
-  notify "Hammer $latest is installed, but macOS wouldn't open it. Try opening Hammer from Applications."
+  # Built, but macOS wouldn't open it; build.sh put the previous one back (and said why, above).
+  echo "$latest" > "$FAILED"
+  echo "$(date): macOS wouldn't open $latest; put $installed back"
+  notify "macOS wouldn't open Hammer's update, so the version you had is back."
 else
   echo "$latest" > "$FAILED"
   echo "$(date): build failed for $latest; still running $installed"

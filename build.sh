@@ -14,9 +14,8 @@ VERSION="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo dev)"
 
 mkdir -p "$BUILD"
 
-# Build for the macOS this Mac runs. Left to themselves, newer Command Line Tools
-# build for their own, newer macOS, and macOS then refuses to open Hammer
-# (error -10825, "needs a newer macOS").
+# Build for the macOS this Mac runs (what swiftc picks by default; said outright,
+# and checked below, so an app this Mac can't open is never swapped in).
 OS_VERSION="$(sw_vers -productVersion)"
 TARGET="$(uname -m)-apple-macosx${OS_VERSION%%.*}.0"
 
@@ -87,15 +86,26 @@ if [ -d "$APP" ]; then
   fi
 fi
 
+# The current Hammer is kept aside until the new one has opened; if macOS won't
+# open the new one, the current one goes back, so you're never left without it.
+PREVIOUS="$BUILD/Hammer-previous.app"
 pkill -x Hammer 2>/dev/null || true
 sleep 1
-rm -rf "$APP"
+rm -rf "$PREVIOUS"
+if [ -d "$APP" ]; then mv "$APP" "$PREVIOUS"; fi
 mkdir -p "$(dirname "$APP")"
 mv "$STAGE" "$APP"
-cp "$BUILD/Hammer" "$HOME_DIR/Hammer"          # for Terminal commands: ~/Hammer/Hammer
 if ! open "$APP"; then
-  echo "Hammer $VERSION is installed, but macOS wouldn't open it."
+  echo "macOS wouldn't open Hammer $VERSION (the error is just above)."
+  if [ -d "$PREVIOUS" ]; then
+    rm -rf "$APP"
+    mv "$PREVIOUS" "$APP"
+    open "$APP" || true
+    echo "The Hammer you had is back."
+  fi
   exit 3
 fi
+rm -rf "$PREVIOUS"
+cp "$BUILD/Hammer" "$HOME_DIR/Hammer"          # for Terminal commands: ~/Hammer/Hammer
 
 echo "Hammer $VERSION installed (built for macOS ${BUILT_FOR:-?} on $OS_VERSION)."
