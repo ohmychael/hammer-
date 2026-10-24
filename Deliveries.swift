@@ -1315,15 +1315,15 @@ struct CheckFailure: Error, Equatable {
             if text.localizedCaseInsensitiveContains("application-specific") {
                 self.init(message: "Gmail needs an app password.",
                           advice: "Your regular Google password doesn't work here. Make an app password "
-                            + "(2-Step Verification has to be on) and set up Gmail again.",
+                            + "(2-Step Verification has to be on) and paste it below.",
                           needsSetup: true, stopChecking: true, link: CheckFailure.appPasswords)
             } else if text.localizedCaseInsensitiveContains("webalert") {
                 self.init(message: "Google blocked the sign-in as unusual.",
-                          advice: "Open Gmail in your browser once, then set up Gmail again.",
+                          advice: "Open Gmail in your browser once, then try again.",
                           needsSetup: true, stopChecking: true)
             } else {
                 self.init(message: "Gmail didn't accept the app password.",
-                          advice: "Make a new app password and set up Gmail again.",
+                          advice: "Check the address, or make a new app password and paste it below.",
                           needsSetup: true, stopChecking: true, link: CheckFailure.appPasswords)
             }
         case .notAllowed(let text):

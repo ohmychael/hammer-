@@ -467,7 +467,7 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
             case .unavailable: return .failure(keychainBusy)
             case .missing:
                 return .failure(CheckFailure(message: "Hammer can't find your app password in the Keychain.",
-                                             advice: "Set up Gmail again.", needsSetup: true, stopChecking: true))
+                                             advice: "Paste it below, or make a new one.", needsSetup: true, stopChecking: true))
             }
         case .script:
             var key = cached.secret
