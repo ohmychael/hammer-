@@ -21,6 +21,12 @@
 #
 # If any step fails, Hammer is signed ad hoc as before, so a build never fails here,
 # and the update log says which signature was used.
+#
+# The keychain's password goes to `security` on its command line, the one exception
+# to keeping secrets off command lines: it's made here at random, only opens this
+# signing keychain, and is kept in a file only you can read. The stdin route
+# (`security -i`) was tried on a macOS 15 runner: there a wrong password still
+# exits 0, so a broken keychain would never be noticed and remade.
 # To remove it all: rm -rf ~/Hammer/signing
 
 SIGN_DIR="${HAMMER_SIGN_DIR:-$HOME/Hammer/signing}"
