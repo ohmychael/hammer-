@@ -1,192 +1,42 @@
-# Builds Hammer on a real Apple Silicon Mac (GitHub's macOS runner) for every
-# push, so a change that only compiles with Apple's frameworks is checked before
-# it reaches your Mac. Your Mac still runs the tests itself before installing.
-#
-# The runner has no monitor or bulbs: this checks that everything builds, the
-# tests pass, the monitor check runs without crashing, and signing works (and
-# gives the same signature the second time, so macOS keeps permissions).
-# Results also show as annotations on the commit.
-
+# Probe only (branch probe-security): how `security -i` behaves when commands with
+# passwords come on stdin instead of the command line. Not merged anywhere.
 name: macOS build
 
 on:
   push:
-  workflow_dispatch:
-
-permissions:
-  contents: write     # only to save the player check's pictures on the ci-screenshots branch
-
-defaults:
-  run:
-    shell: bash          # bash -eo pipefail: a failure inside "… | tee" fails the step
 
 jobs:
-  build:
+  probe:
     runs-on: macos-15
-    timeout-minutes: 50
     steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false    # the write token isn't left where build.sh or the tests could use it
-
-      - name: Tools
-        run: |
-          sw_vers
-          uname -m
-          swiftc --version
-          sysctl -n hw.ncpu
-          # Every minute, note what's running, so a step that hangs shows why.
-          (while sleep 60; do
-             echo "--- $(date +%T)"
-             ps -ax -o etime=,command= \
-               | grep -E "swift-frontend|codesign|/security|openssl|SecurityAgent|Hammer|build.sh| tr | od |head|PlistBuddy" \
-               | grep -v grep | cut -c1-160 || true
-           done) > /tmp/ps.log 2>&1 &
-
-      - name: Tests
-        timeout-minutes: 10
-        run: |
-          start=$(date +%s)
-          target="$(uname -m)-apple-macosx$(sw_vers -productVersion | cut -d. -f1).0"    # as build.sh does
-          swiftc -O -target "$target" HammerCore.swift Monitor.swift Player.swift Deliveries.swift Tests/main.swift \
-            -o /tmp/hammer-tests 2>&1 | tee /tmp/tests-build.log
-          /tmp/hammer-tests | tee /tmp/tests.log
-          echo "::notice title=Tests::$(tail -1 /tmp/tests.log) (built and run in $(( $(date +%s) - start )) s)"
-
-      - name: Build the app
-        timeout-minutes: 15
-        run: |
-          start=$(date +%s)
-          target="$(uname -m)-apple-macosx$(sw_vers -productVersion | cut -d. -f1).0"    # as build.sh does
-          swiftc -parse-as-library -O -target "$target" Hammer.swift HammerCore.swift Monitor.swift MonitorMac.swift \
-            Player.swift PlayerMac.swift EdgeMac.swift Deliveries.swift DeliveryAlerts.swift -o /tmp/Hammer 2>&1 | tee /tmp/app-build.log
-          echo "::notice title=App::built in $(( $(date +%s) - start )) s"
-
-      - name: Monitor commands (there's no monitor here)
-        timeout-minutes: 3
+      - name: security -i
         run: |
           set +e
-          limit() { perl -e 'alarm shift; exec @ARGV' "$@"; }     # a hang counts as a failure (exit 142)
-          limit 60 /tmp/Hammer monitor check > /tmp/check.txt 2>&1; echo "exit $?" >> /tmp/check.txt
-          limit 30 /tmp/Hammer get brightness >> /tmp/check.txt 2>&1; echo "exit $?" >> /tmp/check.txt
-          limit 30 /tmp/Hammer set brightness 40 >> /tmp/check.txt 2>&1; echo "exit $?" >> /tmp/check.txt
-          cat /tmp/check.txt
-          # Exit 1 means "no working monitor" (expected here); a crash or hang gives 128 or more.
-          if grep -qE "^exit (1[2-9][0-9]|2[0-9][0-9])$" /tmp/check.txt; then exit 1; fi
-          # Dimming the picture in software: dims the runner's screen to half, checks, puts it back.
-          limit 30 /tmp/Hammer dim-check > /tmp/dim.txt 2>&1; echo "exit $?" >> /tmp/dim.txt
-          cat /tmp/dim.txt
-          grep -q "^exit 0$" /tmp/dim.txt
-
-      - name: Install with signing
-        timeout-minutes: 20
-        run: |
-          set -o pipefail
-          perl -e 'alarm shift; exec @ARGV' 1100 bash build.sh 2>&1 \
-            | while IFS= read -r line; do echo "$(date +%T) $line"; done | tee /tmp/install1.log
-          grep -q "Signed with Hammer Local Signing" /tmp/install1.log
-          grep -q "installed (built for macOS" /tmp/install1.log      # macOS opened it; says which macOS it's for
-          codesign -d -r- ~/Applications/Hammer.app 2>&1 | grep designated | tee /tmp/req1.txt
-
-      - name: The menu bar app starts and keeps running
-        timeout-minutes: 3
-        run: |
-          set +e
-          # build.sh opened it, as at login. It must still be running after 30 s
-          # (it reads monitors, builds its menu, registers its shortcuts).
-          sleep 30
-          if pgrep -x Hammer >/dev/null; then
-            echo "Hammer is running" | tee /tmp/launch.txt
-          else
-            echo "Hammer stopped after launching" | tee /tmp/launch.txt
-            latest=$(ls -t ~/Library/Logs/DiagnosticReports/Hammer*.ips 2>/dev/null | head -1)
-            if [ -n "$latest" ]; then
-              python3 - "$latest" <<'EOF' | tee -a /tmp/launch.txt
-          import json, sys
-          body = json.loads(open(sys.argv[1]).read().split('\n', 1)[1])
-          print(body.get('exception')); print(body.get('asi'))
-          images = body.get('usedImages', [])
-          for f in body['threads'][body.get('faultingThread', 0)]['frames'][:15]:
-              print(images[f['imageIndex']].get('name', '?') if f.get('imageIndex') is not None else '?', f.get('symbol', '?'))
-          EOF
-            fi
-          fi
-          # Started the way the login item does it, from scratch.
-          pkill -x Hammer; sleep 2
-          /usr/bin/open ~/Applications/Hammer.app; sleep 20
-          pgrep -x Hammer >/dev/null && echo "…and again from open: running" | tee -a /tmp/launch.txt \
-            || echo "…and again from open: stopped" | tee -a /tmp/launch.txt
-          pkill -x Hammer || true
-          ! grep -q "stopped" /tmp/launch.txt
-
-      - name: YouTube player check (loads a real video, pops it out, takes pictures)
-        timeout-minutes: 4
-        run: |
-          set +e
-          perl -e 'alarm shift; exec @ARGV' 150 ~/Applications/Hammer.app/Contents/MacOS/Hammer player-check /tmp/player-shots \
-            > /tmp/player.txt 2>&1
-          echo "exit $?" >> /tmp/player.txt
-          cat /tmp/player.txt
-          node Tests/Player/script_test.js 2>&1 | tee -a /tmp/player.txt
-          node_status=${PIPESTATUS[0]}
-          grep -q "^SKIPPED" /tmp/player.txt && echo "::warning title=Player check::YouTube served no video to this server; skipped"
-          grep -q "^exit 0$" /tmp/player.txt && [ "$node_status" = 0 ]
-
-      - name: YouTube in Edge check (scripts compile against Edge, an app window opens)
-        if: ${{ !cancelled() }}            # also when YouTube was difficult in the step before
-        timeout-minutes: 3
-        run: |
-          set +e
-          perl -e 'alarm shift; exec @ARGV' 120 ~/Applications/Hammer.app/Contents/MacOS/Hammer edge-check > /tmp/edge.txt 2>&1
-          echo "exit $?" >> /tmp/edge.txt
-          sleep 3
-          mkdir -p /tmp/player-shots && screencapture -x /tmp/player-shots/edge.png
-          cat /tmp/edge.txt
-          pkill -x "Microsoft Edge" || true
-          /usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' ~/Applications/Hammer.app/Contents/Info.plist \
-            | tee /tmp/edge-usage.txt
-          # Without the usage text, macOS would refuse Hammer without asking. (set +e above: check both.)
-          grep -q "Microsoft Edge" /tmp/edge-usage.txt && grep -q "^exit 0$" /tmp/edge.txt
-
-      - name: Keep the pictures (on the ci-screenshots branch)
-        if: always()
-        env:
-          TOKEN: ${{ github.token }}
-        run: |
-          ls /tmp/player-shots/*.png >/dev/null 2>&1 || exit 0
-          cp /tmp/player.txt /tmp/edge.txt /tmp/player-shots/ 2>/dev/null || true
-          cd /tmp/player-shots
-          git init -q && git checkout -q -b ci-screenshots
-          git add -A
-          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "Player pictures for $GITHUB_SHA"
-          if git push -qf "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ci-screenshots; then
-            echo "::notice title=Player pictures::saved to the ci-screenshots branch"
-          else
-            echo "::warning title=Player pictures::couldn't save them"
-          fi
-
-      - name: Sign again (the way the next update does)
-        timeout-minutes: 5
-        run: |
-          rm -rf /tmp/Hammer2.app && cp -R ~/Applications/Hammer.app /tmp/Hammer2.app
-          perl -e 'alarm shift; exec @ARGV' 240 bash -c 'source ./signing.sh && sign_app /tmp/Hammer2.app' \
-            | tee /tmp/sign2.log
-          grep -q "Signed with Hammer Local Signing" /tmp/sign2.log
-          codesign -d -r- /tmp/Hammer2.app 2>&1 | grep designated | tee /tmp/req2.txt
-          cmp /tmp/req1.txt /tmp/req2.txt
-          # The signing keychain must not be left on the search list.
-          ! security list-keychains -d user | grep -q hammer-signing
-
-      - name: Report
-        if: always()
-        run: |
-          # Compiler errors and the logs, as annotations (readable without the full logs).
-          for log in /tmp/tests-build.log /tmp/app-build.log; do
-            [ -f "$log" ] || continue
-            { grep -E "error:" "$log" || true; } | head -10 | while IFS= read -r line; do echo "::error::$line"; done
-          done
-          for file in /tmp/launch.txt /tmp/player.txt /tmp/edge.txt /tmp/dim.txt /tmp/check.txt /tmp/install1.log /tmp/req1.txt /tmp/sign2.log /tmp/req2.txt /tmp/ps.log; do
-            [ -f "$file" ] || continue
-            body="$(tail -40 "$file" | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
-            echo "::notice title=$(basename "$file")::$body"
-          done
+          out="$RUNNER_TEMP/probe.txt"
+          d="$RUNNER_TEMP/with space"; mkdir -p "$d"
+          kc="$d/p.keychain-db"
+          {
+            printf 'create-keychain -p 0123abcd "%s"\n' "$kc" | security -i; echo "create (quoted path with space) exit $?"
+            ls "$d"
+            printf 'unlock-keychain -p wrongpass "%s"\n' "$kc" | security -i; echo "unlock wrong exit $?"
+            printf 'unlock-keychain -p 0123abcd "%s"\n' "$kc" | security -i; echo "unlock right exit $?"
+            printf 'unlock-keychain -p wrongpass "%s"\n' "$RUNNER_TEMP/missing.keychain-db" | security -i; echo "unlock missing exit $?"
+            printf 'unlock-keychain -p wrongpass "%s"\nshow-keychain-info "%s"\n' "$kc" "$kc" | security -i; echo "two commands, first fails: exit $?"
+            security lock-keychain "$kc"; echo "lock exit $?"
+            security show-keychain-info "$kc"; echo "show-keychain-info while locked exit $?"
+            printf 'unlock-keychain -p 0123abcd "%s"\n' "$kc" | security -i; echo "unlock again exit $?"
+            # import a p12 with -P, and set-key-partition-list -k, through -i
+            t="$RUNNER_TEMP/p12"; mkdir -p "$t"
+            printf '[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=Probe\n' > "$t/c.cnf"
+            /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 1 -config "$t/c.cnf" -keyout "$t/k.pem" -out "$t/c.pem" >/dev/null 2>&1
+            P=0123abcd /usr/bin/openssl pkcs12 -export -inkey "$t/k.pem" -in "$t/c.pem" -name Probe -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 -passout env:P -out "$t/i.p12"
+            echo "p12 exit $?"
+            printf 'import "%s" -k "%s" -P 0123abcd -T /usr/bin/codesign\n' "$t/i.p12" "$kc" | security -i; echo "import exit $?"
+            printf 'import "%s" -k "%s" -P wrongpass -T /usr/bin/codesign\n' "$t/i.p12" "$kc" | security -i; echo "import wrong pass exit $?"
+            printf 'set-key-partition-list -S apple-tool:,apple:,codesign: -s -k 0123abcd "%s"\n' "$kc" | security -i >/dev/null; echo "partition list exit $?"
+            printf 'set-key-partition-list -S apple-tool:,apple:,codesign: -s -k wrongpass "%s"\n' "$kc" | security -i >/dev/null; echo "partition list wrong exit $?"
+            security find-identity -p codesigning "$kc"; echo "find-identity exit $?"
+            ps -axo args | grep -c 0123abcd; echo "(password seen in ps: count above includes this grep)"
+          } > "$out" 2>&1
+          cat "$out"
+          echo "::notice title=probe::$(tr '\n' ' ' < "$out" | cut -c1-4000)"
