@@ -911,7 +911,7 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
 
 // MARK: - Menu bar app
 
-/// Called by macOS when Control-Option-H (id 1), Control-Option-Y (id 2) or Command-Y (id 3) is pressed.
+/// Called by macOS when ⌃⌥H (id 1), ⌃⌥Y (id 2) or ⌘Y (id 3) is pressed.
 func hotKeyPressed(_ call: EventHandlerCallRef?, _ event: EventRef?, _ userData: UnsafeMutableRawPointer?) -> OSStatus {
     guard let userData else { return noErr }
     var hotKey = EventHotKeyID()
@@ -1113,11 +1113,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let id = EventHotKeyID(signature: OSType(0x484D_4D52), id: 1)    // "HMMR"
         RegisterEventHotKey(UInt32(kVK_ANSI_H), UInt32(controlKey | optionKey), id,
                             GetApplicationEventTarget(), 0, &hotKeyRef)
+        registerYouTubeKeys()
+        // ⌃⌥Y and ⌘Y are on the key that types "y", which moves when you switch keyboard layouts.
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(keyboardLayoutChanged),
+            name: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String), object: nil,
+            suspensionBehavior: .deliverImmediately)
+    }
+
+    /// Control-Option-Y, and Command-Y while it's on: on whichever key types "y" on your
+    /// keyboard layout (on a German keyboard the American Y key types Z, so ⌘Y there
+    /// would take Undo everywhere).
+    private func registerYouTubeKeys() {
+        if let ref = playerHotKeyRef { UnregisterEventHotKey(ref) }
+        playerHotKeyRef = nil
+        youTubeKeys = YouTubeKeys(plain: YKey.code(withCommand: false), command: YKey.code(withCommand: true))
         let playerID = EventHotKeyID(signature: OSType(0x484D_4D52), id: 2)
-        playerHotKeyWorks = RegisterEventHotKey(UInt32(kVK_ANSI_Y), UInt32(controlKey | optionKey), playerID,
+        playerHotKeyWorks = RegisterEventHotKey(youTubeKeys.plain, UInt32(controlKey | optionKey), playerID,
                                                 GetApplicationEventTarget(), 0, &playerHotKeyRef) == noErr
         registerCommandY()
     }
+
+    /// The keys ⌃⌥Y and ⌘Y are on now.
+    private struct YouTubeKeys: Equatable {
+        var plain = UInt32(ShortcutKey.americanY)
+        var command = UInt32(ShortcutKey.americanY)
+    }
+    private var youTubeKeys = YouTubeKeys()
 
     /// Command-Y, while it's on.
     private func registerCommandY() {
@@ -1126,8 +1148,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         commandYWorks = true
         guard commandYOn else { return }
         let id = EventHotKeyID(signature: OSType(0x484D_4D52), id: 3)
-        commandYWorks = RegisterEventHotKey(UInt32(kVK_ANSI_Y), UInt32(cmdKey), id,
+        commandYWorks = RegisterEventHotKey(youTubeKeys.command, UInt32(cmdKey), id,
                                             GetApplicationEventTarget(), 0, &commandYRef) == noErr
+    }
+
+    /// Another keyboard layout (or input method): only if "y" moved are the shortcuts moved.
+    @objc private func keyboardLayoutChanged() {
+        guard YouTubeKeys(plain: YKey.code(withCommand: false), command: YKey.code(withCommand: true)) != youTubeKeys else { return }
+        registerYouTubeKeys()
+        rebuildMenuSoon()
+    }
+
+    /// The key that types "y" on the keyboard layout in use (Carbon's UCKeyTranslate).
+    /// `withCommand`: as typed with ⌘ held, for layouts that switch then ("Dvorak – QWERTY ⌘").
+    /// A layout with no "y" (Russian, say) uses its Latin layout, as macOS does for ⌘
+    /// shortcuts; failing that, the American Y key.
+    private enum YKey {
+        static func code(withCommand: Bool) -> UInt32 {
+            let sources = [TISCopyCurrentKeyboardLayoutInputSource(), TISCopyCurrentASCIICapableKeyboardLayoutInputSource()]
+                .compactMap { $0?.takeRetainedValue() }
+            for source in sources {
+                guard let property = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { continue }
+                let data = Unmanaged<CFData>.fromOpaque(property).takeUnretainedValue()
+                guard let bytes = CFDataGetBytePtr(data) else { continue }
+                let layout = UnsafeRawPointer(bytes).assumingMemoryBound(to: UCKeyboardLayout.self)
+                let modifiers = withCommand ? UInt32((cmdKey >> 8) & 0xFF) : 0
+                let found = ShortcutKey.code(typing: "y") { key in
+                    var deadKeys: UInt32 = 0
+                    var length = 0
+                    var characters = [UniChar](repeating: 0, count: 4)
+                    let status = UCKeyTranslate(layout, key, UInt16(kUCKeyActionDisplay), modifiers, UInt32(LMGetKbdType()),
+                                                OptionBits(kUCKeyTranslateNoDeadKeysMask), &deadKeys,
+                                                characters.count, &length, &characters)
+                    return status == noErr ? String(utf16CodeUnits: characters, count: length) : nil
+                }
+                if let found { return UInt32(found) }
+            }
+            return UInt32(ShortcutKey.americanY)
+        }
     }
 
     @objc private func toggleCommandY() {
@@ -1160,12 +1218,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                   self?.setYouTubeInEdge(false)
                                   self?.player.showDropdown()
                               })
+        made.onChange = { [weak self] in self?.rebuildMenuSoon() }
         edgeYouTube = made
         return made
     }
 
+    @objc private func allowEdgeControl() { EdgePlayer.openAutomationSettings() }
+
     /// YouTube opens in Microsoft Edge (signed in, your extensions) if it's installed,
-    /// unless you chose Hammer's own player in YouTube Options.
+    /// unless you chose Hammer's own player in Open In.
     private var youTubeInEdge: Bool {
         (UserDefaults.standard.object(forKey: "youTubeInEdge") as? Bool ?? true) && EdgePlayer.isInstalled
     }
@@ -1201,8 +1262,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func addYouTube(to menu: NSMenu) {
         menu.addItem(label("YouTube"))
         let inEdge = youTubeInEdge
-        let open = action(inEdge ? "YouTube in Edge" : youTube?.place == .mini ? "Back to the YouTube Player" : "YouTube Player",
-                          #selector(toggleYouTube))
+        // In Hammer's player with a video playing in the dropdown, this pops it back out.
+        let backToMini = !inEdge && youTube?.place == .dropdown && youTube?.playing == true
+        let open = action(backToMini ? "Back to the Mini Player" : "Open YouTube", #selector(toggleYouTube))
+        // The shortcut shown is one that's really registered.
         if commandYOn && commandYWorks {
             open.keyEquivalent = "y"
             open.keyEquivalentModifierMask = [.command]
@@ -1211,40 +1274,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             open.keyEquivalentModifierMask = [.control, .option]
         }
         menu.addItem(open)
-        if !playerHotKeyWorks && !(commandYOn && commandYWorks) {
-            menu.addItem(hint("Another app has Control-Option-Y, so it's menu only."))
+        let commandYTaken = commandYOn && !commandYWorks
+        if !playerHotKeyWorks && commandYTaken {
+            menu.addItem(hint("Other apps have ⌘Y and ⌃⌥Y; use the menu."))
+        } else if !playerHotKeyWorks && !commandYOn {
+            menu.addItem(hint("Another app has ⌃⌥Y; use the menu."))
         }
         menu.addItem(action("Play Copied Link", #selector(playCopiedLink)))
         if !inEdge, let youTube, youTube.place != .hidden, !youTube.title.isEmpty {
             menu.addItem(hint((youTube.playing ? "Playing: " : "Paused: ") + truncated(youTube.title, 44)))
         }
-        menu.addItem(youTubeOptions(inEdge: inEdge))
+        if inEdge, edgeYouTube?.needsPermission == true {
+            menu.addItem(action("Allow Edge Control…", #selector(allowEdgeControl)))
+        }
+        menu.addItem(youTubeOpenIn(inEdge: inEdge))
+        let commandY = action("⌘Y Shortcut", #selector(toggleCommandY))
+        commandY.state = commandYOn ? .on : .off
+        commandY.toolTip = "While it's on, other apps don't get ⌘Y (Quick Look in Finder, History in browsers, Redo in Office)."
+        menu.addItem(commandY)
+        if commandYTaken && playerHotKeyWorks {
+            menu.addItem(hint("Another app has ⌘Y; use ⌃⌥Y."))
+        }
     }
 
-    /// Where YouTube opens, and whether Command-Y opens it.
-    private func youTubeOptions(inEdge: Bool) -> NSMenuItem {
+    /// Where YouTube opens.
+    private func youTubeOpenIn(inEdge: Bool) -> NSMenuItem {
         let options = NSMenu()
         options.autoenablesItems = false                 // so the Edge choice really is off without Edge
-        let edgeItem = action("Open in Microsoft Edge (your account, your extensions)", #selector(useEdgeForYouTube))
+        let edgeItem = action("Microsoft Edge", #selector(useEdgeForYouTube))
         edgeItem.state = inEdge ? .on : .off
+        edgeItem.toolTip = "Your Edge account and extensions"
         let installed = EdgePlayer.isInstalled
         edgeItem.isEnabled = installed
         options.addItem(edgeItem)
         if !installed { options.addItem(hint("Microsoft Edge isn't installed.")) }
-        let hammerItem = action("Open in Hammer's Player (glass, mini player)", #selector(useHammerPlayerForYouTube))
+        let hammerItem = action("Hammer's Player", #selector(useHammerPlayerForYouTube))
         hammerItem.state = inEdge ? .off : .on
+        hammerItem.toolTip = "Glass dropdown and a floating mini player"
         options.addItem(hammerItem)
-        options.addItem(.separator())
-        let commandY = action("⌘Y Opens YouTube", #selector(toggleCommandY))
-        commandY.state = commandYOn ? .on : .off
-        options.addItem(commandY)
-        if commandYOn && !commandYWorks {
-            options.addItem(hint("Another app has ⌘Y everywhere, so use ⌃⌥Y."))
-        } else {
-            options.addItem(hint("While on, other apps don't get ⌘Y:"))
-            options.addItem(hint("Quick Look in Finder, History in browsers, Redo in Office."))
-        }
-        let item = NSMenuItem(title: "YouTube Options", action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: "Open In", action: nil, keyEquivalent: "")
         item.submenu = options
         return item
     }

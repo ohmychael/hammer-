@@ -1369,8 +1369,41 @@ expect(YouTubeLink.parseTime("90") == 90 && YouTubeLink.parseTime("1h2m3s") == 3
 expect(YouTubeLink.parseTime("") == nil && YouTubeLink.parseTime("1x") == nil && YouTubeLink.parseTime("1m30") == nil
        && YouTubeLink.parseTime("-5") == nil && YouTubeLink.parseTime("m") == nil, "bad times")
 expect(YouTubeLink.parseTime("9999999999999999h") == nil && YouTubeLink.parseTime("99999999999999999999") == nil
-       && YouTubeLink.parseTime("9999999h9999999m9999999s") == 9999999 * 3661 && YouTubeLink.parseTime("١٢") == nil,
+       && YouTubeLink.parseTime("9999999h9999999m9999999s") == nil && YouTubeLink.parseTime("١٢") == nil,
        "absurd times give nil, never a crash")
+expect(YouTubeLink.parseTime("1h1h1h") == nil && YouTubeLink.parseTime("1s1m") == nil && YouTubeLink.parseTime("1m1m") == nil
+       && YouTubeLink.parseTime("1h30s") == 3630, "each unit once, hours before minutes before seconds")
+expect(YouTubeLink.parseTime("24h") == 86_400 && YouTubeLink.parseTime("86400") == 86_400 && YouTubeLink.parseTime("86401") == nil
+       && YouTubeLink.parseTime("24h1s") == nil && YouTubeLink.parseTime("1441m") == nil, "no start time beyond 24 hours")
+expect(playerVideo("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1h1h1h") == "dQw4w9WgXcQ"
+       && playerVideo("https://youtu.be/dQw4w9WgXcQ?t=100000") == "dQw4w9WgXcQ", "a link with a nonsense time plays from the start")
+expect(playerVideo("<https://youtu.be/dQw4w9WgXcQ>") == "dQw4w9WgXcQ" && playerVideo("<https://youtu.be/dQw4w9WgXcQ?t=42>") == "dQw4w9WgXcQ@42",
+       "a link in <…>, as mail apps write them")
+expect(playerVideo("https://youtu.be/dQw4w9WgXcQ.") == "dQw4w9WgXcQ" && playerVideo("https://www.youtube.com/watch?v=dQw4w9WgXcQ)") == "dQw4w9WgXcQ"
+       && playerVideo("(https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=90).") == "dQw4w9WgXcQ@90"
+       && playerVideo("https://youtu.be/dQw4w9WgXcQ?t=42).") == "dQw4w9WgXcQ@42", "a full stop or bracket after the link")
+expect(playerVideo("https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ?start=7") == "dQw4w9WgXcQ@7"
+       && playerVideo("youtube-nocookie.com/embed/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+       && playerVideo("https://www.youtube-nocookie.com/watch?v=dQw4w9WgXcQ") == nil
+       && playerVideo("https://youtube-nocookie.com.evil.example/embed/dQw4w9WgXcQ") == nil, "privacy-mode embeds (youtube-nocookie.com/embed)")
+expect(playerVideo("<>") == nil && playerVideo(".") == nil && playerVideo("(") == nil && playerVideo(")).") == nil, "only brackets: nothing")
+
+// "Open in your browser": YouTube's full site, at the moment you're at.
+func playerBrowser(_ text: String, _ seconds: Double?) -> String? {
+    YouTubeLink.browserURL(for: URL(string: text)!, at: seconds)?.absoluteString
+}
+expect(playerBrowser("https://m.youtube.com/watch?v=dQw4w9WgXcQ&t=5s", 61.7) == "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=61s",
+       "a video: the full site, at the time you're at")
+expect(playerBrowser("https://m.youtube.com/watch?v=dQw4w9WgXcQ&t=5s", nil) == "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=5s"
+       && playerBrowser("https://m.youtube.com/watch?v=dQw4w9WgXcQ", 0.4) == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+       && playerBrowser("https://m.youtube.com/watch?v=dQw4w9WgXcQ", .nan) == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+       && playerBrowser("https://m.youtube.com/watch?v=dQw4w9WgXcQ", 1e12) == "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+       "no time known: the link's own; the very start, or nonsense: none")
+expect(playerBrowser("https://m.youtube.com/shorts/dQw4w9WgXcQ", 3) == "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=3s", "shorts too")
+expect(playerBrowser("https://m.youtube.com/results?search_query=lofi", 10) == "https://www.youtube.com/results?search_query=lofi"
+       && playerBrowser("https://accounts.google.com/x", nil) == "https://accounts.google.com/x"
+       && playerBrowser("about:blank", nil) == nil && playerBrowser("file:///etc/hosts", nil) == nil,
+       "other YouTube pages on the full site; other web pages as they are; nothing else")
 expect(playerVideo("https://youtu.be/dQw4w9WgXcQ?t=9999999999999999h") == "dQw4w9WgXcQ", "a link with an absurd time still plays")
 expect(YouTubeLink.watchURL(id: "dQw4w9WgXcQ").absoluteString == "https://m.youtube.com/watch?v=dQw4w9WgXcQ"
        && YouTubeLink.watchURL(id: "dQw4w9WgXcQ", start: 90).absoluteString == "https://m.youtube.com/watch?v=dQw4w9WgXcQ&t=90s",
@@ -1393,6 +1426,41 @@ expect(playerDecide("https://accounts.google.com/ServiceLogin") == .stay && play
 expect(playerDecide("https://accounts.google.evil.example/") == .openInBrowser
        && playerDecide("https://accounts.google.co.evil/") == .openInBrowser
        && playerDecide("https://accounts.google.c0m.au/") == .openInBrowser, "look-alike sign-in pages don't stay")
+expect(playerDecide("https://accounts.google.co.jp/x") == .stay && playerDecide("https://accounts.google.com.br/x") == .stay
+       && playerDecide("https://accounts.google.cat/x") == .stay && playerDecide("https://accounts.google.co.za/x", clicked: false) == .stay,
+       "Google's own country domains stay, even when the page goes there by itself")
+expect(playerDecide("https://accounts.google.zz/", clicked: false) == .block && playerDecide("https://accounts.google.co.zz/", clicked: false) == .block
+       && playerDecide("https://accounts.google.com.zz/", clicked: false) == .block && playerDecide("https://accounts.google.uk/", clicked: false) == .block
+       && playerDecide("https://accounts.google.co.de/", clicked: false) == .block && playerDecide("https://x.accounts.google.de/", clicked: false) == .block
+       && playerDecide("https://accounts.google.de.evil.example/", clicked: false) == .block,
+       "a country Google doesn't have (anyone could own accounts.google.zz): not in the player")
+expect(playerDecide("https://accounts.google.zz/") == .openInBrowser, "…clicked, it opens in your browser")
+expect(PlayerNavigation.googleCountries.count > 180 && PlayerNavigation.googleCountries.contains("co.uk")
+       && PlayerNavigation.googleCountries.allSatisfy { !$0.isEmpty && !$0.contains(" ") && !$0.hasPrefix(".") },
+       "Google's country list is all there: \(PlayerNavigation.googleCountries.count)")
+// The whole list, pinned: any domain added, dropped or mistyped changes the count or the checksum
+// (FNV-1a of the sorted list, comma-separated).
+let playerCountryList = PlayerNavigation.googleCountries.sorted().joined(separator: ",")
+var playerCountryHash: UInt64 = 0xcbf29ce484222325
+for byte in playerCountryList.utf8 { playerCountryHash = (playerCountryHash ^ UInt64(byte)) &* 0x100000001b3 }
+expect(PlayerNavigation.googleCountries.count == 191 && playerCountryHash == 0x12f1799e757ec206
+       && playerCountryList.hasPrefix("ad,ae,al,am,as,at,az,ba,") && playerCountryList.hasSuffix(",tt,vg,vu,ws"),
+       "the sign-in country list is exactly Google's 191 domains (\(PlayerNavigation.googleCountries.count), \(String(playerCountryHash, radix: 16)))")
+
+// MARK: YouTube: the shortcut's key follows the keyboard layout
+
+// What each key types (key code → letter) on a few layouts.
+func playerLayout(_ letters: [UInt16: String]) -> (UInt16) -> String? { { letters[$0] } }
+let playerQWERTY = playerLayout([0x00: "a", 0x06: "z", 0x10: "y", 0x11: "t", 0x03: "f", 0x0D: "w"])
+let playerQWERTZ = playerLayout([0x00: "a", 0x06: "y", 0x10: "z", 0x11: "t"])           // German: Y and Z swapped
+let playerDvorak = playerLayout([0x00: "a", 0x06: ";", 0x10: "f", 0x11: "y", 0x03: "u"])  // Dvorak: "y" is where T is
+let playerRussian = playerLayout([0x00: "ф", 0x06: "я", 0x10: "н", 0x11: "е"])
+expect(ShortcutKey.code(typing: "y", playerQWERTY) == ShortcutKey.americanY, "American keyboard: the Y key")
+expect(ShortcutKey.code(typing: "y", playerQWERTZ) == 0x06, "German keyboard: the key that types y (not Z, which would take Undo)")
+expect(ShortcutKey.code(typing: "y", playerDvorak) == 0x11, "Dvorak: the key that types y (not F, which would take Find)")
+expect(ShortcutKey.code(typing: "y", playerRussian) == nil, "a layout with no y: none (Hammer falls back to the American key)")
+expect(ShortcutKey.code(typing: "y", playerLayout([0x10: "Y"])) == nil && ShortcutKey.code(typing: "y", { _ in nil }) == nil,
+       "only a key that types exactly y")
 expect(playerDecide("about:blank") == .stay, "blank pages stay")
 expect(playerDecide("https://example.com/merch") == .openInBrowser && playerDecide("https://www.youtube.com.evil.example/") == .openInBrowser
        && playerDecide("http://amzn.to/x") == .openInBrowser, "web links you click open in your browser")
@@ -1472,12 +1540,76 @@ expect(EdgeYouTube.quoted("a\rb\tc\u{0}d\u{2028}e") == "\"abcde\"", "control cha
 let edgeFind = EdgeYouTube.findScript(prefixes: ["https://www.youtube.com/"] + EdgeYouTube.detours)
 expect(edgeFind.contains("tell application id \"com.microsoft.edgemac\"") && edgeFind.contains("mode of w is \"normal\"")
        && edgeFind.contains("(count of tabs of w) is 1")
-       && edgeFind.contains("if (u starts with \"https://www.youtube.com/\") or (u starts with \"https://consent.youtube.com/\") then")
-       && edgeFind.contains("set found to found & ((id of w) as text)") && !edgeFind.contains("& u"),
+       && edgeFind.contains("if ((u starts with \"https://www.youtube.com/\") or (u starts with \"https://consent.youtube.com/\")) then")
+       && edgeFind.contains("set found to found & ((id of w) as text)") && !edgeFind.contains("& u") && !edgeFind.contains("bounds"),
        "the find script: ordinary windows, one tab, Hammer's address (or YouTube's cookie question); only numbers come back")
 expect(EdgeYouTube.findScript(prefixes: ["x\" & (do shell script \"y"]).contains("(u starts with \"x\\\" & (do shell script \\\"y\")"),
        "an address can't break out of the script")
-expect(EdgeYouTube.findScript(prefixes: []).contains("if false then"), "no addresses: matches nothing")
+expect(EdgeYouTube.findScript(prefixes: []).contains("if (false) then"), "no addresses: matches nothing")
+let edgeFindThere = EdgeYouTube.findScript(prefixes: EdgeYouTube.anyPage, at: [3080, 25, 3840, 485])
+expect(EdgeYouTube.anyPage == ["https://www.youtube.com/", "https://consent.youtube.com/"]
+       && edgeFindThere.contains("if ((u starts with \"https://www.youtube.com/\") or (u starts with \"https://consent.youtube.com/\")) "
+                                 + "and ((bounds of w) is {3080, 25, 3840, 485}) then")
+       && !edgeFindThere.contains("& u") && !edgeFindThere.contains("& (bounds"),
+       "finding Hammer's window after Edge restarts: any YouTube page, exactly where it was; the script compares, only numbers come back")
+expect(!EdgeYouTube.findScript(prefixes: ["a"], at: [1, 2]).contains("bounds"), "a broken place is left out, never a broken script")
+
+// Huge numbers from Edge: never a crash (each of these used to take the whole app down).
+expect(EdgeYouTube.parseState("false,1e19,0,0,0", id: 1) == .unreadable, "1e19 isn't a position")
+expect(EdgeYouTube.parseState("false,-5000000000000000000,0,5000000000000000000,1", id: 1) == .unreadable
+       && EdgeYouTube.size(ofBounds: [-5_000_000_000_000_000_000, 0, 5_000_000_000_000_000_000, 1]) == nil,
+       "bounds whose width doesn't fit in a number")
+expect(EdgeYouTube.parseState("false,-1000,0,9223372036854774784,1", id: 1) == .unreadable
+       && EdgeYouTube.size(ofBounds: [-1000, 0, 9_223_372_036_854_774_784, 1]) == nil, "a right edge near the largest number")
+expect(EdgeYouTube.size(ofBounds: [Int.min, Int.min, Int.max, Int.max]) == nil && EdgeYouTube.size(ofBounds: [0, 0, 10_000_000, 1]) != nil
+       && EdgeYouTube.size(ofBounds: [0, 0, 10_000_001, 1]) == nil, "sizes worked out without overflowing, up to ten million points")
+expect(EdgeYouTube.parseState("false,-9999999.6,0,10000000,1", id: 1) == .found(EdgeYouTube.State(id: 1, minimized: false,
+       bounds: [-10_000_000, 0, 10_000_000, 1], windows: [])), "the largest positions still read")
+expect(EdgeYouTube.bounds(CGRect(x: CGFloat.nan, y: 0, width: CGFloat.infinity, height: 1e300), mainScreenHeight: 900).count == 4,
+       "nonsense frames give bounds, never a crash")
+expect(EdgeYouTube.showBounds(current: [Int.min, 0, Int.max, 1], visible: playerWideScreen, mainScreenHeight: 1600) == [3080, 25, 3840, 485],
+       "nonsense bounds: the default size in the corner")
+
+// The same, fuzzed: random answers from Edge, many of them huge or odd. None may crash, and
+// whatever is read as a window is on a screen-sized scale.
+struct EdgeFuzzRandom {
+    var state: UInt64
+    mutating func next() -> UInt64 {
+        state = state &* 6364136223846793005 &+ 1442695040888963407
+        var z = state
+        z = (z ^ (z >> 33)) &* 0xff51afd7ed558ccd
+        return z ^ (z >> 29)
+    }
+    mutating func pick<T>(_ list: [T]) -> T { list[Int(next() % UInt64(list.count))] }
+}
+var edgeRandom = EdgeFuzzRandom(state: 2026)
+let edgeOddNumbers = ["0", "-760", "3080.0", "1e19", "-1e19", "1e300", "9.22337203685478E+18", "-9.22337203685478E+18",
+                      "9223372036854775807", "-9223372036854775808", "9223372036854774784", "4.6e18", "2147483648", "nan", "inf",
+                      "-0", " 5 ", "", "missing value", "1.5", "10000000", "10000000.4", "10000001", "-1e7", "0x10"]
+var edgeFuzzOK = true
+for _ in 0..<5000 {
+    var lines = [(0..<5).map { $0 == 0 ? edgeRandom.pick(["true", "false", " false", "1", ""]) : edgeRandom.pick(edgeOddNumbers) }
+        .joined(separator: ",")]
+    for _ in 0..<Int(edgeRandom.next() % 4) {
+        lines.append("\(edgeRandom.pick(["3", "-1", "99999999999999999999", "x"])),\(edgeRandom.pick(["true", "false"])),\(edgeRandom.pick(edgeOddNumbers))")
+    }
+    let reply = lines.joined(separator: edgeRandom.pick(["\n", "\r\n", "\r"]))
+    let answer = EdgeYouTube.parseState(reply, id: 3)
+    if case .found(let state) = answer {
+        if !state.bounds.allSatisfy({ abs($0) <= 10_000_000 }) { edgeFuzzOK = false; print("  out of range: \(reply.debugDescription)") }
+        _ = EdgeYouTube.size(ofBounds: state.bounds)
+        _ = state.inFront
+        _ = EdgeYouTube.othersShown(state)
+        let shown = EdgeYouTube.showBounds(current: state.bounds, visible: playerWideScreen, mainScreenHeight: 1600)
+        if shown.count != 4 || !shown.allSatisfy({ abs($0) <= 10_000_000 }) { edgeFuzzOK = false }
+    }
+    _ = EdgeYouTube.decide(answer, edgeIsFrontApp: edgeRandom.next() % 2 == 0)
+    let bounds = (0..<4).map { _ in edgeRandom.pick([Int.max, Int.min, 0, -5, 5000, Int.max / 2, Int.min / 2, 10_000_001, -10_000_000]) }
+    _ = EdgeYouTube.size(ofBounds: bounds)
+    _ = EdgeYouTube.showBounds(current: bounds, visible: playerWideScreen, mainScreenHeight: 1600)
+    _ = EdgeYouTube.findScript(prefixes: EdgeYouTube.anyPage, at: bounds)
+}
+expect(edgeFuzzOK, "5,000 random answers from Edge: no crash, nothing off the scale")
 expect(EdgeYouTube.parseIDs("57,58,\n") == [57, 58] && EdgeYouTube.parseIDs("") == [] && EdgeYouTube.parseIDs("x,3,,") == [3],
        "reads window numbers")
 expect(EdgeYouTube.newWindow(after: [12, 57, 58], before: [12]) == 58 && EdgeYouTube.newWindow(after: [12], before: [12]) == nil
@@ -1572,12 +1704,19 @@ final class FakeEdge: EdgeDriver {
     var log: [String] = []
     var saved: [String: String] = [:]
     var visible = CGRect(x: 0, y: 0, width: 3840, height: 1575)
+    var startsAfter = 0                        // a starting Edge counts as running only after this many pauses
+    var windowAfter = 0                        // the app window shows up after this many pauses
+    var notRunningTimes = 0                    // macOS says "not running" this many times first (Edge starting up)
+    var onPause: (() -> Void)?
+    private var starting = 0
+    private var late: [(due: Int, win: Win)] = []
 
-    func running() -> String? { isRunning ? "edge-\(run)" : nil }
+    func running() -> String? { isRunning && starting == 0 ? "edge-\(run)" : nil }
     func edgeInFront() -> Bool { inFront }
     func permission(ask: Bool) async -> EdgePermission {
         if let permissionOverride { return permissionOverride }
-        guard isRunning else { return .notRunning }
+        if notRunningTimes > 0 { notRunningTimes -= 1; return .notRunning }
+        guard running() != nil else { return .notRunning }
         if !asked && ask { asked = true; log.append("asked") }
         return asked ? answer : .notAsked
     }
@@ -1586,12 +1725,30 @@ final class FakeEdge: EdgeDriver {
         guard launchWorks else { return false }
         if !isRunning {
             isRunning = true
+            starting = startsAfter
             for w in restores { add(w) }
         }
         if opensWindow, let app = arguments.first(where: { $0.hasPrefix("--app=") }) {
-            add(Win(tabs: 1, url: redirect ?? String(app.dropFirst(6))))
+            let window = Win(tabs: 1, url: redirect ?? String(app.dropFirst(6)))
+            if windowAfter > 0 { late.append((windowAfter, window)) } else { add(window) }
         }
         return true
+    }
+    /// Time passes: Edge finishes starting, late windows show up.
+    func settle() {
+        starting = 0
+        for w in late { add(w.win) }
+        late = []
+    }
+    /// Edge quits, or restarts bringing back `restored` (window IDs start over).
+    func restart(restoring restored: [Win]?) {
+        run += 1
+        windows = [:]
+        order = []
+        nextID = 1
+        late = []
+        isRunning = restored != nil
+        for w in restored ?? [] { add(w) }
     }
     @discardableResult func add(_ w: Win) -> Int {
         let id = nextID
@@ -1601,7 +1758,13 @@ final class FakeEdge: EdgeDriver {
         return id
     }
     func bringForward() async { inFront = true; log.append("forward") }
-    func pause(_ seconds: Double) async {}
+    func pause(_ seconds: Double) async {
+        if starting > 0 { starting -= 1 }
+        late = late.map { ($0.due - 1, $0.win) }
+        for w in late where w.due <= 0 { add(w.win) }
+        late.removeAll { $0.due <= 0 }
+        onPause?()
+    }
     func screen() -> (visible: CGRect, mainHeight: CGFloat) { (visible, 1600) }
     func remembered(_ key: String) -> String? { saved[key] }
     func remember(_ value: String?, _ key: String) { saved[key] = value }
@@ -1625,10 +1788,10 @@ final class FakeEdge: EdgeDriver {
     }
 
     func run(_ script: String) async -> EdgeScriptResult {
-        guard isRunning else { return .failed(number: -600, message: "Edge isn't running (-600)") }
+        guard running() != nil else { return .failed(number: -600, message: "Edge isn't running (-600)") }
         guard answer == .allowed && asked else { return .failed(number: -1743, message: "Not authorized (-1743)") }
         if script.contains("set found to") {
-            log.append("find")
+            log.append(script.contains("(bounds of w) is {") ? "find there" : "find")
             if let failFind { return .failed(number: failFind, message: "error (\(failFind))") }
             var prefixes: [String] = []
             var rest = Substring(script)
@@ -1637,9 +1800,14 @@ final class FakeEdge: EdgeDriver {
                 prefixes.append(String(text))
                 rest = rest[range.upperBound...]
             }
+            var place: [Int]?
+            if let range = script.range(of: "(bounds of w) is {") {
+                place = script[range.upperBound...].prefix { $0 != "}" }.split(separator: ",").compactMap {
+                    Int($0.trimmingCharacters(in: .whitespaces)) }
+            }
             return .ok(order.filter { id in
                 let w = windows[id]!
-                return !w.inPrivate && w.tabs == 1 && prefixes.contains { w.url.hasPrefix($0) }
+                return !w.inPrivate && w.tabs == 1 && prefixes.contains { w.url.hasPrefix($0) } && (place == nil || w.bounds == place!)
             }.map { "\($0)," }.joined())
         }
         if script.contains("return \"missing\"") {
@@ -1868,14 +2036,288 @@ let elsewhereEdge = FakeEdge()
 elsewhereEdge.redirect = "https://example.com/"
 if case .failed = edgeToggle(EdgeController(driver: elsewhereEdge)) {} else { expect(false, "a window somewhere else entirely isn't taken") }
 
-// macOS says Edge isn't running though it seemed to be (it just quit): started again.
+// macOS says Edge isn't running though it seemed to be, and then it's gone (it just quit): started again.
 let flickerEdge = FakeEdge()
 flickerEdge.isRunning = true
 flickerEdge.asked = true
-flickerEdge.permissionOverride = .notRunning
+flickerEdge.notRunningTimes = 99
+flickerEdge.onPause = { flickerEdge.isRunning = false; flickerEdge.notRunningTimes = 0; flickerEdge.onPause = nil }
 flickerEdge.log = []
-_ = edgeToggle(EdgeController(driver: flickerEdge))
-expect(flickerEdge.log.first == "launch --app=https://www.youtube.com/", "Edge quit just then: opened again \(flickerEdge.log)")
+expect(edgeToggle(EdgeController(driver: flickerEdge)) == .opened && flickerEdge.log.first == "launch --app=https://www.youtube.com/",
+       "Edge quit just then: opened again \(flickerEdge.log)")
+// …and Edge is still there but never answers: Hammer doesn't open a window blind (it couldn't tell it from yours).
+let mutedEdge = FakeEdge()
+mutedEdge.isRunning = true
+mutedEdge.asked = true
+mutedEdge.permissionOverride = .notRunning
+expect(edgeToggle(EdgeController(driver: mutedEdge)) == .failed(EdgeYouTube.plainError(nil)) && mutedEdge.log.isEmpty,
+       "Edge running but not answering: says so, opens nothing \(mutedEdge.log)")
+
+// Your own one-tab YouTube window, and macOS says "not running" for a moment while Edge is up:
+// Hammer looks at Edge's windows before opening its own, so yours is never taken for it.
+let yoursEdge = FakeEdge()
+yoursEdge.isRunning = true
+yoursEdge.asked = true
+let edgeYours = yoursEdge.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/watch?v=yourvideo00", bounds: [200, 200, 900, 600]))
+yoursEdge.notRunningTimes = 1
+let yoursController = EdgeController(driver: yoursEdge)
+expect(edgeToggle(yoursController) == .opened && yoursController.savedWindow(for: "edge-1") != edgeYours
+       && yoursEdge.windows[edgeYours]!.bounds == [200, 200, 900, 600] && yoursEdge.windows.count == 2,
+       "a brief \"not running\": your window is left alone, Hammer's opens \(yoursEdge.log)")
+// The same when a script fails with -600 while Edge is still up.
+let yours600 = FakeEdge()
+yours600.isRunning = true
+yours600.asked = true
+let edgeYours600 = yours600.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [200, 200, 900, 600]))
+yours600.saved["edgeYouTubeWindow"] = "edge-1|9"
+yours600.failState = -600
+let yours600Controller = EdgeController(driver: yours600)
+expect(edgeToggle(yours600Controller) == .opened && yours600Controller.savedWindow(for: "edge-1") != edgeYours600
+       && yours600.windows[edgeYours600]!.bounds == [200, 200, 900, 600], "a -600 while Edge is up: your window is left alone \(yours600.log)")
+// A brief "not running" with Hammer's window already open: no second window.
+let blinkEdge = FakeEdge()
+let blinkController = EdgeController(driver: blinkEdge)
+_ = edgeToggle(blinkController)
+blinkEdge.inFront = false
+blinkEdge.notRunningTimes = 2
+expect(edgeToggle(blinkController) == .shown && blinkEdge.windows.count == 1, "a brief \"not running\": the same window, shown")
+// A window that's said to be gone once, mid-answer: checked again before another is opened.
+blinkEdge.failState = -1728
+blinkEdge.log = []
+_ = edgeToggle(blinkController)
+expect(blinkEdge.log.filter { $0 == "state" }.count == 2, "\"window gone\": checked twice \(blinkEdge.log)")
+blinkEdge.failState = nil
+
+// Pile-ups. 1: you said Don't Allow, a link played anyway; later you allowed Hammer in Settings.
+let allowLater = FakeEdge()
+allowLater.isRunning = true
+allowLater.asked = true
+allowLater.answer = .denied
+allowLater.add(FakeEdge.Win(tabs: 3, url: "https://www.bing.com/"))
+let allowLaterController = EdgeController(driver: allowLater)
+expect(edgeToggle(allowLaterController, play: EdgeYouTube.watchURL(id: "jNQXAC9IVRw")) == .notAllowed(openedAnyway: true)
+       && allowLater.windows.count == 2, "not allowed: the video still plays")
+allowLater.answer = .allowed
+allowLater.log = []
+expect(edgeToggle(allowLaterController) == .shown && allowLater.windows.count == 2 && !allowLater.log.contains { $0.hasPrefix("launch") }
+       && allowLaterController.savedWindow(for: "edge-1") == 2 && allowLater.windows[2]!.bounds == [3080, 25, 3840, 485],
+       "allowed later: the next press takes that window and puts it in the corner, no second one \(allowLater.log)")
+expect(allowLater.saved["edgeYouTubeLaunched"] == nil, "…and stops looking for it")
+// 1b: the same with Edge closed: Don't Allow (YouTube opens anyway), then allowed.
+let allowLaterCold = FakeEdge()
+allowLaterCold.answer = .denied
+let allowLaterColdController = EdgeController(driver: allowLaterCold)
+expect(edgeToggle(allowLaterColdController) == .notAllowed(openedAnyway: true), "Edge closed, not allowed: opened anyway")
+allowLaterCold.answer = .allowed
+allowLaterCold.inFront = true
+allowLaterCold.log = []
+expect(edgeToggle(allowLaterColdController) == .shown && allowLaterCold.windows.count == 1
+       && allowLaterCold.windows[1]!.bounds == [3080, 25, 3840, 485] && !allowLaterCold.log.contains("hide 1"),
+       "allowed later: that window comes to the corner (not tucked away, though it's in front) \(allowLaterCold.log)")
+// 2: Edge takes longer to start than Hammer looks.
+let slowStart = FakeEdge()
+slowStart.startsAfter = 70
+let slowStartController = EdgeController(driver: slowStart)
+if case .failed = edgeToggle(slowStartController) {} else { expect(false, "too slow: says so") }
+slowStart.settle()                                            // it's there now
+slowStart.log = []
+expect(edgeToggle(slowStartController) == .shown && slowStart.windows.count == 1 && !slowStart.log.contains { $0.hasPrefix("launch") }
+       && slowStart.windows[1]!.bounds == [3080, 25, 3840, 485], "the next press takes the window that came late \(slowStart.log)")
+// 2b: Edge running, but its window takes too long; then it shows up. Your window that was there already isn't taken.
+let slowWindow = FakeEdge()
+slowWindow.isRunning = true
+slowWindow.asked = true
+let edgeSlowYours = slowWindow.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [10, 10, 500, 400]))
+slowWindow.windowAfter = 100
+let slowWindowController = EdgeController(driver: slowWindow)
+if case .failed = edgeToggle(slowWindowController) {} else { expect(false, "window too slow: says so") }
+slowWindow.settle()
+expect(edgeToggle(slowWindowController) == .shown && slowWindowController.savedWindow(for: "edge-1") == 2
+       && slowWindow.windows[edgeSlowYours]!.bounds == [10, 10, 500, 400], "the late window is taken, not yours")
+// …and if you closed the late one first, yours still isn't taken: a new one opens.
+let slowClosed = FakeEdge()
+slowClosed.isRunning = true
+slowClosed.asked = true
+let edgeSlowClosedYours = slowClosed.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [10, 10, 500, 400]))
+slowClosed.windowAfter = 100
+let slowClosedController = EdgeController(driver: slowClosed)
+_ = edgeToggle(slowClosedController)
+slowClosed.settle()
+slowClosed.windows[2] = nil
+slowClosed.order.removeAll { $0 == 2 }
+slowClosed.windowAfter = 0
+expect(edgeToggle(slowClosedController) == .opened && slowClosedController.savedWindow(for: "edge-1") == 3
+       && slowClosed.windows[edgeSlowClosedYours]!.bounds == [10, 10, 500, 400], "closed before it was found: yours is left alone")
+// A window Hammer opened before Edge was even running is only looked for for ten minutes.
+let staleStart = FakeEdge()
+staleStart.startsAfter = 70
+let staleStartController = EdgeController(driver: staleStart)
+_ = edgeToggle(staleStartController)
+staleStart.settle()
+staleStartController.clock = { Date().addingTimeInterval(11 * 60) }
+staleStart.log = []
+_ = edgeToggle(staleStartController)
+expect(staleStart.log.contains { $0.hasPrefix("launch") }, "…after ten minutes it's not taken for Hammer's \(staleStart.log)")
+
+// Your own windows are never taken for the one Hammer opened but didn't find (from the review).
+// R1: first use, Edge closed, Don't Allow; you then watch YouTube in your own one-tab window; later you allow.
+let reviewR1 = FakeEdge()
+reviewR1.answer = .denied
+let reviewR1Controller = EdgeController(driver: reviewR1)
+_ = edgeToggle(reviewR1Controller)
+let reviewR1Yours = reviewR1.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/watch?v=yourvideo00", bounds: [200, 200, 900, 600]))
+reviewR1.answer = .allowed
+expect(edgeToggle(reviewR1Controller) == .shown && reviewR1Controller.savedWindow(for: "edge-1") == 1
+       && reviewR1.windows[reviewR1Yours]!.bounds == [200, 200, 900, 600], "R1: Hammer's own (the first) is taken, not your newer one")
+// R2: Edge running, not allowed, Play Copied Link; you close that window; your own older one is there; later you allow.
+let reviewR2 = FakeEdge()
+reviewR2.isRunning = true
+reviewR2.asked = true
+reviewR2.answer = .denied
+let reviewR2Yours = reviewR2.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [200, 200, 900, 600]))
+let reviewR2Controller = EdgeController(driver: reviewR2)
+_ = edgeToggle(reviewR2Controller, play: EdgeYouTube.watchURL(id: "jNQXAC9IVRw"))
+let reviewR2Hammer = reviewR2.windows.keys.max()!
+reviewR2.windows[reviewR2Hammer] = nil
+reviewR2.order.removeAll { $0 == reviewR2Hammer }
+reviewR2.answer = .allowed
+_ = edgeToggle(reviewR2Controller)
+expect(reviewR2Controller.savedWindow(for: "edge-1") != reviewR2Yours && reviewR2.windows[reviewR2Yours]!.bounds == [200, 200, 900, 600],
+       "R2: you closed Hammer's window: yours isn't taken")
+// R3: allowed, Play Copied Link, Edge never shows the window; your one-tab window on another video was there.
+let reviewR3 = FakeEdge()
+reviewR3.isRunning = true
+reviewR3.asked = true
+let reviewR3Yours = reviewR3.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/watch?v=yourvideo00", bounds: [200, 200, 900, 600]))
+reviewR3.opensWindow = false
+let reviewR3Controller = EdgeController(driver: reviewR3)
+_ = edgeToggle(reviewR3Controller, play: EdgeYouTube.watchURL(id: "jNQXAC9IVRw"))
+_ = edgeToggle(reviewR3Controller)
+expect(reviewR3Controller.savedWindow(for: "edge-1") != reviewR3Yours && reviewR3.windows[reviewR3Yours]!.bounds == [200, 200, 900, 600],
+       "R3: a window of yours on another video isn't taken after a slow open")
+// R4: a slow open; days later, in the same run of Edge, you open your own one-tab YouTube window.
+let reviewR4 = FakeEdge()
+reviewR4.isRunning = true
+reviewR4.asked = true
+reviewR4.opensWindow = false
+let reviewR4Controller = EdgeController(driver: reviewR4)
+_ = edgeToggle(reviewR4Controller)
+reviewR4Controller.clock = { Date().addingTimeInterval(3 * 86_400) }
+let reviewR4Yours = reviewR4.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [200, 200, 900, 600]))
+_ = edgeToggle(reviewR4Controller)
+expect(reviewR4Controller.savedWindow(for: "edge-1") != reviewR4Yours && reviewR4.windows[reviewR4Yours]!.bounds == [200, 200, 900, 600],
+       "R4: days later, your own window isn't taken")
+// R5: allowed later, with Hammer's window still there and a newer one of yours: Hammer's wins.
+let reviewR5 = FakeEdge()
+reviewR5.isRunning = true
+reviewR5.asked = true
+reviewR5.answer = .denied
+let reviewR5Controller = EdgeController(driver: reviewR5)
+_ = edgeToggle(reviewR5Controller, play: EdgeYouTube.watchURL(id: "jNQXAC9IVRw"))
+let reviewR5Hammer = reviewR5.windows.keys.max()!
+reviewR5.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [200, 200, 900, 600]))
+reviewR5.answer = .allowed
+_ = edgeToggle(reviewR5Controller)
+expect(reviewR5Controller.savedWindow(for: "edge-1") == reviewR5Hammer, "R5: Hammer's own window wins over your newer one")
+// Not allowed, Edge running, and two windows on that video: Hammer couldn't look first, so it doesn't guess.
+let guessEdge = FakeEdge()
+guessEdge.isRunning = true
+guessEdge.asked = true
+guessEdge.answer = .denied
+let guessYours = guessEdge.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/watch?v=jNQXAC9IVRw", bounds: [200, 200, 900, 600]))
+let guessController = EdgeController(driver: guessEdge)
+_ = edgeToggle(guessController, play: EdgeYouTube.watchURL(id: "jNQXAC9IVRw"))
+guessEdge.answer = .allowed
+_ = edgeToggle(guessController)
+expect(guessController.savedWindow(for: "edge-1") != guessYours && guessEdge.windows[guessYours]!.bounds == [200, 200, 900, 600],
+       "two windows that could be it and no look first: neither is taken")
+expect(guessEdge.saved["edgeYouTubeLaunched"] == nil, "…and it isn't looked for again")
+// Edge starts too slowly to be seen within the wait, bringing back a window of yours on the same page:
+// Hammer never saw that run of Edge start, so it doesn't know which window came first, and doesn't guess.
+let coldGuess = FakeEdge()
+coldGuess.startsAfter = 70
+coldGuess.restores = [FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [200, 200, 900, 600])]
+let coldGuessController = EdgeController(driver: coldGuess)
+if case .failed = edgeToggle(coldGuessController) {} else { expect(false, "too slow to be seen: says so") }
+expect(coldGuess.saved["edgeYouTubeLaunched"]?.split(separator: "|", omittingEmptySubsequences: false).dropFirst(2).first == "?",
+       "Edge never seen running: which windows were there is unknown")
+coldGuess.settle()
+_ = edgeToggle(coldGuessController)
+expect(coldGuessController.savedWindow(for: "edge-1") != 1 && coldGuess.windows[1]!.bounds == [200, 200, 900, 600],
+       "…so of your window and Hammer's, neither is guessed at: yours is left alone \(coldGuess.log)")
+
+// It's looked for once: if that look finds nothing, it's forgotten even when opening a new one fails.
+let onceEdge = FakeEdge()
+onceEdge.isRunning = true
+onceEdge.asked = true
+onceEdge.opensWindow = false
+let onceController = EdgeController(driver: onceEdge)
+_ = edgeToggle(onceController)
+expect(onceEdge.saved["edgeYouTubeLaunched"] != nil, "(the window that didn't show up is remembered)")
+onceEdge.launchWorks = false
+_ = edgeToggle(onceController)
+expect(onceEdge.saved["edgeYouTubeLaunched"] == nil, "looked for once and not there: forgotten")
+// Edge restarts while Hammer waits for its window, handing out the old numbers again: still found.
+let midRestart = FakeEdge()
+midRestart.isRunning = true
+midRestart.asked = true
+midRestart.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [200, 200, 900, 600]))   // window 1, yours
+midRestart.windowAfter = 5
+midRestart.onPause = {
+    midRestart.onPause = nil
+    midRestart.restart(restoring: [])                                   // your window gone; numbers start again at 1
+    midRestart.windowAfter = 0
+    midRestart.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/"))  // Hammer's, as window 1 of the new run
+}
+let midRestartController = EdgeController(driver: midRestart)
+expect(edgeToggle(midRestartController) == .opened && midRestartController.savedWindow(for: "edge-2") == 1,
+       "Edge restarted mid-way: Hammer's window is found by its new number \(midRestart.log)")
+// Where Hammer's window is, saved as soon as Hammer puts it there.
+let placeEdge = FakeEdge()
+let placeController = EdgeController(driver: placeEdge)
+_ = edgeToggle(placeController)
+expect(placeController.rememberedPlace == [3080, 25, 3840, 485], "opened: its place is saved")
+placeEdge.windows[1]!.bounds = [200, 300, 1100, 820]               // you moved it
+placeEdge.inFront = false
+_ = edgeToggle(placeController)
+expect(placeController.rememberedPlace == [2940, 25, 3840, 545], "shown in the corner again: that place is saved")
+// 3: Edge restarts (an update) and brings Hammer's window back where it was.
+let restartEdge = FakeEdge()
+let restartController = EdgeController(driver: restartEdge)
+_ = edgeToggle(restartController)                             // opened, in the corner
+_ = edgeToggle(restartController)                             // tucked away
+expect(restartController.rememberedPlace == [3080, 25, 3840, 485], "where it was is remembered")
+restartEdge.restart(restoring: [FakeEdge.Win(tabs: 2, url: "https://www.bing.com/"),
+                                FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/watch?v=abc", bounds: [500, 100, 1300, 600]),
+                                FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/watch?v=xyz", minimized: true, bounds: [3080, 25, 3840, 485])])
+restartEdge.inFront = false
+restartEdge.log = []
+expect(edgeToggle(restartController) == .shown && restartEdge.windows.count == 3 && !restartEdge.log.contains { $0.hasPrefix("launch") }
+       && restartController.savedWindow(for: "edge-2") == 3 && !restartEdge.windows[3]!.minimized,
+       "after a restart: the window that's exactly where Hammer's was is Hammer's \(restartEdge.log)")
+expect(restartEdge.windows[2]!.bounds == [500, 100, 1300, 600], "…your other YouTube window is left alone")
+// …but one somewhere else isn't taken (you moved it, or it's yours): a new one.
+restartEdge.restart(restoring: [FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [3080, 25, 3840, 486])])
+expect(edgeToggle(restartController) == .opened && restartEdge.windows[1]!.bounds == [3080, 25, 3840, 486]
+       && restartController.savedWindow(for: "edge-3") == 2, "a window a point away isn't taken for Hammer's")
+
+// Crashes: huge numbers in Edge's answer are read as nonsense (the window is shown, never reopened).
+let hugeEdge = FakeEdge()
+let hugeController = EdgeController(driver: hugeEdge)
+_ = edgeToggle(hugeController)
+for reply in ["false,1e19,0,0,0", "false,-5000000000000000000,0,5000000000000000000,1", "false,-1000,0,9223372036854774784,1",
+              "false,-9223372036854775808,0,9223372036854775807,1\n1,false,1e300"] {
+    hugeEdge.stateReply = reply
+    expect(edgeToggle(hugeController) == .shown, "huge numbers from Edge (\(reply.prefix(30))…): shown, no crash")
+}
+hugeEdge.stateReply = nil
+hugeEdge.windows = [:]                                        // you closed it
+hugeEdge.order = []
+hugeEdge.saved["edgeYouTubeSize"] = "99999999999,99999999999"
+hugeEdge.saved["edgeYouTubePlace"] = "-9223372036854775808,0,9223372036854775807,1"
+expect(hugeController.rememberedPlace == nil, "a nonsense saved place isn't used")
+expect(edgeToggle(hugeController) == .opened && hugeEdge.windows[2]?.bounds == [3080, 25, 3840, 485]
+       && hugeController.rememberedPlace == [3080, 25, 3840, 485], "a nonsense saved size: the default size; the place is saved afresh")
 
 // Tucking away fails: said so.
 let stuckEdge = FakeEdge()

@@ -226,10 +226,15 @@ final class EdgePlayer {
     private let screen: () -> NSScreen?
     private let useHammerPlayer: () -> Void
     private var busySince: Date?
-    private var toldAboutPermission = false
+    private var queued: (url: URL?, at: Date)?      // one press that came while busy (url nil: the shortcut)
+    private var toldAboutPermission = false         // the alert about it: once per launch
     private var cameFrom: NSRunningApplication?     // the app you were in when YouTube last came forward
+    /// You said no to Hammer steering Edge (the menu then offers Allow Edge Control…).
+    private(set) var needsPermission = false
+    var onChange: (() -> Void)?                     // the menu shows Allow Edge Control… or not
 
-    /// `screen`: the menu bar icon's screen. `useHammerPlayer`: switch to Hammer's own player.
+    /// `screen`: the menu bar icon's screen (used when the pointer's isn't known).
+    /// `useHammerPlayer`: switch to Hammer's own player.
     init(screen: @escaping () -> NSScreen?, useHammerPlayer: @escaping () -> Void) {
         self.screen = screen
         self.useHammerPlayer = useHammerPlayer
@@ -238,26 +243,55 @@ final class EdgePlayer {
     /// Opens, shows or tucks away YouTube's Edge window; with `url`, plays it there.
     func toggle(play url: URL? = nil) {
         // One press at a time: the first may wait on macOS's question, and every step has
-        // its own time limit. Only if something got stuck anyway is it forgotten (ten minutes).
-        if let since = busySince, Date().timeIntervalSince(since) < 600 { return }
+        // its own time limit. One more press is kept for when it's done (a quick double
+        // press shows and tucks away). Only if something got stuck anyway is it forgotten (ten minutes).
+        if let since = busySince, Date().timeIntervalSince(since) < 600 {
+            if queued == nil || url != nil { queued = (url, Date()) }
+            return
+        }
         busySince = Date()
+        queued = nil
         let front = NSWorkspace.shared.frontmostApplication
         let from = front?.bundleIdentifier == EdgeYouTube.bundleID || front == NSRunningApplication.current ? nil : front
-        driver.prepare(screen: screen())
+        driver.prepare(screen: NSScreen.withPointer ?? screen())          // where you're working
         let controller = self.controller
         Task { @MainActor in
             let outcome = await controller.toggle(play: url)
+            let finished = Date()
             self.busySince = nil
             if outcome == .opened || outcome == .shown { self.cameFrom = from }   // where to go back to on the next hide
-            self.handle(outcome)
+            let next = self.queued
+            self.queued = nil
+            guard self.handle(outcome), let next else { return }
+            // The shortcut pressed again during a slow open (Edge starting, macOS's question) would
+            // tuck the new window straight away: only a quick double press counts. A video to play
+            // always does (it never tucks anything away).
+            if next.url == nil && (outcome == .opened || finished.timeIntervalSince(next.at) > 1) { return }
+            self.toggle(play: next.url)
         }
     }
 
-    private func handle(_ outcome: EdgeController.Outcome) {
+    /// Opens Privacy & Security → Automation in System Settings, where you let Hammer steer Edge.
+    static func openAutomationSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func permissionNeeded(_ needed: Bool) {
+        guard needsPermission != needed else { return }
+        needsPermission = needed
+        onChange?()
+    }
+
+    /// Deals with how a press went. false: it showed you something, so a press that came
+    /// meanwhile is dropped.
+    private func handle(_ outcome: EdgeController.Outcome) -> Bool {
         switch outcome {
         case .opened, .shown:
-            break
+            permissionNeeded(false)
         case .hidden(let othersShown):
+            permissionNeeded(false)
             // Typing goes back to the app you came from, not to an Edge window you can't
             // see. If Edge still shows other windows, you were working in Edge: stay there.
             let app = cameFrom
@@ -268,8 +302,14 @@ final class EdgePlayer {
             }
         case .notInstalled:
             useHammerPlayer()
+            return false
         case .notAllowed(let openedAnyway):
-            if openedAnyway && toldAboutPermission { return }  // don't nag every time; you know how to fix it
+            permissionNeeded(true)
+            // Once per launch, never stacked: after that the menu has Allow Edge Control….
+            guard !toldAboutPermission else {
+                if !openedAnyway { NSSound.beep() }            // nothing happened: a sound says so
+                return true
+            }
             toldAboutPermission = true
             let alert = NSAlert()
             alert.messageText = "Let Hammer steer Microsoft Edge"
@@ -282,14 +322,13 @@ final class EdgePlayer {
             alert.addButton(withTitle: "Not Now")
             switch show(alert) {
             case .alertFirstButtonReturn:
-                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
-                    NSWorkspace.shared.open(url)
-                }
+                Self.openAutomationSettings()
             case .alertSecondButtonReturn:
                 useHammerPlayer()
             default:
                 break
             }
+            return false
         case .failed(let message):
             let alert = NSAlert()
             alert.messageText = "Couldn't open YouTube in Edge"
@@ -297,10 +336,15 @@ final class EdgePlayer {
             alert.addButton(withTitle: "OK")
             alert.addButton(withTitle: "Use Hammer's Player")
             if show(alert) == .alertSecondButtonReturn { useHammerPlayer() }
+            return false
         }
+        return true
     }
 
+    /// Presses while it's up are dropped, so alerts never stack.
     private func show(_ alert: NSAlert) -> NSApplication.ModalResponse {
+        busySince = Date()
+        defer { busySince = nil }
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
         return alert.runModal()
     }
@@ -335,6 +379,7 @@ enum EdgeCheck {
         // Compiling loads Edge's dictionary from its app; nothing is sent to Edge.
         let link = EdgeYouTube.watchURL(id: "jNQXAC9IVRw", start: 5)
         let scripts = [("find", EdgeYouTube.findScript(prefixes: [EdgeYouTube.matchPrefix(EdgeYouTube.home)] + EdgeYouTube.detours)),
+                       ("find-where-it-was", EdgeYouTube.findScript(prefixes: EdgeYouTube.anyPage, at: [3080, 25, 3840, 485])),
                        ("state", EdgeYouTube.stateScript(id: 1)),
                        ("show", EdgeYouTube.showScript(id: 1, bounds: [3080, 25, 3840, 485])),
                        ("hide", EdgeYouTube.hideScript(id: 1)), ("play", EdgeYouTube.goScript(id: 1, url: link)),
