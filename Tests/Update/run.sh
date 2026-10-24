@@ -158,14 +158,14 @@ hold_lock() {
   printf '%s\n%s\n' "$!" "$(ps -o lstart= -p "$!")" > "$HOME/Hammer/.update.lock/pid"
 }
 
-# A "Hammer" that's busy (a dialog is open) for $1 seconds: a copy of sleep named Hammer.
+# A "Hammer" that's busy for $1 seconds (why: $2, or a dialog): a copy of sleep named Hammer.
 busy_hammer() {
   local real
   for real in /bin/sleep /usr/bin/sleep; do [ -x "$real" ] && break; done
   mkdir -p "$WORK/bin" && /bin/cp "$real" "$WORK/bin/Hammer"
   "$WORK/bin/Hammer" "$1" &
   holders+=($!)
-  printf '%s\na dialog is open\n' "$!" > "$HOME/Hammer/.busy"
+  printf '%s\n%s\n' "$!" "${2:-a dialog is open}" > "$HOME/Hammer/.busy"
 }
 
 app_version() { cat "$HOME/Applications/Hammer.app/Contents/Resources/VERSION" 2>/dev/null || echo none; }
@@ -628,10 +628,16 @@ scenario_signing_logout() {
 scenario_busy() {
   echo "[10: Hammer is busy (a dialog, or YouTube)]"
   B="$(commit B)"
-  busy_hammer 2
+  busy_hammer 2 YouTube
   FAKE_SLEEP_SCALE=0.05 upd
   check 'said "waits until you.re done" && [ "$elapsed" -ge 2 ] && [ "$(app_version)" = "$B" ] && [ "$(running)" = "$B" ]' \
     "the update is built, waits until you're done, then installs"
+  check 'said "Hammer is busy (YouTube)"' "…and the log says why it waited"
+  B2="$(commit B2)"
+  busy_hammer 1 $'a dialog is open\e[31m; $(id)'
+  FAKE_SLEEP_SCALE=0.05 upd
+  check 'said "Hammer is busy (a dialog is open31m id)" && [ "$(app_version)" = "$B2" ]' \
+    "a strange reason is shown as plain text"
   C="$(commit C)"
   busy_hammer 300
   upd

@@ -21,7 +21,7 @@ STAGE="$BUILD/Hammer.app"
 PREVIOUS="$BUILD/Hammer-previous.app"  # the Hammer you had, while a new one is tried
 SWAPPING="$BUILD/.swapping"            # while the app is being swapped
 LAUNCHED="$HOME_DIR/.launched"         # Hammer writes its version here once it has started
-BUSY="$HOME_DIR/.busy"                 # Hammer: a dialog is open (its PID, then why)
+BUSY="$HOME_DIR/.busy"                 # Hammer is busy: a dialog, or its YouTube player (its PID, then why)
 RETRY="$HOME_DIR/.retry-later"
 BUNDLE_ID="local.hammer"
 PLISTBUDDY="${HAMMER_PLISTBUDDY:-/usr/libexec/PlistBuddy}"   # tests swap in stand-ins
@@ -257,15 +257,17 @@ PLIST
 source "$REPO/signing.sh"
 sign_app "$STAGE"
 
-# 3. Wait until you're done: not while one of Hammer's dialogs is open (Hammer
-# keeps ~/Hammer/.busy then, with its PID). At most 30 minutes.
+# 3. Wait until you're done: not while one of Hammer's dialogs is open or its own
+# YouTube player is open or playing (Hammer keeps ~/Hammer/.busy then, with its
+# PID and why). At most 30 minutes.
 hammer_busy() {
   local pid
   pid="$(sed -n 1p "$BUSY" 2>/dev/null)"
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o comm= 2>/dev/null | grep -q 'Hammer$'
 }
 if hammer_busy; then
-  echo "A Hammer dialog is open, so the update waits until you're done (at most 30 minutes)."
+  why="$(sed -n 2p "$BUSY" 2>/dev/null | tr -cd '[:alnum:] ,.-')"
+  echo "Hammer is busy (${why:-in use}), so the update waits until you're done (at most 30 minutes)."
   if [ -n "${HAMMER_STATUS_FILE:-}" ]; then
     printf 'state=waiting\ntime=%s\nversion=%s\nmessage=%s\ndetail=\n' "$(date +%s)" "$VERSION" \
       "Update ready · installs when you're done" \

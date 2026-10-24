@@ -115,7 +115,7 @@ Each build is signed with a certificate made once on your Mac (in `~/Hammer/sign
 
 Hammer checks this repo at login and every 5 minutes, and every 2 minutes while it's running. When there's a new commit it rebuilds and restarts itself. Every update first runs the tests in `Tests/main.swift`; if a test fails or the new version doesn't build, the update stops and the current one keeps running. The new version is kept only once it has started properly; if it doesn't, the one you had comes back. You can also choose **Check for Updates** in the menu. The menu shows what the last check found (for example "Up to date · checked 2:14 PM"), and Hammer shows a notification when it has updated.
 
-- An update doesn't restart Hammer while one of its dialogs is open; it waits until you're done, for up to 30 minutes.
+- An update doesn't restart Hammer while one of its dialogs is open, or while Hammer's own YouTube player is open or playing; it waits until you're done, for up to 30 minutes. (A video in Edge isn't affected: it plays in Edge.)
 - Problems with your Mac rather than the update (Apple's command-line tools need reinstalling after a macOS upgrade, the disk is almost full) are shown in the menu with what to do, and the update is tried again later.
 - An update cut off part-way (by a logout or a shutdown) puts the Hammer you had back on the next run, even offline.
 

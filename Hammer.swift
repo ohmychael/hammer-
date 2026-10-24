@@ -1443,7 +1443,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let window = self?.statusItem.button?.window else { return (NSScreen.main, nil) }
             return (window.screen, window.frame)
         })
-        made.onChange = { [weak self] in self?.rebuildMenuSoon() }
+        made.onChange = { [weak self, weak made] in
+            self?.rebuildMenuSoon()
+            // An update restarts Hammer, which would cut off a video in Hammer's own
+            // player, so it waits while the player is open or playing. (A video in
+            // Edge plays in Edge itself, so it doesn't need this.)
+            if let made { Busy.set("YouTube", made.place != .hidden || made.playing) }
+        }
         youTube = made
         return made
     }

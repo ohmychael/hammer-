@@ -14,9 +14,10 @@ import UserNotifications
 private let hammerFolder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Hammer")
 
 /// Tells build.sh not to restart Hammer for an update just now (it waits up to 30
-/// minutes). Dialogs are covered by `watchDialogs()`. Anything else that shouldn't be
-/// cut off can call `Busy.set("<what>", true)` while it's going, and
-/// `Busy.set("<what>", false)` once it's done (nothing else does yet).
+/// minutes). Dialogs are covered by `watchDialogs()`, and Hammer's own YouTube player
+/// sets "YouTube" while it's open or playing. Anything else that shouldn't be cut off
+/// can call `Busy.set("<what>", true)` while it's going, and `Busy.set("<what>", false)`
+/// once it's done.
 @MainActor
 enum Busy {
     private static var reasons: Set<String> = []
