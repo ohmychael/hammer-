@@ -2049,8 +2049,9 @@ for (subject, verdict) in [("We were unable to deliver your parcel today", Deliv
            "general rule: \(subject) → \(verdict.map(\.rawValue) ?? "nil")")
 }
 expect(classified("Etsy: Delivered", from: "Etsy <transaction@etsy.com>") == nil
-       && classified("OnTrac: Delivered", from: "OnTrac <noreply@ontrac.com>") == .delivered,
-       "a bare 'Delivered' is about a parcel when a carrier sends it, not a store")
+       && classified("OnTrac: Delivered", from: "OnTrac <noreply@ontrac.com>") == nil
+       && classified("OnTrac: Package Delivered", from: "OnTrac <noreply@ontrac.com>") == .delivered,
+       "a bare 'Delivered' names no parcel, even from a carrier")
 
 // Negatives and questions: a question isn't news; "wasn't delivered" is a problem.
 for (subject, verdict) in [("Your package hasn't been delivered", Delivery.Kind.problem),
@@ -2101,8 +2102,8 @@ expect(classified("UPS Delivery Notification, Tracking Number 1Z999AA10123456784
        "UPS's own delivered notice still is")
 expect(classified("Out for delivery today: order #1042 (order #1041 was delivered)", from: "Shop <s@shop.app>") == .outForDelivery,
        "out for delivery comes first")
-expect(classified("Delivery attempted; redelivery scheduled for Monday", from: upsFrom) == nil,
-       "scheduled comes before problems")
+expect(classified("Delivery attempted; redelivery scheduled for Monday", from: upsFrom) == .problem,
+       "a problem beats 'scheduled'")
 // 3. Not a parcel for you, before problems and delivered.
 expect(classified("Your order was cancelled and will not be delivered", from: walmartFrom) == nil, "cancelled comes before problems")
 expect(classified("Your Amazon.com eGift Card has been delivered", from: amazonFrom) == nil, "a gift card has nothing to deliver")
@@ -2153,6 +2154,41 @@ expect(shopCA?.store == "Unverified sender", "and any unverified sender shows as
 expect(checkedByGmail("Your package was delivered", from: "Shop <orders@tinyshop.co>",
                       verdict: "mx.google.com; dkim=pass header.i=@tinyshop.co")?.store == "tinyshop.co",
        "a verified unknown sender shows its domain")
+
+// Fourth review: a problem beats "not yet", and the first clause that says where the parcel is decides.
+for (subject, from, verdict) in [("Delivery exception: your package will arrive a day late", fedexFrom, Delivery.Kind.problem),
+                                 ("Delivery attempted — redelivery scheduled for Tuesday", fedexFrom, .problem),
+                                 ("Part of your order has been delivered; the rest is on its way", amazonFrom, .delivered),
+                                 ("2 of 3 items delivered, 1 item arriving Friday", amazonFrom, .delivered),
+                                 ("Your package was delivered. Your other package shipped separately", amazonFrom, .delivered),
+                                 ("Your order has been delivered. How did we do? Leave a review", amazonFrom, .delivered),
+                                 (#"Delivered: "Lamp" — How was your delivery? Rate us"#, amazonFrom, .delivered),
+                                 ("Delivery attempted. Not home? Let us know when to try again", fedexFrom, .problem),
+                                 ("Your package is on its way; the last one was delivered", amazonFrom, nil),
+                                 ("Arriving Friday: 1 item. 2 items were delivered", amazonFrom, nil)] {
+    expect(classified(subject, from: from) == verdict, "mixed subject: \(subject) → \(verdict.map(\.rawValue) ?? "nil")")
+}
+// A carrier's slogan isn't a delivery: a carrier's "Delivered" needs a parcel word or tracking number too.
+for (subject, from) in [("UPS My Choice®: peace of mind, delivered", upsFrom), ("Holiday cheer, delivered", fedexFrom),
+                        ("Your DHL newsletter, delivered", "DHL <noreply@dhl.com>"), ("Your UPS invoice has been delivered", upsFrom),
+                        ("The future of delivery has arrived", upsFrom),
+                        ("Delivered: our 2026 sustainability report", "DHL <noreply@dhl.com>"),
+                        ("New: Delivery notification settings 1Z999AA10123456784", upsFrom),
+                        (#"New in "Home": fresh styles delivered"#, "Amazon.com <store-news@amazon.com>")] {
+    expect(classified(subject, from: from) == nil, "a slogan, not a delivery: \(subject)")
+}
+expect(classified("UPS Update: Delivery Attempted", from: upsFrom) == .problem
+       && classified("Your shipment is out for delivery", from: "DHL <noreply@dhl.com>") == .outForDelivery,
+       "a carrier's problems and out for delivery still count without a parcel word")
+expect(classified("Delivery attempted", from: "Shop <s@tinyshop.co>") == nil
+       && classified("Delivery attempted", from: upsFrom) == .problem, "…which a store's don't")
+expect(classified("Your package will have been delivered by 5 PM", from: upsFrom) == nil,
+       "'will have been delivered' is still to come")
+expect(classified(#"Delivered: "The Holiday Gift Guide""#, from: amazonFrom) == .delivered,
+       "known limit: a quoted name after 'Delivered:' is taken as an item")
+expect(DeliveryMail.hasQuotedItem(#"amazon.com: delivered: "kindle""#, shipper: "Amazon")
+       && !DeliveryMail.hasQuotedItem(#"new in "home": fresh styles delivered"#, shipper: "Amazon")
+       && !DeliveryMail.hasQuotedItem(#"delivered: "kindle""#, shipper: ""), "a quoted item only right after the status")
 
 // MARK: Delivery emails: the frozen hold-out set
 
@@ -2270,7 +2306,7 @@ for c in holdOut {
 }
 print("hold-out: \(holdOutRight) of \(holdOut.count) right")
 for miss in holdOutMisses { print("  hold-out miss: \(miss)") }
-// Scores: 403a26e 86 of 94, 5e3209e 85 of 94, the third round 91 of 94. Later rounds may only do better.
+// Scores: 403a26e 86 of 94, 5e3209e 85 of 94, the third round 91 of 94, the fourth 91 of 94. Later rounds may only do better.
 expect(holdOut.count == 94 && holdOutRight >= 91, "the hold-out set doesn't get worse: \(holdOutRight) of \(holdOut.count)")
 
 // MARK: Delivery emails: senders, Gmail's check, names, bodies, dates
@@ -2361,10 +2397,10 @@ signedHeaders[":gmail-verdict"] = nil
 expect(DeliveryMail.classify(headers: signedHeaders, uid: 1)?.store == "Unverified sender",
        "only the verdict the IMAP reader picked counts, not any Authentication-Results")
 // DMARC passing for the From domain counts too (senders whose DKIM is their mail provider's).
-let ontrac = checkedByGmail("OnTrac: Delivered", from: "OnTrac <noreply@ontrac.com>",
+let ontrac = checkedByGmail("OnTrac: Package Delivered", from: "OnTrac <noreply@ontrac.com>",
                             verdict: "mx.google.com; spf=pass (google.com: domain of b@ontrac.com designates 1.2.3.4 as permitted sender) smtp.mailfrom=b@ontrac.com; dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=ontrac.com")
 expect(ontrac?.kind == .delivered && ontrac?.store == "OnTrac", "aligned SPF and DMARC: verified: \(ontrac?.store ?? "-")")
-let viaProvider = checkedByGmail("LaserShip: Delivered", from: "LaserShip <noreply@lasership.com>",
+let viaProvider = checkedByGmail("LaserShip: Package Delivered", from: "LaserShip <noreply@lasership.com>",
                                  verdict: "mx.google.com; dkim=pass header.i=@sendgrid.net; dmarc=pass (p=NONE) header.from=lasership.com")
 expect(viaProvider?.store == "LaserShip", "DKIM by the mail provider, DMARC for the sender: verified")
 expect(checkedByGmail("UPS Update: Package Delivered", from: "UPS <mcinfo@ups.com>",
@@ -3160,12 +3196,14 @@ processed = ScriptCheck.process(batch, state: scriptState, now: now)
 expect(processed.deliveries.map(\.body) == ["Apple iPhone 15 Pro Max", "Lamp", "Cable"]
        && processed.deliveries.map(\.kind) == [.delivered, .outForDelivery, .delivered],
        "new deliveries only, oldest first: \(processed.deliveries.map(\.body))")
-expect(processed.deliveries.map(\.store) == ["eBay", "Target", "Amazon"] && processed.deliveries[2].messageID == nil
-       && processed.deliveries[2].gmailID == "n2", "store, and Gmail's ID when there's no Message-ID")
+/// The nth element, or nil: a wrong count shows as a failed check, not a crash.
+func nth<T>(_ items: [T], _ index: Int) -> T? { items.indices.contains(index) ? items[index] : nil }
+expect(processed.deliveries.map(\.store) == ["eBay", "Target", "Amazon"] && nth(processed.deliveries, 2)?.messageID == nil
+       && nth(processed.deliveries, 2)?.gmailID == "n2", "store, and Gmail's ID when there's no Message-ID")
 expect(processed.state.seen == ["old1", "n2", "n1", "n3", "n4"], "everything looked at is remembered")
-expect(processed.deliveries[2].gmailLink(account: "you@gmail.com")?.absoluteString
+expect(nth(processed.deliveries, 2)?.gmailLink(account: "you@gmail.com")?.absoluteString
        == "https://mail.google.com/mail/?authuser=you@gmail.com#all/n2", "link by Gmail's ID")
-expect(processed.deliveries[0].gmailLink(account: "you@gmail.com")?.absoluteString
+expect(nth(processed.deliveries, 0)?.gmailLink(account: "you@gmail.com")?.absoluteString
        == "https://mail.google.com/mail/?authuser=you@gmail.com#all/n1", "Gmail's ID first, even with a Message-ID")
 let alreadyShown = ScriptCheck.process([email("s1", "Your package was delivered", messageID: "<seen@mail>"),
                                         email("s2", #"Delivered: "Rug""#, from: amazonFrom, messageID: "<new@mail>"),
