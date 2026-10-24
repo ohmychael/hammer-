@@ -631,6 +631,17 @@ case "limit":   // macOS refuses another link (too many devices); the bulb is ot
     run(65)                                                      // the next retry (backoff up to a minute)
     check(gb.isConnected(list[4].id) && gb.connectError(list[4].id) == nil, "connected later: the hint goes")
 
+case "error-clears":   // a failed attempt's error goes once the bulb talks to Hammer again (not only on connecting)
+    let bulb = addBulb()
+    startHammer(holding: [bulb])
+    run(2)
+    check(gb.isConnected(bulb.id) && gb.connectError(bulb.id) == nil, "connected")
+    // A late failure report for an attempt macOS had queued (the link itself is fine).
+    gb.centralManager(simCentral!, didFailToConnect: bulb.peripheral, error: NSError(domain: "CBErrorDomain", code: 11))
+    check(gb.connectError(bulb.id) == 11 && gb.unreachableReason(bulb.id) == .tooManyDevices, "the error is noted")
+    run(3)                                                       // the 2-second "are you on?" gets an answer
+    check(gb.connectError(bulb.id) == nil && gb.unreachableReason(bulb.id) == .busy, "an answer from the bulb clears it")
+
 case "manual-replaces":   // a tap replaces a scheduled command still waiting for the bulb
     let bulb = addBulb()
     startHammer(holding: [bulb])

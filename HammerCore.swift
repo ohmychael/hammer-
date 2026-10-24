@@ -292,11 +292,16 @@ enum LightList {
 }
 
 /// Before lights found only on the local network had to be added, they were yours
-/// unless you removed them. Once, after updating, those are added for you, so they
-/// don't all move to Other Lights. It waits for a scan that reaches the local network
-/// (Wi-Fi may be off at login), for up to 3 days.
-enum LANMigration {
+/// unless you removed them. Once, after updating, the ones you'd set up (renamed, or
+/// given a color or white) are added for you, so they don't move to Other Lights.
+/// It happens at the first scan that reaches the local network, whatever it finds
+/// (Wi-Fi may be off at login: it waits up to 3 days for one), and never again, so a
+/// later scan at an office or a friend's never adopts their lights.
+struct LANMigration {
     static let window: TimeInterval = 3 * 86_400
+
+    var startedAt: Date
+    var done = false
 
     /// Settings an older Hammer leaves once it has been used (none of them is written
     /// just by starting up), so a new install doesn't take in a dorm's lights.
@@ -308,13 +313,17 @@ enum LANMigration {
 
     static func updating(settings: Set<String>) -> Bool { !settings.isDisjoint(with: usedBefore) }
 
-    /// The lights to add, and whether it's done.
-    static func step(found: [GoveeLight], hidden: Set<String>, startedAt: Date, now: Date)
-        -> (add: Set<String>, done: Bool) {
-        guard now.timeIntervalSince(startedAt) < window else { return ([], true) }
-        guard found.contains(where: { $0.lanIP != nil }) else { return ([], false) }
-        let add = found.filter { $0.lanIP != nil && !$0.inAccount && !hidden.contains($0.id) }.map { $0.id }
-        return (Set(add), true)
+    /// One scan: the lights to add. `reachedNetwork` says the scan went out on the local
+    /// network (it can't when Wi-Fi is off); `setUp` is the lights with names or colors
+    /// saved by the older Hammer.
+    mutating func scanned(found: [GoveeLight], reachedNetwork: Bool, hidden: Set<String>, setUp: Set<String>,
+                          now: Date) -> Set<String> {
+        guard !done else { return [] }
+        guard now.timeIntervalSince(startedAt) < Self.window else { done = true; return [] }
+        guard reachedNetwork else { return [] }
+        done = true
+        return Set(found.filter { $0.lanIP != nil && !$0.inAccount && !hidden.contains($0.id) && setUp.contains($0.id) }
+            .map { $0.id })
     }
 }
 
@@ -470,11 +479,43 @@ struct LightResults {
         waiting[id, default: [:]][kind] = what
     }
 
-    /// One command's result: what was waited for, if anything.
-    mutating func result(_ id: String, _ kind: Kind) -> Waiting? {
-        let what = waiting[id]?.removeValue(forKey: kind)
+    /// One command's result: what was waited for, if anything. `scheduled` says whose
+    /// result it is (nil: can't tell, as over Bluetooth, where a tap replaces a waiting
+    /// scheduled command), so a tap's result doesn't settle a scheduled command.
+    mutating func result(_ id: String, _ kind: Kind, scheduled: Bool? = nil) -> Waiting? {
+        guard let what = waiting[id]?[kind] else { return nil }
+        if let scheduled, what.scheduled != scheduled { return nil }
+        waiting[id]?[kind] = nil
         if waiting[id]?.isEmpty == true { waiting[id] = nil }
         return what
+    }
+}
+
+// MARK: - Why a bulb can't be reached
+
+/// The error from each bulb's last failed connection attempt, for the menu's hint.
+/// A bulb your phone holds doesn't fail (the attempt just waits), so no error means
+/// "something else has it"; any sign of life clears the error.
+struct LinkErrors {
+    enum Reason: Equatable { case busy, tooManyDevices, refused }
+
+    private(set) var codes: [UUID: Int] = [:]
+
+    mutating func failed(_ id: UUID, code: Int) { codes[id] = code }
+
+    /// It connected, got ready, answered, or isn't yours any more: whatever failed before is over.
+    @discardableResult
+    mutating func cleared(_ id: UUID) -> Bool { codes.removeValue(forKey: id) != nil }
+
+    mutating func clearAll() { codes = [:] }
+
+    func code(_ id: UUID) -> Int? { codes[id] }
+
+    /// CBError connectionLimitReached (11) and tooManyLEPairedDevices (16) mean the Mac has
+    /// too many devices; any other failure, that the connection was refused.
+    func reason(_ id: UUID) -> Reason {
+        guard let code = codes[id] else { return .busy }
+        return [11, 16].contains(code) ? .tooManyDevices : .refused
     }
 }
 
@@ -688,7 +729,7 @@ enum MacWake {
     static let stampPattern = "(0[1-9]|1[0-2])/(0[1-9]|[12][0-9]|3[01])/[0-9]{2} " + timePattern
 
     static func matches(_ text: String, _ pattern: String) -> Bool {
-        text.range(of: "^" + pattern + "$", options: .regularExpression) != nil
+        text.range(of: "^(" + pattern + ")\\z", options: .regularExpression) != nil     // \z: not even a newline after
     }
 
     /// "06:59:00"

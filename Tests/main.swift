@@ -278,16 +278,27 @@ expect(bedroomNow?.inAccount == true && bedroomNow?.lanIP == "10.0.0.5" && bedro
        && LightList.isMine(bedroomNow!, added: [], hidden: []), "on Wi-Fi and in the saved account: yours, the fast route")
 expect(combined.first { $0.id == lanOnly.id }?.inAccount == false, "a light only on the network still isn't in it")
 
-// Once, after updating: lights only on the local network that an older Hammer counted as yours are added.
-let migrationStart = at(0)
-var migration = LANMigration.step(found: [cloudBulb], hidden: [], startedAt: migrationStart, now: at(60))
-expect(migration.add.isEmpty && !migration.done, "waits for a scan that reaches the local network")
+// Once, after updating: lights only on the local network that an older Hammer counted as yours, and
+// you'd set up (renamed or colored), are added, at the first scan that reaches the network, and never again.
 let hiddenLAN = GoveeLight(id: "99:88", sku: "H6159", name: "Hidden", lanIP: "10.0.0.8")
-migration = LANMigration.step(found: [lanOnly, hiddenLAN, bedroomNow!, cloudBulb], hidden: [hiddenLAN.id],
-                              startedAt: migrationStart, now: at(120))
-expect(migration.add == [lanOnly.id] && migration.done, "adds the ones on Wi-Fi only, not removed ones or account ones")
-migration = LANMigration.step(found: [lanOnly], hidden: [], startedAt: migrationStart, now: at(4 * 86_400))
-expect(migration.add.isEmpty && migration.done, "gives up after 3 days")
+let plainLAN = GoveeLight(id: "77:66", sku: "H6159", name: "Never set up", lanIP: "10.0.0.9")
+let setUpBefore: Set<String> = [lanOnly.id, hiddenLAN.id, bedroomNow!.id]
+var migration = LANMigration(startedAt: at(0))
+var adopted = migration.scanned(found: [], reachedNetwork: false, hidden: [], setUp: setUpBefore, now: at(60))
+expect(adopted.isEmpty && !migration.done, "a scan that couldn't go out (Wi-Fi off) doesn't count")
+adopted = migration.scanned(found: [lanOnly, hiddenLAN, plainLAN, bedroomNow!, cloudBulb], reachedNetwork: true,
+                            hidden: [hiddenLAN.id], setUp: setUpBefore, now: at(120))
+expect(adopted == [lanOnly.id] && migration.done,
+       "the first scan adopts set-up lights only: not removed, never set up, or account ones: \(adopted)")
+// A Bluetooth-only user: the first scan finds nothing, and that closes it.
+migration = LANMigration(startedAt: at(0))
+adopted = migration.scanned(found: [], reachedNetwork: true, hidden: [], setUp: setUpBefore, now: at(60))
+expect(adopted.isEmpty && migration.done, "a first scan that finds nothing closes it")
+adopted = migration.scanned(found: [lanOnly, plainLAN], reachedNetwork: true, hidden: [], setUp: setUpBefore, now: at(3600))
+expect(adopted.isEmpty, "a later scan (an office, a friend's) adopts nothing, even lights with old settings")
+migration = LANMigration(startedAt: at(0))
+adopted = migration.scanned(found: [lanOnly], reachedNetwork: true, hidden: [], setUp: setUpBefore, now: at(4 * 86_400))
+expect(adopted.isEmpty && migration.done, "no scan reached the network in 3 days: it gives up")
 expect(LANMigration.updating(settings: ["lightModes", "NSStatusItem Visible Hammer"])
        && !LANMigration.updating(settings: ["bluetoothBulbs", "bluetoothBulbsSeen", "NSStatusItem Visible Hammer"]),
        "only an older Hammer that was used is migrated, not a new install")
@@ -377,6 +388,25 @@ expect(waits.result("bulb", .power)?.scheduled == true && waits.waiting.isEmpty,
 waits.expect("bulb", .look, LightResults.Waiting(mode: "daylight"))
 waits.expect("bulb", .look, LightResults.Waiting(mode: "color"))
 expect(waits.result("bulb", .look)?.mode == "color", "a newer pick of the same kind replaces the older")
+waits.expect("bulb", .power, LightResults.Waiting(failNote: "Couldn't turn off Bulb at 11:00 PM", scheduled: true))
+expect(waits.result("bulb", .power, scheduled: false) == nil, "a tap's result doesn't settle a scheduled command")
+expect(waits.result("bulb", .power, scheduled: true)?.scheduled == true, "the scheduled command's own result does")
+waits.expect("bulb", .power, LightResults.Waiting(scheduled: true))
+expect(waits.result("bulb", .power, scheduled: nil) != nil, "over Bluetooth (can't tell whose) it settles it")
+
+// Why a bulb can't be reached: no error means something else has it; any sign of life clears the error.
+var links = LinkErrors()
+let linkBulb = UUID(), otherLink = UUID()
+expect(links.reason(linkBulb) == .busy && links.code(linkBulb) == nil, "no error: busy (usually your phone)")
+links.failed(linkBulb, code: 11)
+links.failed(otherLink, code: 10)
+expect(links.reason(linkBulb) == .tooManyDevices && links.reason(otherLink) == .refused, "too many devices, or refused")
+links.failed(otherLink, code: 16)
+expect(links.reason(otherLink) == .tooManyDevices, "too many paired devices too")
+expect(links.cleared(linkBulb) && links.reason(linkBulb) == .busy && !links.cleared(linkBulb),
+       "once it talks to Hammer again the error goes (once)")
+links.clearAll()
+expect(links.codes.isEmpty, "Bluetooth reset: all gone")
 
 var menuNotes = LightNotes()
 menuNotes.failed("bedroom", "Couldn't turn on Bedroom at 7:00 AM", scheduled: true, now: at(0))
@@ -488,7 +518,10 @@ expect(MacWake.Event(saved: MacWake.Event.daily("06:59:00").saved) == .daily("06
        "saved and read back")
 expect(["daily 24:00:00", "daily 6:59:00", "daily 06:59", "daily 06:59:00; rm -rf ~", "daily 06:59:00' || true",
         "once 13/01/26 06:59:00", "once 11/01/2026 06:59:00", "once 11/01/26 06:59:00'; reboot", "weekly 06:59:00",
-        "daily \n06:59:00"].allSatisfy { MacWake.Event(saved: $0) == nil }, "a malformed saved wake is ignored")
+        "daily \n06:59:00", "daily 06:59:00\n", "once 11/01/26 06:59:00\n"].allSatisfy { MacWake.Event(saved: $0) == nil },
+       "a malformed saved wake is ignored")
+expect(!MacWake.isTime("06:59:00\n") && !MacWake.isStamp("11/01/26 06:59:00\n") && MacWake.isTime("06:59:00"),
+       "not even a newline after")
 let hammersRepeat = "Repeating power events:\n  wakepoweron at 6:59AM every day\nScheduled power events:\n [0]  wake at 11/01/2026 06:59:00 by 'pmset'\n"
 let usersRepeat = "Repeating power events:\n  wakepoweron at 6:59AM every day\n  shutdown at 11:00PM weekdays only\n"
 expect(MacWake.repeating(in: hammersRepeat) == ["wakepoweron at 6:59AM every day"] && MacWake.repeating(in: "").isEmpty,
@@ -542,7 +575,8 @@ expect(MacWake.adminScript(["/usr/bin/pmset schedule cancel wake '11/01/26 06:59
 expect(MacWake.adminScript(["/usr/bin/pmset repeat cancel; rm -rf ~"], wakes: true) == nil
        && MacWake.adminScript(["/usr/bin/pmset repeat wake MTWRFSU 06:59:00\" & do shell script \"x"], wakes: true) == nil
        && MacWake.adminScript(["/usr/bin/pmset schedule wake '11/01/26 06:59:00' || reboot"], wakes: true) == nil
-       && MacWake.adminScript(["/bin/rm -rf /"], wakes: true) == nil && MacWake.adminScript([], wakes: true) == nil,
+       && MacWake.adminScript(["/bin/rm -rf /"], wakes: true) == nil && MacWake.adminScript([], wakes: true) == nil
+       && MacWake.adminScript(["/usr/bin/pmset repeat cancel\n"], wakes: false) == nil,
        "anything else is refused")
 let everyKindOfPlan = [
     MacWake.plan(current: nil, wanted: .daily("06:59:00"), schedule: "", now: beforeIt, timeZone: wakeZone),
