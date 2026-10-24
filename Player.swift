@@ -570,12 +570,13 @@ final class EdgeController {
     var findFor: TimeInterval = 25
     /// The time now (the tests set their own).
     var clock: () -> Date = Date.init
-    /// A window Hammer opened before Edge was even running is looked for this long afterwards.
+    /// A window Hammer opened but hasn't found is looked for this long afterwards, no longer.
     static let launchedFor: TimeInterval = 600
     private let windowKey = "edgeYouTubeWindow"   // "<Edge's run>|<window ID>"
     private let sizeKey = "edgeYouTubeSize"       // the size you last left it at: "width,height"
     /// A window Hammer opened but hasn't found yet: "<Edge's run, or nothing if Edge wasn't
-    /// running yet>|<when, in seconds since 1970>|<the window IDs that were there already>".
+    /// running yet>|<when, in seconds since 1970>|<the window IDs that were there already, or ?
+    /// if Hammer couldn't look>|<the start of the address it opened>".
     private let launchedKey = "edgeYouTubeLaunched"
     /// Where Hammer's window last was, "left,top,right,bottom": Edge puts it back there when it restarts.
     private let placeKey = "edgeYouTubePlace"
@@ -590,24 +591,24 @@ final class EdgeController {
         return id
     }
 
-    /// A window Hammer opened in this run of Edge (or just before Edge started) that it
-    /// hasn't found yet, and the windows that were already there then (they aren't it).
-    func launchedUnfound(in edge: String) -> Set<Int>? {
+    /// A window Hammer opened in the last ten minutes, in this run of Edge (or just before
+    /// Edge started), that it hasn't found yet: the windows that were already there then
+    /// (nil if Hammer couldn't look), and the start of the address it opened.
+    func launchedUnfound(in edge: String) -> (besides: Set<Int>?, prefix: String)? {
         guard let saved = driver.remembered(launchedKey) else { return nil }
-        let parts = saved.split(separator: "|", omittingEmptySubsequences: false)
-        guard parts.count == 3, let when = Double(parts[1]) else { return nil }
-        if parts[0].isEmpty {
-            let age = clock().timeIntervalSince1970 - when
-            guard age >= -60, age < Self.launchedFor else { return nil }
-        } else if String(parts[0]) != edge {
-            return nil
-        }
-        return EdgeYouTube.parseIDs(String(parts[2]))
+        let parts = saved.split(separator: "|", maxSplits: 3, omittingEmptySubsequences: false)
+        guard parts.count == 4, let when = Double(parts[1]), !parts[3].isEmpty else { return nil }
+        let age = clock().timeIntervalSince1970 - when
+        guard age >= -60, age < Self.launchedFor else { return nil }
+        if !parts[0].isEmpty && String(parts[0]) != edge { return nil }
+        return (parts[2] == "?" ? nil : EdgeYouTube.parseIDs(String(parts[2])), String(parts[3]))
     }
 
-    private func markLaunched(in edge: String?, besides: Set<Int> = []) {
+    /// `besides`: the windows already there that look like it; nil when Hammer couldn't look.
+    private func markLaunched(_ url: URL, in edge: String?, besides: Set<Int>?) {
         let when = Int(clock().timeIntervalSince1970)
-        driver.remember("\(edge ?? "")|\(when)|" + besides.sorted().map(String.init).joined(separator: ","), launchedKey)
+        let there = besides.map { $0.sorted().map(String.init).joined(separator: ",") } ?? "?"
+        driver.remember("\(edge ?? "")|\(when)|\(there)|" + EdgeYouTube.matchPrefix(url), launchedKey)
     }
 
     /// From now on this is Hammer's window.
@@ -670,7 +671,7 @@ final class EdgeController {
         case .notRunning:
             guard driver.running() == nil else { return .failed(EdgeYouTube.plainError(nil)) }
             return await open(target, play: url != nil)            // Edge quit: start it again with the window
-        case .denied, .notAsked: return await openUnsteered(url, in: edge, besides: nil)
+        case .denied, .notAsked: return await openUnsteered(url, in: edge)
         }
         var found = savedWindow(for: edge)
         var neverPlaced = false
@@ -732,24 +733,26 @@ final class EdgeController {
 
     /// Hammer may not steer Edge: a video you asked for still plays (Edge puts the window
     /// where it likes). Once you allow Hammer, the next press finds that window rather
-    /// than opening another.
-    private func openUnsteered(_ url: URL?, in edge: String?, besides: Set<Int>?) async -> Outcome {
+    /// than opening another. Hammer couldn't look at Edge's windows first, so it won't guess
+    /// between several that look like it.
+    private func openUnsteered(_ url: URL?, in edge: String?) async -> Outcome {
         guard let url else { return .notAllowed(openedAnyway: false) }
         let opened = await driver.launch(EdgeYouTube.launchArguments(url))
-        if opened { markLaunched(in: edge, besides: besides ?? []) }
+        if opened { markLaunched(url, in: edge, besides: nil) }
         return .notAllowed(openedAnyway: opened)
     }
 
     private enum Found { case window(Int, placed: Bool), nothing, stop(Outcome) }
 
     /// No window of Hammer's in this run of Edge yet: is one there anyway? The one Hammer
-    /// opened but couldn't find (Edge was slow, or you hadn't allowed Hammer yet): the
-    /// newest that looks like it. Or the one Edge brought back when it restarted: exactly
-    /// where Hammer's last was. The scripts do the matching; only window numbers come back.
+    /// opened in the last ten minutes but couldn't find (Edge was slow, or you hadn't allowed
+    /// Hammer yet): on the address it opened, not there before, the first to come (later
+    /// ones are yours). Or the one Edge brought back when it restarted: exactly where
+    /// Hammer's last was. The scripts do the matching; only window numbers come back.
     private func findOwn(in edge: String) async -> Found {
-        var searches: [(script: String, besides: Set<Int>, placed: Bool)] = []
-        if let besides = launchedUnfound(in: edge) {
-            searches.append((EdgeYouTube.findScript(prefixes: EdgeYouTube.anyPage), besides, false))
+        var searches: [(script: String, besides: Set<Int>?, placed: Bool)] = []
+        if let launched = launchedUnfound(in: edge) {
+            searches.append((EdgeYouTube.findScript(prefixes: [launched.prefix] + EdgeYouTube.detours), launched.besides, false))
         }
         if let place = rememberedPlace {
             searches.append((EdgeYouTube.findScript(prefixes: EdgeYouTube.anyPage, at: place), [], true))
@@ -758,7 +761,10 @@ final class EdgeController {
             switch await driver.run(search.script) {
             case .ok(let text):
                 if !search.placed { driver.remember(nil, launchedKey) }     // looked for once
-                guard let id = EdgeYouTube.parseIDs(text).subtracting(search.besides).max() else { continue }
+                let candidates = EdgeYouTube.parseIDs(text).subtracting(search.besides ?? [])
+                // Hammer couldn't look before it opened its window: of several, any could be yours.
+                if search.besides == nil && candidates.count > 1 { continue }
+                guard let id = search.placed ? candidates.max() : candidates.min() else { continue }
                 keep(id, in: edge)
                 return .window(id, placed: search.placed)
             case .failed(let number, _):
@@ -779,7 +785,7 @@ final class EdgeController {
             guard let edge = driver.running() else { return .edgeGone }
             switch await driver.permission(ask: true) {
             case .denied, .notAsked:
-                return .stop(await openUnsteered(play ? url : nil, in: edge, besides: nil))
+                return .stop(await openUnsteered(play ? url : nil, in: edge))
             case .allowed:
                 switch await driver.run(find) {
                 case .ok(let text): return .taken(edge: edge, ids: EdgeYouTube.parseIDs(text))
@@ -799,7 +805,8 @@ final class EdgeController {
     private func open(_ url: URL, play: Bool) async -> Outcome {
         // Known by the address Hammer opened. When Edge starts with this window it
         // doesn't bring back your other windows, and when it's running, windows that
-        // were already there don't count; of several new ones, the newest wins.
+        // were already there don't count; of several new ones, the newest wins (it's
+        // looked for right after it was opened).
         let find = EdgeYouTube.findScript(prefixes: [EdgeYouTube.matchPrefix(url)] + EdgeYouTube.detours)
         var before = Set<Int>()
         var run: String?                                 // the run of Edge those windows are from
@@ -815,7 +822,8 @@ final class EdgeController {
             return .failed("Microsoft Edge didn't open. If it's showing a question, answer it and try again.")
         }
         // Until it's found, the next press looks for this one rather than opening another.
-        markLaunched(in: run, besides: before)
+        // (Edge not running yet: Hammer can't know which windows a later Edge brings back.)
+        markLaunched(url, in: run, besides: run == nil ? nil : before)
         let deadline = clock().addingTimeInterval(findFor)
         var tries = 0
         while tries < 60 && clock() < deadline {        // about 15 seconds, more if Edge is slow
@@ -826,7 +834,7 @@ final class EdgeController {
                 // Edge has just started (or started again): its windows are all new, and IDs start over.
                 before = []
                 run = edge
-                markLaunched(in: edge)
+                markLaunched(url, in: edge, besides: [])
             }
             if !asked {
                 // Now macOS can ask whether Hammer may steer it.

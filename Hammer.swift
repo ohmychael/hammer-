@@ -1127,11 +1127,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func registerYouTubeKeys() {
         if let ref = playerHotKeyRef { UnregisterEventHotKey(ref) }
         playerHotKeyRef = nil
+        youTubeKeys = YouTubeKeys(plain: YKey.code(withCommand: false), command: YKey.code(withCommand: true))
         let playerID = EventHotKeyID(signature: OSType(0x484D_4D52), id: 2)
-        playerHotKeyWorks = RegisterEventHotKey(YKey.code(withCommand: false), UInt32(controlKey | optionKey), playerID,
+        playerHotKeyWorks = RegisterEventHotKey(youTubeKeys.plain, UInt32(controlKey | optionKey), playerID,
                                                 GetApplicationEventTarget(), 0, &playerHotKeyRef) == noErr
         registerCommandY()
     }
+
+    /// The keys ⌃⌥Y and ⌘Y are on now.
+    private struct YouTubeKeys: Equatable {
+        var plain = UInt32(ShortcutKey.americanY)
+        var command = UInt32(ShortcutKey.americanY)
+    }
+    private var youTubeKeys = YouTubeKeys()
 
     /// Command-Y, while it's on.
     private func registerCommandY() {
@@ -1140,11 +1148,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         commandYWorks = true
         guard commandYOn else { return }
         let id = EventHotKeyID(signature: OSType(0x484D_4D52), id: 3)
-        commandYWorks = RegisterEventHotKey(YKey.code(withCommand: true), UInt32(cmdKey), id,
+        commandYWorks = RegisterEventHotKey(youTubeKeys.command, UInt32(cmdKey), id,
                                             GetApplicationEventTarget(), 0, &commandYRef) == noErr
     }
 
+    /// Another keyboard layout (or input method): only if "y" moved are the shortcuts moved.
     @objc private func keyboardLayoutChanged() {
+        guard YouTubeKeys(plain: YKey.code(withCommand: false), command: YKey.code(withCommand: true)) != youTubeKeys else { return }
         registerYouTubeKeys()
         rebuildMenuSoon()
     }
@@ -1264,8 +1274,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             open.keyEquivalentModifierMask = [.control, .option]
         }
         menu.addItem(open)
-        if !playerHotKeyWorks && !(commandYOn && commandYWorks) {
-            menu.addItem(hint("Another app has ⌃⌥Y, so it's menu only."))
+        let commandYTaken = commandYOn && !commandYWorks
+        if !playerHotKeyWorks && commandYTaken {
+            menu.addItem(hint("Other apps have ⌘Y and ⌃⌥Y; use the menu."))
+        } else if !playerHotKeyWorks && !commandYOn {
+            menu.addItem(hint("Another app has ⌃⌥Y; use the menu."))
         }
         menu.addItem(action("Play Copied Link", #selector(playCopiedLink)))
         if !inEdge, let youTube, youTube.place != .hidden, !youTube.title.isEmpty {
@@ -1277,10 +1290,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(youTubeOpenIn(inEdge: inEdge))
         let commandY = action("⌘Y Shortcut", #selector(toggleCommandY))
         commandY.state = commandYOn ? .on : .off
-        commandY.toolTip = "While it's on, other apps don't get ⌘Y (Quick Look in Finder, History in browsers)."
+        commandY.toolTip = "While it's on, other apps don't get ⌘Y (Quick Look in Finder, History in browsers, Redo in Office)."
         menu.addItem(commandY)
-        if commandYOn && !commandYWorks {
-            menu.addItem(hint(playerHotKeyWorks ? "Another app has ⌘Y, so use ⌃⌥Y." : "Another app has ⌘Y."))
+        if commandYTaken && playerHotKeyWorks {
+            menu.addItem(hint("Another app has ⌘Y; use ⌃⌥Y."))
         }
     }
 

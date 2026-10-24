@@ -270,6 +270,8 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
 
     func showDropdown() {
         idleGeneration += 1                                  // cancels unloading
+        popOutGeneration += 1                                // and a pop-out still on its way
+        popOutPending = false
         if !loaded {
             loaded = true
             web.load(URLRequest(url: YouTubeLink.home))
@@ -630,15 +632,25 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
     @objc private func goBack() { if webView?.canGoBack == true { webView?.goBack() } }
     @objc private func goHome() { web.load(URLRequest(url: YouTubeLink.home)) }
 
-    /// The page in your browser, on YouTube's full site, at the moment you're at; the player pauses.
+    /// How a page opens in your browser (the self-test catches it instead).
+    static var openLink: (URL) -> Void = { NSWorkspace.shared.open($0) }
+
+    /// The ↗ button, as if you had pressed it (for the self-test).
+    func pressBrowserButton() { openInBrowser() }
+
+    /// The page in your browser, on YouTube's full site, at the moment you're at; the player
+    /// pauses and the dropdown closes.
     @objc private func openInBrowser() {
         guard let page = webView?.url else { return }
         let handed = HandOff()
         let go: @MainActor (Double?) -> Void = { [weak self] seconds in
-            guard !handed.done else { return }
+            guard !handed.done, let self else { return }
             handed.done = true
-            if let url = YouTubeLink.browserURL(for: page, at: seconds) { NSWorkspace.shared.open(url) }
-            self?.run("window.__hammer && window.__hammer.pause()")
+            if let url = YouTubeLink.browserURL(for: page, at: seconds) { Self.openLink(url) }
+            // Paused, and out of the way of your browser.
+            self.stayPutUntil = Date().addingTimeInterval(2)
+            self.run("window.__hammer && window.__hammer.pause()")
+            if self.place == .dropdown { self.hideAll() }
         }
         run("window.__hammer ? window.__hammer.time() : null") { result in
             let seconds = (result as? NSNumber)?.doubleValue
@@ -678,8 +690,9 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         mini.contentAspectRatio = NSSize(width: 16, height: 9)
         mini.minSize = NSSize(width: PlayerGeometry.minMiniWidth, height: PlayerGeometry.minMiniWidth * 9 / 16)
         mini.delegate = self
-        // Click it and it takes the keys (Esc, Space, ← →) without taking over from your app.
-        mini.becomesKeyOnlyIfNeeded = false
+        // Clicking its buttons, or dragging it, keeps your typing where it was; a click on the
+        // video gives it the keys (Esc, Space, ← →) without making Hammer the active app.
+        mini.becomesKeyOnlyIfNeeded = true
         mini.onEscape = { [weak self] in self?.closeMini() }
         overlay.frame = content.bounds
         overlay.autoresizingMask = [.width, .height]
@@ -691,19 +704,33 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         overlay.onClose = { [weak self] in self?.closeMini() }
     }
 
-    /// A key pressed in the mini player or the dropdown, as if you had (for the self-test).
+    /// A key pressed, as if you had (for the self-test): it goes to whichever window has the
+    /// keys, as yours would. With `command`, straight to the dropdown's own handling (⌘W).
     func press(_ key: String, keyCode: UInt16, command: Bool = false) {
         let window = place == .mini ? mini : dropdown
-        if place == .mini {
-            window.makeKey()
-            window.makeFirstResponder(overlay)
-        }
         guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: command ? [.command] : [],
                                            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
                                            context: nil, characters: key, charactersIgnoringModifiers: key,
                                            isARepeat: false, keyCode: keyCode) else { return }
-        if command { _ = window.performKeyEquivalent(with: event) } else { window.sendEvent(event) }
+        if command { _ = window.performKeyEquivalent(with: event) } else { NSApp.postEvent(event, atStart: false) }
     }
+
+    /// A click in the mini player, as if you had (for the self-test): on its video, or on its
+    /// "back 10 seconds" button. The events go through AppKit as a real click's would.
+    func clickMini(onButton: Bool) {
+        mini.contentView?.layoutSubtreeIfNeeded()
+        guard let point = onButton ? overlay.backButtonPoint : NSPoint(x: mini.frame.width / 2, y: mini.frame.height * 0.6) else { return }
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            if let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                                              timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: mini.windowNumber,
+                                              context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0) {
+                NSApp.postEvent(event, atStart: false)
+            }
+        }
+    }
+
+    /// Whether the mini player has the keys (for the self-test).
+    var miniHasKeys: Bool { mini.isKeyWindow }
 
     /// After you drag the mini player, it settles into the nearest corner.
     func windowDidMove(_ notification: Notification) {
@@ -819,6 +846,7 @@ final class MiniOverlay: NSView {
         button.bezelStyle = .regularSquare
         button.contentTintColor = .white
         button.toolTip = tip
+        button.refusesFirstResponder = true                  // clicking one never takes your typing
         button.widthAnchor.constraint(equalToConstant: 26).isActive = true
         button.heightAnchor.constraint(equalToConstant: 26).isActive = true
         actions[ObjectIdentifier(button)] = action
@@ -903,14 +931,21 @@ final class MiniOverlay: NSView {
     override func mouseDown(with event: NSEvent) {
         dragging = false
         downEvent = event
-        takeKeys()
         if event.clickCount == 2 { onExpand?() }
     }
 
-    /// Clicked: the mini player takes the keys (it's a panel, so your app stays the active one).
-    private func takeKeys() {
-        window?.makeKey()
-        window?.makeFirstResponder(self)
+    /// A click on the video (not a drag, not a button): the mini player takes the keys. It's
+    /// a panel, so your app stays the active one.
+    override func mouseUp(with event: NSEvent) {
+        guard !dragging, event.clickCount == 1, let window, window.isVisible else { return }
+        window.makeKey()
+        window.makeFirstResponder(self)
+    }
+
+    /// Where the "back 10 seconds" button is, in the window (for the self-test).
+    var backButtonPoint: NSPoint? {
+        guard let button = seekButtons.first else { return nil }
+        return button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -1138,6 +1173,16 @@ final class PlayerCheck: NSObject, NSApplicationDelegate {
         let link = handOff?.absoluteString ?? "none"
         expect(link.hasPrefix("https://www.youtube.com/watch?v=jNQXAC9IVRw"), "\"Open in your browser\" goes to YouTube's full site: \(link)")
         note(link.hasSuffix("&t=7s") ? "  ok   …at the moment the video is at" : "  note …without the time here (\(link))")
+        // The ↗ button itself: hands that over, pauses, and gets the dropdown out of the browser's way.
+        var opened: URL?
+        YouTubePlayer.openLink = { opened = $0 }
+        player.pressBrowserButton()
+        _ = await wait(3) { opened != nil }
+        YouTubePlayer.openLink = { NSWorkspace.shared.open($0) }
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        expect(opened?.absoluteString.hasPrefix("https://www.youtube.com/watch?v=jNQXAC9IVRw") == true && player.place == .hidden,
+               "the ↗ button opens it in your browser and closes the dropdown (\(opened?.absoluteString ?? "nothing"), \(player.place))")
+        player.toggle()
 
         // You close the dropdown before the video starts; then it starts: into the mini player, never playing unseen.
         _ = await player.evaluateBool("(() => { const v = document.querySelector('video'); if (v) v.pause(); return true })()")
@@ -1164,13 +1209,21 @@ final class PlayerCheck: NSObject, NSApplicationDelegate {
             _ = await wait(5) { self.player.place == .mini }
         }
         if player.place == .mini {
+            // Its buttons never take your typing; a click on the video gives it the keys.
+            player.clickMini(onButton: true)
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            expect(!player.miniHasKeys, "clicking a mini player button leaves your typing where it was")
+            player.clickMini(onButton: false)
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            expect(player.miniHasKeys, "clicking the video gives the mini player the keys")
             let before = await isPlaying
             player.press(" ", keyCode: 49)
             try? await Task.sleep(nanoseconds: 800_000_000)
             let after = await isPlaying
             expect(before != nil && after != nil && before != after, "Space in the mini player plays or pauses (\(String(describing: before)) → \(String(describing: after)))")
             player.press("\u{1B}", keyCode: 53)
-            expect(player.place == .hidden, "Esc closes the mini player")
+            let closedByEsc = await wait(2, until: { self.player.place == .hidden })
+            expect(closedByEsc, "Esc closes the mini player")
             try? await Task.sleep(nanoseconds: 500_000_000)
             let stillPlaying = await isPlaying
             expect(stillPlaying == false, "…and pauses it")

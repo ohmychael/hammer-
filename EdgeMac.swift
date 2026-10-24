@@ -226,7 +226,7 @@ final class EdgePlayer {
     private let screen: () -> NSScreen?
     private let useHammerPlayer: () -> Void
     private var busySince: Date?
-    private var queued: URL??                       // one press that came while busy (.some(nil): the shortcut)
+    private var queued: (url: URL?, at: Date)?      // one press that came while busy (url nil: the shortcut)
     private var toldAboutPermission = false         // the alert about it: once per launch
     private var cameFrom: NSRunningApplication?     // the app you were in when YouTube last came forward
     /// You said no to Hammer steering Edge (the menu then offers Allow Edge Control…).
@@ -246,7 +246,7 @@ final class EdgePlayer {
         // its own time limit. One more press is kept for when it's done (a quick double
         // press shows and tucks away). Only if something got stuck anyway is it forgotten (ten minutes).
         if let since = busySince, Date().timeIntervalSince(since) < 600 {
-            if queued == nil || url != nil { queued = .some(url) }
+            if queued == nil || url != nil { queued = (url, Date()) }
             return
         }
         busySince = Date()
@@ -257,11 +257,17 @@ final class EdgePlayer {
         let controller = self.controller
         Task { @MainActor in
             let outcome = await controller.toggle(play: url)
+            let finished = Date()
             self.busySince = nil
             if outcome == .opened || outcome == .shown { self.cameFrom = from }   // where to go back to on the next hide
             let next = self.queued
             self.queued = nil
-            if self.handle(outcome), let next { self.toggle(play: next) }
+            guard self.handle(outcome), let next else { return }
+            // The shortcut pressed again during a slow open (Edge starting, macOS's question) would
+            // tuck the new window straight away: only a quick double press counts. A video to play
+            // always does (it never tucks anything away).
+            if next.url == nil && (outcome == .opened || finished.timeIntervalSince(next.at) > 1) { return }
+            self.toggle(play: next.url)
         }
     }
 

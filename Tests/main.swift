@@ -1162,6 +1162,14 @@ expect(playerDecide("https://accounts.google.zz/") == .openInBrowser, "…clicke
 expect(PlayerNavigation.googleCountries.count > 180 && PlayerNavigation.googleCountries.contains("co.uk")
        && PlayerNavigation.googleCountries.allSatisfy { !$0.isEmpty && !$0.contains(" ") && !$0.hasPrefix(".") },
        "Google's country list is all there: \(PlayerNavigation.googleCountries.count)")
+// The whole list, pinned: any domain added, dropped or mistyped changes the count or the checksum
+// (FNV-1a of the sorted list, comma-separated).
+let playerCountryList = PlayerNavigation.googleCountries.sorted().joined(separator: ",")
+var playerCountryHash: UInt64 = 0xcbf29ce484222325
+for byte in playerCountryList.utf8 { playerCountryHash = (playerCountryHash ^ UInt64(byte)) &* 0x100000001b3 }
+expect(PlayerNavigation.googleCountries.count == 191 && playerCountryHash == 0x12f1799e757ec206
+       && playerCountryList.hasPrefix("ad,ae,al,am,as,at,az,ba,") && playerCountryList.hasSuffix(",tt,vg,vu,ws"),
+       "the sign-in country list is exactly Google's 191 domains (\(PlayerNavigation.googleCountries.count), \(String(playerCountryHash, radix: 16)))")
 
 // MARK: YouTube: the shortcut's key follows the keyboard layout
 
@@ -1874,6 +1882,115 @@ staleStartController.clock = { Date().addingTimeInterval(11 * 60) }
 staleStart.log = []
 _ = edgeToggle(staleStartController)
 expect(staleStart.log.contains { $0.hasPrefix("launch") }, "…after ten minutes it's not taken for Hammer's \(staleStart.log)")
+
+// Your own windows are never taken for the one Hammer opened but didn't find (from the review).
+// R1: first use, Edge closed, Don't Allow; you then watch YouTube in your own one-tab window; later you allow.
+let reviewR1 = FakeEdge()
+reviewR1.answer = .denied
+let reviewR1Controller = EdgeController(driver: reviewR1)
+_ = edgeToggle(reviewR1Controller)
+let reviewR1Yours = reviewR1.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/watch?v=yourvideo00", bounds: [200, 200, 900, 600]))
+reviewR1.answer = .allowed
+expect(edgeToggle(reviewR1Controller) == .shown && reviewR1Controller.savedWindow(for: "edge-1") == 1
+       && reviewR1.windows[reviewR1Yours]!.bounds == [200, 200, 900, 600], "R1: Hammer's own (the first) is taken, not your newer one")
+// R2: Edge running, not allowed, Play Copied Link; you close that window; your own older one is there; later you allow.
+let reviewR2 = FakeEdge()
+reviewR2.isRunning = true
+reviewR2.asked = true
+reviewR2.answer = .denied
+let reviewR2Yours = reviewR2.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [200, 200, 900, 600]))
+let reviewR2Controller = EdgeController(driver: reviewR2)
+_ = edgeToggle(reviewR2Controller, play: EdgeYouTube.watchURL(id: "jNQXAC9IVRw"))
+let reviewR2Hammer = reviewR2.windows.keys.max()!
+reviewR2.windows[reviewR2Hammer] = nil
+reviewR2.order.removeAll { $0 == reviewR2Hammer }
+reviewR2.answer = .allowed
+_ = edgeToggle(reviewR2Controller)
+expect(reviewR2Controller.savedWindow(for: "edge-1") != reviewR2Yours && reviewR2.windows[reviewR2Yours]!.bounds == [200, 200, 900, 600],
+       "R2: you closed Hammer's window: yours isn't taken")
+// R3: allowed, Play Copied Link, Edge never shows the window; your one-tab window on another video was there.
+let reviewR3 = FakeEdge()
+reviewR3.isRunning = true
+reviewR3.asked = true
+let reviewR3Yours = reviewR3.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/watch?v=yourvideo00", bounds: [200, 200, 900, 600]))
+reviewR3.opensWindow = false
+let reviewR3Controller = EdgeController(driver: reviewR3)
+_ = edgeToggle(reviewR3Controller, play: EdgeYouTube.watchURL(id: "jNQXAC9IVRw"))
+_ = edgeToggle(reviewR3Controller)
+expect(reviewR3Controller.savedWindow(for: "edge-1") != reviewR3Yours && reviewR3.windows[reviewR3Yours]!.bounds == [200, 200, 900, 600],
+       "R3: a window of yours on another video isn't taken after a slow open")
+// R4: a slow open; days later, in the same run of Edge, you open your own one-tab YouTube window.
+let reviewR4 = FakeEdge()
+reviewR4.isRunning = true
+reviewR4.asked = true
+reviewR4.opensWindow = false
+let reviewR4Controller = EdgeController(driver: reviewR4)
+_ = edgeToggle(reviewR4Controller)
+reviewR4Controller.clock = { Date().addingTimeInterval(3 * 86_400) }
+let reviewR4Yours = reviewR4.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [200, 200, 900, 600]))
+_ = edgeToggle(reviewR4Controller)
+expect(reviewR4Controller.savedWindow(for: "edge-1") != reviewR4Yours && reviewR4.windows[reviewR4Yours]!.bounds == [200, 200, 900, 600],
+       "R4: days later, your own window isn't taken")
+// R5: allowed later, with Hammer's window still there and a newer one of yours: Hammer's wins.
+let reviewR5 = FakeEdge()
+reviewR5.isRunning = true
+reviewR5.asked = true
+reviewR5.answer = .denied
+let reviewR5Controller = EdgeController(driver: reviewR5)
+_ = edgeToggle(reviewR5Controller, play: EdgeYouTube.watchURL(id: "jNQXAC9IVRw"))
+let reviewR5Hammer = reviewR5.windows.keys.max()!
+reviewR5.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [200, 200, 900, 600]))
+reviewR5.answer = .allowed
+_ = edgeToggle(reviewR5Controller)
+expect(reviewR5Controller.savedWindow(for: "edge-1") == reviewR5Hammer, "R5: Hammer's own window wins over your newer one")
+// Not allowed, Edge running, and two windows on that video: Hammer couldn't look first, so it doesn't guess.
+let guessEdge = FakeEdge()
+guessEdge.isRunning = true
+guessEdge.asked = true
+guessEdge.answer = .denied
+let guessYours = guessEdge.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/watch?v=jNQXAC9IVRw", bounds: [200, 200, 900, 600]))
+let guessController = EdgeController(driver: guessEdge)
+_ = edgeToggle(guessController, play: EdgeYouTube.watchURL(id: "jNQXAC9IVRw"))
+guessEdge.answer = .allowed
+_ = edgeToggle(guessController)
+expect(guessController.savedWindow(for: "edge-1") != guessYours && guessEdge.windows[guessYours]!.bounds == [200, 200, 900, 600],
+       "two windows that could be it and no look first: neither is taken")
+expect(guessEdge.saved["edgeYouTubeLaunched"] == nil, "…and it isn't looked for again")
+// It's looked for once: if that look finds nothing, it's forgotten even when opening a new one fails.
+let onceEdge = FakeEdge()
+onceEdge.isRunning = true
+onceEdge.asked = true
+onceEdge.opensWindow = false
+let onceController = EdgeController(driver: onceEdge)
+_ = edgeToggle(onceController)
+expect(onceEdge.saved["edgeYouTubeLaunched"] != nil, "(the window that didn't show up is remembered)")
+onceEdge.launchWorks = false
+_ = edgeToggle(onceController)
+expect(onceEdge.saved["edgeYouTubeLaunched"] == nil, "looked for once and not there: forgotten")
+// Edge restarts while Hammer waits for its window, handing out the old numbers again: still found.
+let midRestart = FakeEdge()
+midRestart.isRunning = true
+midRestart.asked = true
+midRestart.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [200, 200, 900, 600]))   // window 1, yours
+midRestart.windowAfter = 5
+midRestart.onPause = {
+    midRestart.onPause = nil
+    midRestart.restart(restoring: [])                                   // your window gone; numbers start again at 1
+    midRestart.windowAfter = 0
+    midRestart.add(FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/"))  // Hammer's, as window 1 of the new run
+}
+let midRestartController = EdgeController(driver: midRestart)
+expect(edgeToggle(midRestartController) == .opened && midRestartController.savedWindow(for: "edge-2") == 1,
+       "Edge restarted mid-way: Hammer's window is found by its new number \(midRestart.log)")
+// Where Hammer's window is, saved as soon as Hammer puts it there.
+let placeEdge = FakeEdge()
+let placeController = EdgeController(driver: placeEdge)
+_ = edgeToggle(placeController)
+expect(placeController.rememberedPlace == [3080, 25, 3840, 485], "opened: its place is saved")
+placeEdge.windows[1]!.bounds = [200, 300, 1100, 820]               // you moved it
+placeEdge.inFront = false
+_ = edgeToggle(placeController)
+expect(placeController.rememberedPlace == [2940, 25, 3840, 545], "shown in the corner again: that place is saved")
 // 3: Edge restarts (an update) and brings Hammer's window back where it was.
 let restartEdge = FakeEdge()
 let restartController = EdgeController(driver: restartEdge)
