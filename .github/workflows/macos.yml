@@ -13,6 +13,7 @@ jobs:
         timeout-minutes: 8
         run: |
           set +e
+          exec > >(tee "$RUNNER_TEMP/probe.txt") 2>&1
           t() { perl -e 'alarm 25; exec @ARGV' "$@"; }
           d="$RUNNER_TEMP/with space"; mkdir -p "$d"
           kc="$d/p.keychain-db"
@@ -30,3 +31,7 @@ jobs:
           printf 'set-key-partition-list -S apple-tool:,apple:,codesign: -s -k 0123abcd "%s"\n' "$kc" | t security -i >/dev/null; echo "== partition list exit $?"
           printf 'set-key-partition-list -S apple-tool:,apple:,codesign: -s -k wrongpass "%s"\n' "$kc" | t security -i >/dev/null; echo "== partition list wrong exit $?"
           t security find-identity -p codesigning "$kc"; echo "== find-identity exit $?"
+      - name: report
+        if: always()
+        run: |
+          echo "::notice title=probe::$(tr '\n' ' ' < "$RUNNER_TEMP/probe.txt" | cut -c1-4000)"
