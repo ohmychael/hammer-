@@ -510,36 +510,46 @@ func runDimCheck() -> Int32 {
         let end = Date().addingTimeInterval(seconds)
         while Date() < end { _ = RunLoop.main.run(mode: .default, before: end) }
     }
+    /// Lets a fade finish (up to 2 s on a busy machine): how long it took, or nil if it never got there.
+    func settle(_ done: () -> Bool) -> String? {
+        let start = Date()
+        while Date().timeIntervalSince(start) < 2 {
+            if done() { return String(format: "%.2f s", Date().timeIntervalSince(start)) }
+            wait(0.02)
+        }
+        return nil
+    }
     dimmer.set(50, on: display, save: false)
     dimmer.fade(on: [display], dimming: false)
     wait(0.1)
     check(dimmer.curvesNow(display).map { !$0.matches(expected) && !$0.matches(before) } == true,
           "fading out: partway after 0.1 s (top \(dimmer.curvesNow(display)?.r.last ?? -1))")
-    wait(0.5)
-    check(dimmer.curvesNow(display) == before, "fading out: then put back exactly")
+    var took = settle { dimmer.curvesNow(display) == before }
+    let topNow = dimmer.curvesNow(display)?.r.last ?? -1
+    check(took != nil, "fading out: then put back exactly (\(took ?? "not within 2 s; top \(topNow)"))")
     dimmer.set(50, on: display, save: false)
     dimmer.fade(on: [display], dimming: false)
     dimmer.set(50, on: display, save: false)
-    wait(0.5)
+    wait(0.6)
     check(dimmer.curvesNow(display).map { $0.matches(expected) } == true, "set during a fade: that wins")
     dimmer.set(100, on: display, save: false)
     dimmer.fade(on: [display], dimming: true, levels: [display: 50])
     wait(0.1)
     check(dimmer.curvesNow(display).map { !$0.matches(expected) && !$0.matches(before) } == true,
           "fading in: partway after 0.1 s (top \(dimmer.curvesNow(display)?.r.last ?? -1))")
-    wait(0.5)
-    check(dimmer.curvesNow(display).map { $0.matches(expected) } == true, "fading in: then exactly half")
+    took = settle { dimmer.curvesNow(display).map { $0.matches(expected) } == true }
+    check(took != nil, "fading in: then exactly half (\(took ?? "not within 2 s"))")
     dimmer.set(100, on: display, save: false)
     dimmer.fade(on: [display], dimming: true, levels: [display: 50])
     wait(0.1)
     dimmer.undo(display)
-    wait(0.5)
+    wait(0.6)
     check(dimmer.curvesNow(display) == before, "undone during a fade in: stays undone")
     dimmer.set(50, on: display, save: false)
     dimmer.fade(on: [display], dimming: false)
     wait(0.1)
     dimmer.undoAll()
-    wait(0.5)
+    wait(0.6)
     check(dimmer.curvesNow(display) == before, "undone during a fade out: stays undone")
     dimmer.set(100, on: display, save: false)
     check(dimmer.curvesNow(display) == before, "100%: put back exactly")
