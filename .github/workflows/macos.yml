@@ -10,33 +10,23 @@ jobs:
     runs-on: macos-15
     steps:
       - name: security -i
+        timeout-minutes: 8
         run: |
           set +e
-          out="$RUNNER_TEMP/probe.txt"
+          t() { perl -e 'alarm 25; exec @ARGV' "$@"; }
           d="$RUNNER_TEMP/with space"; mkdir -p "$d"
           kc="$d/p.keychain-db"
-          {
-            printf 'create-keychain -p 0123abcd "%s"\n' "$kc" | security -i; echo "create (quoted path with space) exit $?"
-            ls "$d"
-            printf 'unlock-keychain -p wrongpass "%s"\n' "$kc" | security -i; echo "unlock wrong exit $?"
-            printf 'unlock-keychain -p 0123abcd "%s"\n' "$kc" | security -i; echo "unlock right exit $?"
-            printf 'unlock-keychain -p wrongpass "%s"\n' "$RUNNER_TEMP/missing.keychain-db" | security -i; echo "unlock missing exit $?"
-            printf 'unlock-keychain -p wrongpass "%s"\nshow-keychain-info "%s"\n' "$kc" "$kc" | security -i; echo "two commands, first fails: exit $?"
-            security lock-keychain "$kc"; echo "lock exit $?"
-            security show-keychain-info "$kc"; echo "show-keychain-info while locked exit $?"
-            printf 'unlock-keychain -p 0123abcd "%s"\n' "$kc" | security -i; echo "unlock again exit $?"
-            # import a p12 with -P, and set-key-partition-list -k, through -i
-            t="$RUNNER_TEMP/p12"; mkdir -p "$t"
-            printf '[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=Probe\n' > "$t/c.cnf"
-            /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 1 -config "$t/c.cnf" -keyout "$t/k.pem" -out "$t/c.pem" >/dev/null 2>&1
-            P=0123abcd /usr/bin/openssl pkcs12 -export -inkey "$t/k.pem" -in "$t/c.pem" -name Probe -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 -passout env:P -out "$t/i.p12"
-            echo "p12 exit $?"
-            printf 'import "%s" -k "%s" -P 0123abcd -T /usr/bin/codesign\n' "$t/i.p12" "$kc" | security -i; echo "import exit $?"
-            printf 'import "%s" -k "%s" -P wrongpass -T /usr/bin/codesign\n' "$t/i.p12" "$kc" | security -i; echo "import wrong pass exit $?"
-            printf 'set-key-partition-list -S apple-tool:,apple:,codesign: -s -k 0123abcd "%s"\n' "$kc" | security -i >/dev/null; echo "partition list exit $?"
-            printf 'set-key-partition-list -S apple-tool:,apple:,codesign: -s -k wrongpass "%s"\n' "$kc" | security -i >/dev/null; echo "partition list wrong exit $?"
-            security find-identity -p codesigning "$kc"; echo "find-identity exit $?"
-            ps -axo args | grep -c 0123abcd; echo "(password seen in ps: count above includes this grep)"
-          } > "$out" 2>&1
-          cat "$out"
-          echo "::notice title=probe::$(tr '\n' ' ' < "$out" | cut -c1-4000)"
+          printf 'create-keychain -p 0123abcd "%s"\n' "$kc" | t security -i; echo "== create (quoted path with space) exit $?"
+          ls "$d"
+          printf 'unlock-keychain -p wrongpass "%s"\n' "$kc" | t security -i; echo "== unlock wrong exit $?"
+          printf 'unlock-keychain -p 0123abcd "%s"\n' "$kc" | t security -i; echo "== unlock right exit $?"
+          printf 'unlock-keychain -p wrongpass "%s"\n' "$RUNNER_TEMP/missing.keychain-db" | t security -i; echo "== unlock missing exit $?"
+          tp="$RUNNER_TEMP/p12"; mkdir -p "$tp"
+          printf '[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=Probe\n' > "$tp/c.cnf"
+          /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 1 -config "$tp/c.cnf" -keyout "$tp/k.pem" -out "$tp/c.pem" >/dev/null 2>&1
+          P=0123abcd /usr/bin/openssl pkcs12 -export -inkey "$tp/k.pem" -in "$tp/c.pem" -name Probe -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 -passout env:P -out "$tp/i.p12"; echo "== p12 exit $?"
+          printf 'import "%s" -k "%s" -P 0123abcd -T /usr/bin/codesign\n' "$tp/i.p12" "$kc" | t security -i; echo "== import exit $?"
+          printf 'import "%s" -k "%s" -P wrongpass -T /usr/bin/codesign\n' "$tp/i.p12" "$kc" | t security -i; echo "== import wrong pass exit $?"
+          printf 'set-key-partition-list -S apple-tool:,apple:,codesign: -s -k 0123abcd "%s"\n' "$kc" | t security -i >/dev/null; echo "== partition list exit $?"
+          printf 'set-key-partition-list -S apple-tool:,apple:,codesign: -s -k wrongpass "%s"\n' "$kc" | t security -i >/dev/null; echo "== partition list wrong exit $?"
+          t security find-identity -p codesigning "$kc"; echo "== find-identity exit $?"
