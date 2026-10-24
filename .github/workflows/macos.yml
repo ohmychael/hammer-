@@ -165,6 +165,36 @@ jobs:
           # Without the usage text, macOS would refuse Hammer without asking. (set +e above: check both.)
           grep -q "Microsoft Edge" /tmp/edge-usage.txt && grep -q "^exit 0$" /tmp/edge.txt
 
+      - name: Keychain check (experiment)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        run: |
+          set +e
+          limit() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+          app=~/Applications/Hammer.app/Contents/MacOS/Hammer
+          out=/tmp/keychain.txt
+          security default-keychain > $out 2>&1; security show-keychain-info >> $out 2>&1
+          echo "== A round trip" >> $out
+          limit 60 "$app" keychain-check >> $out 2>&1; echo "exit $?" >> $out
+          echo "== A keeps one" >> $out
+          limit 30 "$app" keychain-check --keep >> $out 2>&1; echo "exit $?" >> $out
+          echo "== /usr/bin/security reads A's item" >> $out
+          limit 20 /usr/bin/security find-generic-password -s local.hammer.keychain-check -a test -w > /tmp/kc-sec.txt 2>&1; echo "exit $?" >> $out
+          grep -c hammer-test /tmp/kc-sec.txt >> $out
+          rm -rf /tmp/HammerB.app && cp -R ~/Applications/Hammer.app /tmp/HammerB.app
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleVersion experiment' /tmp/HammerB.app/Contents/Info.plist
+          (source ./signing.sh && sign_app /tmp/HammerB.app) >> $out 2>&1
+          codesign -dvvv ~/Applications/Hammer.app 2>&1 | grep -E "^CDHash=|TeamIdentifier|Authority" >> $out
+          codesign -dvvv /tmp/HammerB.app 2>&1 | grep -E "^CDHash=|TeamIdentifier|Authority" >> $out
+          echo "== B (same certificate, new build) reads A's item" >> $out
+          limit 30 /tmp/HammerB.app/Contents/MacOS/Hammer keychain-check --read >> $out 2>&1; echo "exit $?" >> $out
+          mkdir -p /tmp/player-shots && screencapture -x /tmp/player-shots/keychain.png
+          echo "== A cleans up" >> $out
+          limit 30 "$app" keychain-check --delete >> $out 2>&1; echo "exit $?" >> $out
+          cat $out
+          body="$(sed -e 's/%/%25/g' $out | awk '{printf "%s%%0A", $0}')"
+          echo "::notice title=keychain.txt::$body"
+
       - name: Keep the pictures (on the ci-screenshots branch)
         if: always()
         env:

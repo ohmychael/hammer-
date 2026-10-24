@@ -5,6 +5,7 @@
 
 import AppKit
 import Network
+import Security
 import UserNotifications
 #if canImport(FoundationNetworking)
 import FoundationNetworking      // URLSession on Linux, where the tests run
@@ -556,5 +557,66 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
 
     private func save<T: Encodable>(_ value: T, _ key: String) {
         if let data = try? JSONEncoder().encode(value) { UserDefaults.standard.set(data, forKey: key) }
+    }
+}
+
+// MARK: - Keychain check (experiment: does an update of a self-signed Hammer read its own items silently?)
+
+enum KeychainCheck {
+    static let service = "local.hammer.keychain-check"
+    static let account = "test"
+
+    private static func base() -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+         kSecAttrAccount as String: account]
+    }
+
+    private static func timed<T>(_ seconds: Double, _ work: @escaping () -> T) -> T? {
+        let done = DispatchSemaphore(value: 0)
+        let box = Box<T?>(nil)
+        DispatchQueue.global().async { box.value = work(); done.signal() }
+        return done.wait(timeout: .now() + seconds) == .success ? box.value : nil
+    }
+
+    private static func say(_ step: String, _ status: OSStatus?) -> Bool {
+        guard let status else { print("\(step): timed out (macOS is probably asking for permission)"); return false }
+        let text = (SecCopyErrorMessageString(status, nil) as String?) ?? ""
+        print("\(step): \(status) \(text)")
+        return status == errSecSuccess
+    }
+
+    static func run(_ args: [String]) -> Int32 {
+        let mode = args.dropFirst().first ?? "round-trip"
+        let value = "hammer-test-" + UUID().uuidString
+        var ok = true
+        if mode == "round-trip" || mode == "--keep" {
+            _ = timed(15) { SecItemDelete(base() as CFDictionary) }
+            ok = say("store", timed(15) { () -> OSStatus in
+                var query = base()
+                query[kSecValueData as String] = Data(value.utf8)
+                query[kSecAttrLabel as String] = "Hammer keychain check"
+                return SecItemAdd(query as CFDictionary, nil)
+            }) && ok
+        }
+        if mode == "round-trip" || mode == "--read" {
+            let read = timed(15) { () -> (OSStatus, Data?) in
+                var query = base()
+                query[kSecReturnData as String] = true
+                query[kSecMatchLimit as String] = kSecMatchLimitOne
+                var result: CFTypeRef?
+                let status = SecItemCopyMatching(query as CFDictionary, &result)
+                return (status, result as? Data)
+            }
+            ok = say("read", read?.0) && ok
+            if let data = read?.1 {
+                let text = String(decoding: data, as: UTF8.self)
+                print("read value: \(mode == "round-trip" ? (text == value ? "matches" : "DIFFERENT") : (text.hasPrefix("hammer-test-") ? "a test value" : "unexpected"))")
+            }
+        }
+        if mode == "round-trip" || mode == "--delete" || mode == "--read" {
+            ok = say("delete", timed(15) { SecItemDelete(base() as CFDictionary) }) && ok
+        }
+        print(ok ? "keychain check passed" : "keychain check FAILED")
+        return ok ? 0 : 1
     }
 }
