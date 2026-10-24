@@ -2842,15 +2842,18 @@ extension AppDelegate {
 
     func startTour() {
         guard let tour = Self.tour else { return }
+        Self.tourLog("tour: starting (demo: \(tour.demo))")
         try? FileManager.default.createDirectory(at: tour.folder, withIntermediateDirectories: true)
         if tour.demo { applyTourDemo() }
         let prefix = tour.demo ? "demo" : "plain"
         var steps: [TourStep] = []
 
-        // The menu, as you see it when you click the hammer.
-        steps.append(TourStep(name: "\(prefix)-01-menu", wait: 1.5,
-                              open: { [weak self] in self?.statusItem.button?.performClick(nil) },
-                              close: { [weak self] in self?.statusItem.menu?.cancelTracking() }))
+        // The menu, as you see it when you click the hammer: right under the icon.
+        steps.append(TourStep(name: "\(prefix)-01-menu", wait: 1.5, open: { [weak self] in
+            guard let self, let menu = self.statusItem.menu else { return }
+            let icon = self.statusItem.button?.window?.frame ?? NSRect(x: 900, y: 740, width: 24, height: 24)
+            menu.popUp(positioning: nil, at: NSPoint(x: icon.minX, y: icon.minY - 2), in: nil)
+        }, close: { [weak self] in self?.statusItem.menu?.cancelTracking() }))
         // Each submenu, opened on its own near the menu bar.
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1024, height: 740)
         let spot = NSPoint(x: screen.maxX - 330, y: screen.maxY - 8)
@@ -2897,20 +2900,28 @@ extension AppDelegate {
             exit(0)
         }
         let rest = Array(steps.dropFirst())
-        // A timer in every run loop mode, so it fires while a menu or dialog is up.
+        // A timer in every run loop mode, so it fires while a menu or dialog is up. Main-run-loop
+        // timers fire on the main thread, so it can act straight away (no hop that a menu might hold up).
+        Self.tourLog("tour: \(step.name): opening")
         let timer = Timer(timeInterval: step.wait, repeats: false) { [weak self] _ in
-            Task { @MainActor in
+            MainActor.assumeIsolated {
                 Self.screenshot(folder.appendingPathComponent(step.name + ".png"))
-                print("  \(step.name)")
-                fflush(stdout)
+                Self.tourLog("tour: \(step.name): picture taken")
                 step.close()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                    Task { @MainActor in self?.runTour(rest) }
+                let next = Timer(timeInterval: 1, repeats: false) { _ in
+                    MainActor.assumeIsolated { self?.runTour(rest) }
                 }
+                RunLoop.main.add(next, forMode: .common)
             }
         }
         RunLoop.main.add(timer, forMode: .common)
         step.open()                                   // returns at once, or once the menu or dialog is closed
+        Self.tourLog("tour: \(step.name): open returned")
+    }
+
+    nonisolated private static func tourLog(_ text: String) {
+        print(text)
+        fflush(stdout)
     }
 
     nonisolated private static func screenshot(_ url: URL) {
