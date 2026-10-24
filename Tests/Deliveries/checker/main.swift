@@ -15,10 +15,12 @@ let port = UInt16(args[1])!, boxPath = args[2], logPath = args[3], deadPort = UI
 let now = Date(timeIntervalSince1970: 1_792_250_000)            // Sat 17 Oct 2026, ~15:13 UTC
 
 var box: [String: Any] = ["password": "abcdefghijklmnop", "uidvalidity": 7, "messages": [[String: Any]]()]
-func addMail(_ subject: String, from: String = "\"eBay\" <ebay@ebay.com>", id: String? = nil) {
+func addMail(_ subject: String, from: String = "\"eBay\" <ebay@ebay.com>", id: String? = nil, authentication: String? = nil) {
     var messages = box["messages"] as! [[String: Any]]
     let uid = (messages.compactMap { $0["uid"] as? Int }.max() ?? 500) + 1
-    let headers = "From: \(from)\r\nTo: you@gmail.com\r\nSubject: \(subject)\r\nDate: Sat, 17 Oct 2026 14:00:00 +0000\r\nMessage-ID: <\(id ?? "m\(uid)")@mail>\r\nContent-Type: text/plain\r\n"
+    let verdict = authentication ?? "mx.google.com; dkim=pass header.i=@\(DeliveryMail.domain(of: from))"   // Gmail's, on top
+    let checked = "Authentication-Results: \(verdict)\r\n"
+    let headers = checked + "From: \(from)\r\nTo: you@gmail.com\r\nSubject: \(subject)\r\nDate: Sat, 17 Oct 2026 14:00:00 +0000\r\nMessage-ID: <\(id ?? "m\(uid)")@mail>\r\nContent-Type: text/plain\r\n"
     messages.append(["uid": uid, "headers": headers])
     box["messages"] = messages
     let data = try! JSONSerialization.data(withJSONObject: box)
@@ -50,14 +52,20 @@ addMail("=?UTF-8?B?8J+TpiBZb3VyIHBhY2thZ2Ugd2FzIGRlbGl2ZXJlZA==?=")
 addMail(#"Delivered: "Anker 735 Charger" and 1 more item"#, from: "Amazon.com <shipment-tracking@amazon.com>")
 addMail(#"Out for delivery: "Cable""#, from: "Amazon.com <shipment-tracking@amazon.com>")
 addMail("lunch?", from: "Friend <f@gmail.com>")
-addMail("UPS Update: Delivery Attempted", from: "UPS <mcinfo@ups.com>")
+addMail("UPS Update: Delivery Attempted", from: "UPS <mcinfo@ups.com>",
+        authentication: "mx.google.com; dkim=pass header.i=@ups.com header.s=s1; spf=pass smtp.mailfrom=ups.com")
+addMail("UPS Update: Package Delivered", from: "UPS <mcinfo@ups.com>",                   // forged: signed by someone else
+        authentication: "mx.google.com; dkim=pass header.i=@evil.top; spf=fail smtp.mailfrom=evil.top")
 switch check(state) {
 case .success(let result):
     let shown = result.deliveries.map { "\($0.title) | \($0.body)" }
     check(shown == ["Delivered · eBay | Your package was delivered",
                     "Delivered · Amazon | Anker 735 Charger +1 more",
-                    "Delivery problem · UPS | UPS Update: Delivery Attempted"], "the right three, in order: \(shown)")
-    check(result.state.lastUID == 536, "moved past all new mail")
+                    "Out for delivery · Amazon | Cable",
+                    "Delivery problem · UPS | Delivery Attempted",
+                    "Delivered · Unverified sender | UPS Update: Package Delivered"], "the right ones, in order: \(shown)")
+    check(result.deliveries.first?.gmailID == String(1_000_532, radix: 16), "with Gmail's ID for each email")
+    check(result.state.lastUID == 537, "moved past all new mail")
     state = result.state
 case .failure(let error):
     check(false, "check failed: \(error)")

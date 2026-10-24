@@ -6,7 +6,9 @@
 #  2. watcher: DeliveryAlerts.swift's DeliveryWatcher run for real, with stand-ins
 #     for Apple's frameworks (AppleStandIns.swift) and the Keychain tool
 #     (fake_security.py), through an app password (fake_gmail.py) and through the
-#     Google script (fake_script_server.py). Hammer.swift's Deliveries menu code is
+#     Google script (fake_script_server.py): setup, alerts, out for delivery,
+#     setting up again, errors, the Keychain, moving the script's address out of the
+#     settings, and the clipboard. Hammer.swift's Deliveries menu code is
 #     type-checked too.
 #  3. script: the Google Apps Script Hammer hands you, run in node with a fake Gmail.
 set -uo pipefail
@@ -42,6 +44,7 @@ open(f"{work}/Menu.swift", "w").write('''import Foundation
         NSMenuItem(title: t, action: s, keyEquivalent: "") }
     private func clockTime(_ d: Date) -> String { "" }
     private func rebuildMenuSoon() {}
+    private func checked(_ item: NSMenuItem, _ isOn: Bool) -> NSMenuItem { item.state = isOn ? .on : .off; return item }
 ''' + linuxify(app[start:end]) + "}\n")
 PY
 

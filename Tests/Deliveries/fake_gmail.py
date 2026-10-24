@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """A small stand-in for Gmail's IMAP server, for testing Hammer's delivery alerts.
 
-It speaks enough IMAP for what Hammer sends through curl: CAPABILITY, LOGIN,
+It speaks enough IMAP for what Hammer sends: CAPABILITY, LOGIN,
 AUTHENTICATE PLAIN, SELECT/EXAMINE, STATUS, UID SEARCH (a UID range plus Gmail's
-X-GM-RAW "subject:(...)"), UID FETCH of header fields, NOOP and LOGOUT.
+X-GM-RAW "subject:(...)"; anything else, such as SINCE, finds every email), UID
+FETCH of header fields (with Gmail's X-GM-MSGID when asked), NOOP and LOGOUT.
 
     fake_gmail.py PORT MAILBOX.json LOG.txt
 
@@ -172,7 +173,8 @@ async def handle(reader, writer):
                             kept.append(hline)
                     data = ("\r\n".join(kept) + "\r\n\r\n").encode()
                     label = f"BODY[HEADER.FIELDS ({fields.group(1).upper()})]" if fields else "BODY[]"
-                    out += f"* {seq} FETCH (UID {msg['uid']} {label} {{{len(data)}}}\r\n".encode() + data + b")\r\n"
+                    gmail_id = f"X-GM-MSGID {1000000 + msg['uid']} " if "X-GM-MSGID" in what.upper() else ""
+                    out += f"* {seq} FETCH ({gmail_id}UID {msg['uid']} {label} {{{len(data)}}}\r\n".encode() + data + b")\r\n"
                 await send(out + f"{tag} OK Success\r\n".encode())
             else:
                 await send(f"{tag} BAD unsupported\r\n")

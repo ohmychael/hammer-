@@ -45,7 +45,9 @@ class UNMutableNotificationContent: UNNotificationContent {
 class UNNotificationTrigger {}
 class UNNotificationRequest {
     let content: UNNotificationContent
-    init(identifier: String, content: UNNotificationContent, trigger: UNNotificationTrigger?) { self.content = content }
+    let identifier: String
+    init(identifier: String, content: UNNotificationContent, trigger: UNNotificationTrigger?) {
+        self.content = content; self.identifier = identifier }
 }
 class UNNotification { var request: UNNotificationRequest { fatalError() } }
 class UNNotificationResponse { var notification: UNNotification { fatalError() } }
@@ -57,7 +59,8 @@ class UNUserNotificationCenter {
         simAsked += 1; completionHandler(true, nil) }
     func getNotificationSettings(completionHandler: @escaping (UNNotificationSettings) -> Void) { completionHandler(UNNotificationSettings()) }
     func add(_ request: UNNotificationRequest, withCompletionHandler completionHandler: ((Error?) -> Void)? = nil) {
-        simPosted.append((request.content.title, request.content.body, request.content.userInfo["link"] as? String)); completionHandler?(nil) }
+        simPosted.append((request.content.title, request.content.body, request.content.userInfo["link"] as? String))
+        simPostedIDs.append(request.identifier); completionHandler?(nil) }
 }
 // AppKit
 struct Selector { init(_ name: String) {} }
@@ -90,11 +93,24 @@ class NSWindow {
     func setFrameTopLeftPoint(_ point: NSPoint) {}
 }
 final class NSPasteboard {
-    struct PasteboardType: Equatable { let raw: String; static let string = PasteboardType(raw: "public.utf8-plain-text") }
+    struct PasteboardType: Hashable {
+        let raw: String
+        init(raw: String) { self.raw = raw }
+        init(_ raw: String) { self.raw = raw }
+        static let string = PasteboardType(raw: "public.utf8-plain-text")
+    }
+    struct ContentsOptions: OptionSet { let rawValue: UInt; static let currentHostOnly = Self(rawValue: 1) }
     static let general = NSPasteboard()
-    var contents: String?
-    func clearContents() { contents = nil }
-    @discardableResult func setString(_ string: String, forType type: PasteboardType) -> Bool { contents = string; return true }
+    private(set) var changeCount = 0
+    var items: [PasteboardType: Data] = [:]
+    var options: ContentsOptions = []
+    var contents: String? { items[.string].map { String(decoding: $0, as: UTF8.self) } }
+    @discardableResult func clearContents() -> Int { prepareForNewContents(with: []) }
+    func prepareForNewContents(with options: ContentsOptions) -> Int {
+        items = [:]; self.options = options; changeCount += 1; return changeCount }
+    @discardableResult func setString(_ string: String, forType type: PasteboardType) -> Bool { items[type] = Data(string.utf8); return true }
+    @discardableResult func setData(_ data: Data?, forType type: PasteboardType) -> Bool { items[type] = data; return true }
+    func string(forType type: PasteboardType) -> String? { items[type].map { String(decoding: $0, as: UTF8.self) } }
 }
 struct NSModalResponse: Equatable { let raw: Int
     static let alertFirstButtonReturn = Self(raw: 1000), alertSecondButtonReturn = Self(raw: 1001),
@@ -110,14 +126,17 @@ class NSAlert {
 class NSApplication { func activate() {}; func activate(ignoringOtherApps: Bool) {} }
 let NSApp = NSApplication()
 class NSMenu { func addItem(_ item: NSMenuItem) {} }
+enum NSControl { enum StateValue { case on, off, mixed } }
 class NSMenuItem {
     var title: String; var target: AnyObject?; var tag = 0; var toolTip: String?; var submenu: NSMenu?; var isEnabled = true
+    var state = NSControl.StateValue.off
     var representedObject: Any?
     init(title: String, action: Selector?, keyEquivalent: String) { self.title = title }
     static func separator() -> NSMenuItem { NSMenuItem(title: "", action: nil, keyEquivalent: "") }
 }
 
 var simPosted: [(String, String, String?)] = []
+var simPostedIDs: [String] = []
 var simAsked = 0
 final class Box<Value> {
     var value: Value

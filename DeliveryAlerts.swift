@@ -1,7 +1,8 @@
 // DeliveryAlerts.swift — the Mac side of delivery alerts: the secure connection to
-// Gmail, the app password in the Keychain, the notifications, and checking every
-// few minutes. What counts as a delivery, and the IMAP conversation itself, are in
-// Deliveries.swift (tested in Tests/).
+// Gmail, the app password, script key and script address in the Keychain, the
+// notifications, and checking every few minutes. What counts as a delivery, the IMAP
+// conversation and the Keychain tool itself are in Deliveries.swift (tested in
+// Tests/); this file runs end to end in Tests/Deliveries.
 
 import AppKit
 import Network
@@ -68,68 +69,125 @@ final class TLSTransport: IMAPTransport {
     func close() { connection.cancel() }
 }
 
-// MARK: - The app password or script key, in your login Keychain
+// MARK: - The app password, script key and script address, in your login Keychain
 
-/// Stored with the `security` tool that comes with macOS, so the Keychain item
-/// belongs to that tool. Hammer is rebuilt on every update, and an item owned by
-/// Hammer itself would make macOS ask for your password after each one.
-/// Secrets go to `security` on its standard input, never on a command line.
+/// Kept by macOS's `security` tool (see KeychainTool in Deliveries.swift for why),
+/// always off the main thread: it can stop to ask for your Mac password.
 enum GmailKeychain {
     static let service = "local.hammer.gmail"
     static let scriptAccount = "script-key"
-    static var tool = "/usr/bin/security"                  // tests swap in a stand-in
+    static let scriptURLAccount = "script-url"
+    static var tool = KeychainTool()                  // tests swap in a stand-in
 
     /// The key Hammer shares with your Google script.
     @discardableResult
     static func saveScriptKey(_ key: String) -> Bool {
         guard DeliveryScript.isKey(key) else { return false }
-        _ = run(["-i"], input: "add-generic-password -U -s \(service) -a \(scriptAccount) -l Hammer-Gmail-script -w \(key)\n")
-        return scriptKey() == key
+        return tool.save(service: service, account: scriptAccount, label: "Hammer-Gmail-script", secret: key)
     }
 
-    static func scriptKey() -> String? {
-        let (status, output) = run(["find-generic-password", "-s", service, "-a", scriptAccount, "-w"])
-        let value = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        return status == 0 && DeliveryScript.isKey(value) ? value : nil
+    static func scriptKey() -> KeychainRead {
+        let read = tool.find(service: service, account: scriptAccount)
+        if let value = read.value, !DeliveryScript.isKey(value) { return .missing }
+        return read
     }
 
-    static func deleteScriptKey() {
-        _ = run(["delete-generic-password", "-s", service, "-a", scriptAccount])
+    static func deleteScriptKey() { tool.delete(service: service, account: scriptAccount) }
+
+    /// The script's web address. Anyone with it and the key could ask your script for
+    /// your delivery emails, so it's kept with the key rather than in Hammer's settings.
+    @discardableResult
+    static func saveScriptURL(_ url: URL) -> Bool {
+        tool.save(service: service, account: scriptURLAccount, label: "Hammer-Gmail-script-URL", secret: url.absoluteString)
+    }
+
+    static func scriptURL() -> KeychainRead {
+        let read = tool.find(service: service, account: scriptURLAccount)
+        if let value = read.value, DeliveryScript.savedURL(value) == nil { return .missing }
+        return read
+    }
+
+    static func deleteScriptURL() { tool.delete(service: service, account: scriptURLAccount) }
+
+    /// The script's address and key, saved together: if the key can't be saved, the
+    /// address is put back as it was, so the setup in use keeps working.
+    @discardableResult
+    static func saveScript(key: String, url: URL) -> Bool {
+        guard DeliveryScript.isKey(key) else { return false }
+        return tool.saveAll(service: service, [(scriptURLAccount, "Hammer-Gmail-script-URL", url.absoluteString),
+                                               (scriptAccount, "Hammer-Gmail-script", key)])
     }
 
     @discardableResult
     static func save(email: String, password: String) -> Bool {
         guard DeliverySetup.isPlainEmail(email), DeliverySetup.cleanPassword(password) == password else { return false }
-        _ = run(["-i"], input: "add-generic-password -U -s \(service) -a \(email) -l Hammer-Gmail -w \(password)\n")
-        return self.password(for: email) == password
+        return tool.save(service: service, account: email, label: "Hammer-Gmail", secret: password)
     }
 
-    static func password(for email: String) -> String? {
-        guard DeliverySetup.isPlainEmail(email) else { return nil }
-        let (status, output) = run(["find-generic-password", "-s", service, "-a", email, "-w"])
-        let value = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        return status == 0 && !value.isEmpty ? value : nil
+    static func password(for email: String) -> KeychainRead {
+        guard DeliverySetup.isPlainEmail(email) else { return .missing }
+        let read = tool.find(service: service, account: email)
+        if let value = read.value, value.isEmpty { return .missing }
+        return read
     }
 
     static func delete(email: String) {
         guard DeliverySetup.isPlainEmail(email) else { return }
-        _ = run(["delete-generic-password", "-s", service, "-a", email])
+        tool.delete(service: service, account: email)
+    }
+}
+
+/// `Hammer keychain-check`: stores, reads and deletes a test item the way delivery
+/// alerts keep their secrets, under a service name of its own. The build server runs
+/// it on a real Mac.
+enum KeychainCheck {
+    static let service = "local.hammer.keychain-check"
+
+    static func run() -> Int32 {
+        setvbuf(stdout, nil, _IOLBF, 0)
+        let tool = KeychainTool(path: GmailKeychain.tool.path, timeout: 20)
+        let account = "test", value = "hammer-check-" + UUID().uuidString.lowercased()
+        var passed = true
+        func step(_ name: String, _ ok: Bool) {
+            print("\(name): \(ok ? "ok" : "FAILED")")
+            passed = passed && ok
+        }
+        tool.delete(service: service, account: account)                 // left over from an earlier run
+        step("store a test item", tool.save(service: service, account: account, label: "Hammer-keychain-check", secret: value))
+        step("read it back", tool.find(service: service, account: account) == .found(value))
+        step("delete it", tool.delete(service: service, account: account))
+        step("it's gone (reads as missing)", tool.find(service: service, account: account) == .missing)
+        print(passed ? "Keychain check passed." : "Keychain check failed.")
+        return passed ? 0 : 1
+    }
+}
+
+// MARK: - Copying the script
+
+/// The script carries its key, so it's copied for this Mac only (not to your other
+/// devices through Universal Clipboard), marked so clipboard managers neither keep
+/// nor show it (nspasteboard.org), and cleared once Hammer has it set up.
+enum ScriptClipboard {
+    static let concealed = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
+    static let transient = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+    private static var copied: (change: Int, text: String)?
+
+    static func copy(_ script: String) {
+        let board = NSPasteboard.general
+        _ = board.prepareForNewContents(with: .currentHostOnly)
+        _ = board.setString(script, forType: .string)
+        _ = board.setData(Data(), forType: concealed)
+        _ = board.setData(Data(), forType: transient)
+        copied = (board.changeCount, script)
     }
 
-    private static func run(_ arguments: [String], input: String? = nil) -> (Int32, String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: tool)
-        process.arguments = arguments
-        let output = Pipe(), stdin = Pipe()
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        process.standardInput = stdin
-        do { try process.run() } catch { return (-1, "") }
-        if let input { stdin.fileHandleForWriting.write(Data(input.utf8)) }
-        try? stdin.fileHandleForWriting.close()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+    /// Clears the clipboard, but only if it still holds the script Hammer copied.
+    static func clearIfOurs() {
+        guard let copied else { return }
+        self.copied = nil
+        let board = NSPasteboard.general
+        guard board.changeCount == copied.change, board.string(forType: .string) == copied.text else { return }
+        board.clearContents()
     }
 }
 
@@ -142,10 +200,14 @@ enum DeliverySource: String {
 }
 
 /// Checks for new delivery emails every few minutes and shows a notification for
-/// each delivery. Everything here happens on the main thread except the check itself.
+/// each delivery. Everything here happens on the main thread except the check
+/// itself and the Keychain.
 final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
     static let shared = DeliveryWatcher()
     static let checkEvery: TimeInterval = 180
+    /// After a first "can't reach Gmail" (say, just after waking, before Wi-Fi is back),
+    /// Hammer quietly tries again this much later before saying so.
+    static var retryAfter: TimeInterval = 30
     /// How to reach Gmail with an app password (tests swap in a fake server).
     static var connect: () throws -> IMAPTransport = { try TLSTransport(host: "imap.gmail.com", port: 993) }
     /// How to ask the Google script; nil if it couldn't be reached (tests swap in a fake).
@@ -155,17 +217,21 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
     var onChange: (() -> Void)?
 
     private(set) var lastChecked: Date?
-    private(set) var problem: String?
+    /// What's wrong, if anything: one line for the menu, and what to do (Fix…).
+    private(set) var failure: CheckFailure?
+    var problem: String? { failure?.message }
     private(set) var notificationsOff = false
     private(set) var isChecking = false
     private(set) var needsSetup = false        // e.g. Gmail refused the app password, or the script's key is wrong
     private(set) var isSettingUp = false       // the first check after Turn On is running
     private var secret: String?                // the app password or script key, once read from the Keychain
+    private(set) var scriptURL: URL?           // the script's address, once read from the Keychain
     private var generation = 0                 // changes when alerts are set up or turned off
+    private var offlineStreak = 0              // checks in a row that couldn't reach Gmail
     private var timer: Timer?
     private let queue = DispatchQueue(label: "local.hammer.deliveries")
 
-    // Saved between launches. The app password or script key itself is only in the Keychain.
+    // Saved between launches. The app password, script key and script address are only in the Keychain.
     private(set) var source: DeliverySource? {
         get {
             if let raw = UserDefaults.standard.string(forKey: "deliverySource") { return DeliverySource(rawValue: raw) }
@@ -178,10 +244,8 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         get { UserDefaults.standard.string(forKey: "deliveryEmail") }
         set { UserDefaults.standard.set(newValue, forKey: "deliveryEmail") }
     }
-    private(set) var scriptURL: URL? {
-        get { UserDefaults.standard.string(forKey: "deliveryScriptURL").flatMap(URL.init(string:)) }
-        set { UserDefaults.standard.set(newValue?.absoluteString, forKey: "deliveryScriptURL") }
-    }
+    /// Where the script's address was kept before it moved to the Keychain.
+    private static let oldScriptURLSetting = "deliveryScriptURL"
     private var state: DeliveryState {
         get { load(DeliveryState.self, "deliveryState") ?? DeliveryState() }
         set { save(newValue, "deliveryState") }
@@ -190,9 +254,28 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         get { load(ScriptState.self, "deliveryScriptState") ?? ScriptState() }
         set { save(newValue, "deliveryScriptState") }
     }
+    /// When a check last worked. Setting up again looks back to here (at most 3 days).
+    private var lastSuccess: Date? {
+        get { UserDefaults.standard.object(forKey: "deliveryLastSuccess") as? Date }
+        set { UserDefaults.standard.set(newValue, forKey: "deliveryLastSuccess") }
+    }
+    /// The last 7 days' deliveries, newest first.
     private(set) var recent: [Delivery] {
-        get { load([Delivery].self, "recentDeliveries") ?? [] }
-        set { save(Array(newValue.prefix(8)), "recentDeliveries") }
+        get { DeliveryList.current(load([Delivery].self, "recentDeliveries") ?? []) }
+        set { save(DeliveryList.current(newValue), "recentDeliveries") }
+    }
+    /// Whether Hammer has shown any delivery since it was set up (for "No deliveries yet").
+    var hasSeenDeliveries: Bool {
+        UserDefaults.standard.bool(forKey: "deliverySeenAny") || !(load([Delivery].self, "recentDeliveries") ?? []).isEmpty
+    }
+    /// Whether "Out for delivery" emails show a notification too (on unless turned off).
+    var outForDeliveryAlerts: Bool {
+        get { UserDefaults.standard.object(forKey: "deliveryOutForDelivery") == nil
+                || UserDefaults.standard.bool(forKey: "deliveryOutForDelivery") }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "deliveryOutForDelivery")
+            onChange?()
+        }
     }
 
     var isOn: Bool { source != nil }
@@ -216,75 +299,111 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
     // MARK: Setting up
 
     /// Asks the Google script; if it answers properly, saves its address and key and
-    /// starts. Emails already there aren't announced. Calls back on the main thread
-    /// with nil, or with what went wrong. The Keychain is only used off the main
-    /// thread (it can stop to ask for your Mac password).
-    func turnOn(scriptURL: URL, key: String, done: @escaping (String?) -> Void) {
-        let previous = (source: source, email: email)
+    /// starts. Emails already there aren't announced, unless this is the same Gmail
+    /// account set up again: then what arrived since the last good check is. Calls back
+    /// on the main thread with nil, or with what went wrong. The Keychain is only used
+    /// off the main thread (it can stop to ask for your Mac password).
+    func turnOn(scriptURL: URL, key: String, done: @escaping (CheckFailure?) -> Void) {
+        let previous = (source: source, email: email ?? "", scriptState: scriptState)
+        let lookBack = lastSuccess
+        let shown = Set(state.announced + recent.compactMap(\.messageID))
         settingUp(true)
         queue.async {
             let asked = Date()
-            let answer: (failure: String?, account: String, start: ScriptState?)
-            switch Self.askScript(scriptURL, key: key, after: nil) {
-            case .failure(let failure):
-                answer = (failure.message, "", nil)
+            let after = lookBack.map { max($0, asked.addingTimeInterval(-DeliveryCheck.tooOld)) }
+                .map { $0.addingTimeInterval(-DeliveryScript.overlap) }
+            var failure: CheckFailure?
+            var outcome: (account: String, state: ScriptState, found: [Delivery], sameAccount: Bool)?
+            switch Self.askScript(scriptURL, key: key, after: after) {
+            case .failure(let problem):
+                failure = problem
             case .success(let reply):
-                if GmailKeychain.saveScriptKey(key) {
-                    if previous.source == .appPassword, let old = previous.email { GmailKeychain.delete(email: old) }
-                    let start = ScriptCheck.process(reply.emails ?? [], state: ScriptState(), askedAt: asked).state
-                    answer = (nil, reply.account ?? "", start)
+                let account = reply.account ?? ""
+                let same = !account.isEmpty && account.lowercased() == previous.email.lowercased()
+                if GmailKeychain.saveScript(key: key, url: scriptURL) {
+                    if previous.source == .appPassword, !previous.email.isEmpty { GmailKeychain.delete(email: previous.email) }
+                    var start = ScriptState()
+                    if same && lookBack != nil {                       // set up again: catch up on what was missed
+                        start = ScriptState(started: true, seen: previous.scriptState.seen)
+                    }
+                    let processed = ScriptCheck.process(reply.emails ?? [], state: start, now: asked, askedAt: asked,
+                                                        shown: same ? shown : [])
+                    outcome = (account, processed.state, processed.deliveries, same)
                 } else {
-                    answer = ("The script works, but Hammer couldn't save its key to your Keychain.", "", nil)
+                    failure = CheckFailure(message: "The script works, but Hammer couldn't save its key to your Keychain.",
+                                           advice: "Make sure your login Keychain is unlocked, then try again.")
                 }
             }
+            let finished = outcome, problem = failure
             DispatchQueue.main.async {
                 self.settingUp(false)
-                guard let start = answer.start else {
-                    done(answer.failure)
+                guard let outcome = finished else {
+                    done(problem)
                     return
                 }
                 self.source = .script
                 self.scriptURL = scriptURL
-                self.email = answer.account
-                self.scriptState = start
-                self.started(secret: key)
+                UserDefaults.standard.removeObject(forKey: Self.oldScriptURLSetting)
+                self.email = outcome.account
+                self.scriptState = outcome.state
+                self.started(secret: key, keepRecent: outcome.sameAccount)
+                self.announce(outcome.found)
                 done(nil)
             }
         }
     }
 
     /// Tries the email and app password; if Gmail accepts them, saves them and starts.
-    func turnOn(email: String, password: String, done: @escaping (String?) -> Void) {
-        let previous = (source: source, email: self.email)
+    func turnOn(email: String, password: String, done: @escaping (CheckFailure?) -> Void) {
+        let previous = (source: source, email: self.email ?? "")
+        let sameAccount = previous.email.lowercased() == email.lowercased()
+        var catchUp = DeliveryState()
+        if sameAccount {                     // set up again: catch up on what arrived since the last good check
+            catchUp.announced = Array((state.announced + recent.compactMap(\.messageID)).suffix(200))
+            if previous.source == .appPassword {
+                catchUp.uidValidity = state.uidValidity
+                catchUp.lastUID = state.lastUID
+            }
+        }
+        let start = catchUp, lookBack = sameAccount ? lastSuccess : nil
         settingUp(true)
         queue.async {
-            let result = DeliveryCheck.run(state: DeliveryState(), email: email, password: password,
+            let result = DeliveryCheck.run(state: start, email: email, password: password, lookBack: lookBack,
                                            transport: Self.connect)
-            let answer: (failure: String?, start: DeliveryState?)
+            var failure: CheckFailure?
+            var outcome: (deliveries: [Delivery], state: DeliveryState)?
             switch result {
             case .failure(let error):
-                answer = (DeliveryCheck.explain(error), nil)
-            case .success(let outcome):
+                failure = CheckFailure(error)
+            case .success(let checked):
                 if GmailKeychain.save(email: email, password: password) {
-                    if previous.source == .appPassword, let old = previous.email, old != email {
-                        GmailKeychain.delete(email: old)
+                    if previous.source == .appPassword, !previous.email.isEmpty, !sameAccount {
+                        GmailKeychain.delete(email: previous.email)
                     }
-                    if previous.source == .script { GmailKeychain.deleteScriptKey() }
-                    answer = (nil, outcome.state)          // starts from the newest email: old mail isn't announced
+                    if previous.source == .script {
+                        GmailKeychain.deleteScriptKey()
+                        GmailKeychain.deleteScriptURL()
+                    }
+                    outcome = checked
                 } else {
-                    answer = ("Gmail accepted it, but Hammer couldn't save it to your Keychain.", nil)
+                    failure = CheckFailure(message: "Gmail accepted it, but Hammer couldn't save it to your Keychain.",
+                                           advice: "Make sure your login Keychain is unlocked, then try again.")
                 }
             }
+            let finished = outcome, problem = failure
             DispatchQueue.main.async {
                 self.settingUp(false)
-                guard let start = answer.start else {
-                    done(answer.failure)
+                guard let outcome = finished else {
+                    done(problem)
                     return
                 }
                 self.source = .appPassword
                 self.email = email
-                self.state = start
-                self.started(secret: password)
+                self.scriptURL = nil
+                UserDefaults.standard.removeObject(forKey: Self.oldScriptURLSetting)
+                self.state = outcome.state
+                self.started(secret: password, keepRecent: sameAccount)
+                self.announce(outcome.deliveries)
                 done(nil)
             }
         }
@@ -295,19 +414,28 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         onChange?()
     }
 
-    private func started(secret: String) {
+    /// The recent list stays when it's the same Gmail account set up again.
+    private func started(secret: String, keepRecent: Bool) {
         generation += 1
         self.secret = secret
-        recent = []
-        problem = nil
+        if !keepRecent {
+            recent = []
+            UserDefaults.standard.removeObject(forKey: "deliverySeenAny")
+        }
+        failure = nil
         needsSetup = false
+        offlineStreak = 0
         lastChecked = Date()
+        lastSuccess = lastChecked
         scheduleChecks()
         askForNotifications()
         onChange?()
     }
 
-    func turnOff() {
+    /// Turns alerts off and forgets the account. Returns the route that was in use (the
+    /// Google script stays deployed in your account until you delete it there).
+    @discardableResult
+    func turnOff() -> DeliverySource? {
         let old = (source: source, email: email)
         generation += 1
         timer?.invalidate()
@@ -316,17 +444,23 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         email = nil
         scriptURL = nil
         secret = nil
-        problem = nil
+        failure = nil
         needsSetup = false
+        offlineStreak = 0
         lastChecked = nil
-        for key in ["deliveryState", "deliveryScriptState", "recentDeliveries"] {
+        for key in ["deliveryState", "deliveryScriptState", "recentDeliveries", "deliveryLastSuccess", "deliverySeenAny",
+                    Self.oldScriptURLSetting] {
             UserDefaults.standard.removeObject(forKey: key)
         }
         queue.async {
             if old.source == .appPassword, let email = old.email { GmailKeychain.delete(email: email) }
-            if old.source == .script { GmailKeychain.deleteScriptKey() }
+            if old.source == .script {
+                GmailKeychain.deleteScriptKey()
+                GmailKeychain.deleteScriptURL()
+            }
         }
         onChange?()
+        return old.source
     }
 
     // MARK: Checking
@@ -338,74 +472,121 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         var account: String? = nil
     }
 
+    /// The secret (and for the script, its address) from memory or the Keychain. The
+    /// address moves out of Hammer's settings into the Keychain here, once.
+    private static func secrets(source: DeliverySource, email: String, cached: (secret: String?, url: URL?),
+                                oldSetting: String?) -> Result<(secret: String, url: URL?, forgetSetting: Bool), CheckFailure> {
+        let keychainBusy = CheckFailure(message: "Can't open the Keychain right now.")
+        switch source {
+        case .appPassword:
+            if let secret = cached.secret { return .success((secret, nil, false)) }
+            switch GmailKeychain.password(for: email) {
+            case .found(let password): return .success((password, nil, false))
+            case .unavailable: return .failure(keychainBusy)
+            case .missing:
+                return .failure(CheckFailure(message: "Hammer can't find your app password in the Keychain.",
+                                             advice: "Paste it below, or make a new one.", needsSetup: true, stopChecking: true))
+            }
+        case .script:
+            var key = cached.secret
+            if key == nil {
+                switch GmailKeychain.scriptKey() {
+                case .found(let found): key = found
+                case .unavailable: return .failure(keychainBusy)
+                case .missing:
+                    return .failure(CheckFailure(message: "Hammer can't find the script's key in the Keychain.",
+                                                 advice: "Set up Gmail again.", needsSetup: true, stopChecking: true))
+                }
+            }
+            if let url = cached.url, let key, oldSetting == nil { return .success((key, url, false)) }
+            let stored = GmailKeychain.scriptURL()
+            let found = DeliveryMigration.scriptAddress(keychain: stored, setting: oldSetting) { GmailKeychain.saveScriptURL($0) }
+            guard let url = found.url, let key else {
+                if case .unavailable = stored { return .failure(keychainBusy) }
+                return .failure(CheckFailure(message: "Hammer can't find the script's address.",
+                                             advice: "Set up Gmail again.", needsSetup: true, stopChecking: true))
+            }
+            return .success((key, url, found.forgetSetting))
+        }
+    }
+
     func checkNow() {
         guard let source, !isChecking else { return }
         isChecking = true
-        let cached = secret, email = self.email ?? "", url = scriptURL
+        let cached = (secret: secret, url: scriptURL), email = self.email ?? ""
+        let oldSetting = UserDefaults.standard.string(forKey: Self.oldScriptURLSetting)
         let imapState = state, savedScriptState = scriptState, generation = self.generation
         queue.async {
-            let secret: String?
-            switch source {
-            case .appPassword: secret = cached ?? GmailKeychain.password(for: email)
-            case .script: secret = cached ?? GmailKeychain.scriptKey()
-            }
-            guard let secret else {
-                DispatchQueue.main.async { self.secretMissing(generation: generation) }
+            let secrets: (secret: String, url: URL?, forgetSetting: Bool)
+            switch Self.secrets(source: source, email: email, cached: cached, oldSetting: oldSetting) {
+            case .failure(let failure):
+                DispatchQueue.main.async { self.secretTrouble(failure, generation: generation) }
                 return
+            case .success(let found):
+                secrets = found
             }
             let outcome: Outcome
             switch source {
             case .appPassword:
-                switch DeliveryCheck.run(state: imapState, email: email, password: secret, transport: Self.connect) {
+                switch DeliveryCheck.run(state: imapState, email: email, password: secrets.secret, transport: Self.connect) {
                 case .success(let checked): outcome = Outcome(result: .success(checked.deliveries), imapState: checked.state)
                 case .failure(let error): outcome = Outcome(result: .failure(CheckFailure(error)))
                 }
             case .script:
                 let askedAt = Date()
-                let asked = url.map { Self.askScript($0, key: secret, after: savedScriptState.searchFrom) }
-                    ?? .failure(CheckFailure(message: "Hammer lost the script's address.", needsSetup: true))
-                switch asked {
+                switch Self.askScript(secrets.url!, key: secrets.secret, after: savedScriptState.searchFrom) {
                 case .success(let reply):
                     let checked = ScriptCheck.process(reply.emails ?? [], state: savedScriptState, askedAt: askedAt)
-                    outcome = Outcome(result: .success(checked.deliveries), scriptState: checked.state,
-                                      account: reply.account)
+                    outcome = Outcome(result: .success(checked.deliveries), scriptState: checked.state, account: reply.account)
                 case .failure(let failure):
                     outcome = Outcome(result: .failure(failure))
                 }
             }
-            DispatchQueue.main.async { self.finish(outcome, secret: secret, generation: generation) }
+            DispatchQueue.main.async {
+                if secrets.forgetSetting { UserDefaults.standard.removeObject(forKey: Self.oldScriptURLSetting) }
+                self.finish(outcome, secret: secrets.secret, url: secrets.url, generation: generation)
+            }
         }
     }
 
-    private func secretMissing(generation: Int) {
+    private func secretTrouble(_ failure: CheckFailure, generation: Int) {
         isChecking = false
-        guard generation == self.generation, let source else { return }
-        problem = source == .script ? "Hammer can't find the script's key in your Keychain."
-                                    : "Hammer can't find your app password in the Keychain."
-        needsSetup = true
-        timer?.invalidate()                            // don't ask the Keychain again every 3 minutes
-        timer = nil
+        guard generation == self.generation, source != nil else { return }
+        self.failure = failure
+        needsSetup = failure.needsSetup
+        if failure.stopChecking {                       // don't ask the Keychain again every 3 minutes
+            timer?.invalidate()
+            timer = nil
+        }
         onChange?()
     }
 
-    private func finish(_ outcome: Outcome, secret: String, generation: Int) {
+    private func finish(_ outcome: Outcome, secret: String, url: URL?, generation: Int) {
         isChecking = false
         guard generation == self.generation, let source else { return }      // set up again or turned off meanwhile
         switch outcome.result {
         case .success(let deliveries):
             self.secret = secret
+            if let url { scriptURL = url }
             if let checked = outcome.imapState { state = checked }
             if let checked = outcome.scriptState { scriptState = checked }
             if let account = outcome.account, !account.isEmpty { email = account }
             lastChecked = Date()
-            problem = nil
+            lastSuccess = lastChecked
+            failure = nil
             needsSetup = false
+            offlineStreak = 0
             if timer == nil { scheduleChecks() }               // back to normal after a Check Now
-            for delivery in deliveries { post(delivery) }
-            if !deliveries.isEmpty { recent = deliveries.reversed() + recent }
+            announce(deliveries)
         case .failure(let failure):
-            problem = failure.message
-            if failure.needsSetup && source == .appPassword {
+            offlineStreak = failure.offline ? offlineStreak + 1 : 0
+            if failure.offline && offlineStreak == 1 && self.failure == nil, let timer {
+                // Maybe the network isn't back yet: try once more, quietly, before saying so.
+                timer.fireDate = Date().addingTimeInterval(Self.retryAfter)
+                break
+            }
+            self.failure = failure
+            if failure.stopChecking && source == .appPassword {
                 // Don't keep knocking with a password Gmail refuses (it can lock the account).
                 // The script, though, is asked as usual: fixing its deployment fixes this by itself.
                 timer?.invalidate()
@@ -419,9 +600,29 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         onChange?()
     }
 
+    /// Shows new deliveries (oldest first) and lists them in the menu. Their Message-IDs
+    /// are remembered for both routes, so switching routes doesn't announce them again.
+    private func announce(_ deliveries: [Delivery]) {
+        guard !deliveries.isEmpty else { return }
+        var memory = state
+        let known = Set(memory.announced)
+        memory.announced = Array((memory.announced + deliveries.compactMap(\.messageID).filter { !known.contains($0) }).suffix(200))
+        state = memory
+        var list = recent
+        for var delivery in deliveries where delivery.kind != .outForDelivery || outForDeliveryAlerts {
+            // A "Delivered" shows in place of its package's "Out for delivery".
+            delivery.replaces = DeliveryList.replaced(by: delivery, in: list)?.notificationID
+            post(delivery)
+            list = DeliveryList.adding([delivery], to: list)
+            UserDefaults.standard.set(true, forKey: "deliverySeenAny")
+        }
+        if list != recent { recent = list }
+    }
+
     private static func askScript(_ base: URL, key: String, after: Date?) -> Result<ScriptCheck.Reply, CheckFailure> {
         guard let url = DeliveryScript.requestURL(base: base, key: key, after: after) else {
-            return .failure(CheckFailure(message: "That web app address doesn't look right.", needsSetup: true))
+            return .failure(CheckFailure(message: "That web app address doesn't look right.",
+                                         advice: "Set up Gmail again.", needsSetup: true))
         }
         guard let answer = fetch(url) else { return .failure(.offline) }
         return ScriptCheck.read(status: answer.status, body: answer.body, finalURL: answer.finalURL)
@@ -452,8 +653,8 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         self.timer = timer
     }
 
-    // No checks while asleep; the first one comes 10 seconds after waking, once the
-    // network is back, then every 3 minutes as usual.
+    // No checks while asleep; the first one comes 10 seconds after waking, then every
+    // 3 minutes as usual. If the network isn't back by then, the next try is quiet.
     @objc private func macWillSleep() { timer?.fireDate = .distantFuture }
     @objc private func macWoke() { timer?.fireDate = Date().addingTimeInterval(10) }
 
@@ -505,8 +706,8 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         if let link = delivery.gmailLink(account: email ?? "") {           // none for the test alert
             content.userInfo = ["link": link.absoluteString]
         }
-        let id = "delivery-" + (delivery.messageID ?? UUID().uuidString)
-        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
+        // One per package: a package's "Delivered" replaces its "Out for delivery".
+        let request = UNNotificationRequest(identifier: delivery.notificationID, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request) { error in
             guard error != nil else { return }
             // macOS wouldn't show it: notifications are off for Hammer. Say so in the menu
@@ -515,14 +716,17 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// Without Notification Center (the bare binary): AppleScript's notification. The
+    /// text goes in as arguments to a fixed script, never into the script itself.
     private static func plainNotification(title: String, body: String) {
-        func quoted(_ text: String) -> String {
-            "\"" + text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
-        }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", "display notification \(quoted(body)) with title \(quoted(title))"]
-        try? process.run()
+        process.arguments = ["-", title, body]
+        let script = Pipe()
+        process.standardInput = script
+        guard (try? process.run()) != nil else { return }
+        script.fileHandleForWriting.write(Data("on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run\n".utf8))
+        try? script.fileHandleForWriting.close()
     }
 
     // Show banners even while Hammer's menu is open.
