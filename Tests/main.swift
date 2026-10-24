@@ -1956,6 +1956,20 @@ _ = edgeToggle(guessController)
 expect(guessController.savedWindow(for: "edge-1") != guessYours && guessEdge.windows[guessYours]!.bounds == [200, 200, 900, 600],
        "two windows that could be it and no look first: neither is taken")
 expect(guessEdge.saved["edgeYouTubeLaunched"] == nil, "…and it isn't looked for again")
+// Edge starts too slowly to be seen within the wait, bringing back a window of yours on the same page:
+// Hammer never saw that run of Edge start, so it doesn't know which window came first, and doesn't guess.
+let coldGuess = FakeEdge()
+coldGuess.startsAfter = 70
+coldGuess.restores = [FakeEdge.Win(tabs: 1, url: "https://www.youtube.com/", bounds: [200, 200, 900, 600])]
+let coldGuessController = EdgeController(driver: coldGuess)
+if case .failed = edgeToggle(coldGuessController) {} else { expect(false, "too slow to be seen: says so") }
+expect(coldGuess.saved["edgeYouTubeLaunched"]?.split(separator: "|", omittingEmptySubsequences: false).dropFirst(2).first == "?",
+       "Edge never seen running: which windows were there is unknown")
+coldGuess.settle()
+_ = edgeToggle(coldGuessController)
+expect(coldGuessController.savedWindow(for: "edge-1") != 1 && coldGuess.windows[1]!.bounds == [200, 200, 900, 600],
+       "…so of your window and Hammer's, neither is guessed at: yours is left alone \(coldGuess.log)")
+
 // It's looked for once: if that look finds nothing, it's forgotten even when opening a new one fails.
 let onceEdge = FakeEdge()
 onceEdge.isRunning = true

@@ -110,6 +110,7 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
     private var popOutGeneration = 0                     // each pop-out's own; an older one's time limit can't end a newer one
     private var idleGeneration = 0
     private var stayPutUntil = Date.distantPast         // just paused it: a late "playing" from the page doesn't pop it out
+    private var unseenCheckPending = false               // a look, once that moment's up, at whether it's still playing unseen
     private let sizeKey = "playerDropdownSize"
     /// The dropdown's size as you last left it.
     private var dropdownSize: CGSize {
@@ -468,15 +469,23 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
     /// Playing with no window (you closed the dropdown before the video began): into the mini
     /// player. Just after Hammer paused it, the pause gets a moment first; if it's still
     /// playing then (the page only reports changes), it goes to the mini player all the same.
+    /// If another pause holds it back meanwhile, it looks again when that one's moment is up.
     private func popOutIfPlayingUnseen() {
         let wait = stayPutUntil.timeIntervalSinceNow
         guard wait > 0 else { popOut(); return }
+        guard !unseenCheckPending else { return }            // one look at a time
+        unseenCheckPending = true
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64((wait + 0.1) * 1_000_000_000))
-            guard let self, self.place == .hidden, self.playing, Date() > self.stayPutUntil else { return }
-            self.popOut()
+            guard let self else { return }
+            self.unseenCheckPending = false
+            guard self.place == .hidden, self.playing else { return }
+            self.popOutIfPlayingUnseen()                     // pops out, or waits out a longer hold
         }
     }
+
+    /// Holds back popping out for a moment, as a pause does (for the self-test).
+    func holdPopOut(for seconds: TimeInterval) { stayPutUntil = Date().addingTimeInterval(seconds) }
 
     // MARK: Pages: YouTube stays in the player, everything else opens in your browser
 
@@ -970,12 +979,15 @@ final class MiniOverlay: NSView {
         case 49 where plain: onToggle?()                     // Space
         case 123 where plain: if !ad { onSeek?(-10) }        // ←
         case 124 where plain: if !ad { onSeek?(10) }         // →
-        default: super.keyDown(with: event)
+        default: break                                       // other keys: nothing (and no beep)
         }
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard !dragging, let down = downEvent else { return }
+        // A hand that moves 3 points or less is still clicking.
+        let dx = event.locationInWindow.x - down.locationInWindow.x, dy = event.locationInWindow.y - down.locationInWindow.y
+        guard dx * dx + dy * dy > 9 else { return }
         dragging = true
         window?.performDrag(with: down)
     }
@@ -1211,6 +1223,19 @@ final class PlayerCheck: NSObject, NSApplicationDelegate {
             player.pageReported(["playing": true, "hasVideo": true, "ad": false, "title": "Me at the zoo - YouTube"])
             let popped = await wait(5) { self.player.place == .mini }
             expect(popped, "it starts with no window: it comes up in the mini player (the page's report given here)")
+        }
+
+        // Still playing unseen after a pause (it didn't take), and a second pause holds it back
+        // longer before the first moment is up: it still ends up in the mini player.
+        if player.place == .mini {
+            player.closeMini()                                    // pauses; holds popping out for a moment
+            try? await Task.sleep(nanoseconds: 500_000_000)       // (the page says it paused)
+            player.pageReported(["playing": true, "hasVideo": true, "ad": false, "title": "Me at the zoo - YouTube"])
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            player.holdPopOut(for: 2)                             // a second pause, before the first moment is up
+            let early = player.place
+            let later = await wait(6) { self.player.place == .mini }
+            expect(early == .hidden && later, "a pause that doesn't take, held back twice: still into the mini player (\(early))")
         }
 
         // In the mini player: Space plays and pauses, Esc closes it (and pauses).
