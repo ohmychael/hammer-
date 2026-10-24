@@ -1,0 +1,6 @@
+#!/bin/bash
+# Stand-in for pkill (only ever "pkill [-9] -x Hammer" here): stops the "running" Hammer.
+source "$(dirname "$0")/_log"
+[ -f "$FAKE/running" ] || exit 1
+log "pkill $* (stopped $(cat "$FAKE/running"))"
+rm -f "$FAKE/running"

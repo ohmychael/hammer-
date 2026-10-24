@@ -1,0 +1,21 @@
+#!/bin/bash
+# Stand-in for mv. FAKE_MV_FAIL_STAGE=1: moving the new app into place fails (disk full).
+# FAKE_OPEN_DURING_SWAP=1: the login item opens Hammer just as the old app is moved aside.
+# FAKE_TERM_AGAIN=1: a second SIGTERM arrives while the old app is being put back.
+# FAKE_MV_FAIL_DISCARD=1: the app in ~/Applications can't be moved out of the way.
+source "$(dirname "$0")/_log"
+if [ "${FAKE_MV_FAIL_STAGE:-0}" = 1 ] && [[ "$1" == */build/Hammer.app ]]; then
+  echo "mv: rename $1: No space left on device" >&2; log "mv FAILED (stage)"; exit 1
+fi
+if [ "${FAKE_OPEN_DURING_SWAP:-0}" = 1 ] && [ "$1" = "$HOME/Applications/Hammer.app" ]; then
+  log "login item opens Hammer mid-swap"; open "$1" --args --login
+fi
+if [ "${FAKE_MV_FAIL_DISCARD:-0}" = 1 ] && [ "$1" = "$HOME/Applications/Hammer.app" ] && [[ "$2" == */.trash.* ]]; then
+  echo "mv: rename $1: Permission denied" >&2; log "mv FAILED (moving Hammer.app away)"; exit 1
+fi
+if [ "${FAKE_TERM_AGAIN:-0}" = 1 ] && [[ "$1" == */Hammer-previous.app ]] && [ "$2" = "$HOME/Applications/Hammer.app" ]; then
+  trap '' TERM
+  log "SIGTERM again, while the old app is put back"
+  kill -TERM -- "-$(ps -o pgid= -p $$ | tr -d ' ')"
+fi
+for real in /bin/mv /usr/bin/mv; do [ -x "$real" ] && exec "$real" "$@"; done

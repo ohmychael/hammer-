@@ -1,0 +1,11 @@
+#!/bin/bash
+# Stand-in for /usr/bin/git: notes each call in $FAKE/git-calls, then runs the real git.
+# FAKE_NO_CLT=1: like a Mac without the developer tools, where /usr/bin/git asks to
+# install them (a dialog) and fails.
+echo "git $*" >> "$FAKE/git-calls"
+if [ "${FAKE_NO_CLT:-0}" = 1 ]; then
+  echo "xcode-select: note: No developer tools were found, requesting install." >&2
+  exit 1
+fi
+for real in /usr/bin/git /bin/git /usr/local/bin/git /opt/homebrew/bin/git; do [ -x "$real" ] && exec "$real" "$@"; done
+echo "git: not found" >&2; exit 127

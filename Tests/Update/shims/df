@@ -1,0 +1,4 @@
+#!/bin/bash
+# Stand-in for df -Pk: $FAKE/free-kb or FAKE_FREE_KB is how much space is free (default: plenty).
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "/dev/fake 500000000 1000 $(cat "$FAKE/free-kb" 2>/dev/null || echo "${FAKE_FREE_KB:-50000000}") 1% /"

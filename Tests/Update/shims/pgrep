@@ -1,0 +1,3 @@
+#!/bin/bash
+# Stand-in for pgrep: is Hammer "running"?
+[ -f "$FAKE/running" ]

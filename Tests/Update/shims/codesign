@@ -1,0 +1,13 @@
+#!/bin/bash
+# Stand-in for codesign. FAKE_CODESIGN_SLEEP=n: it hangs for n seconds (and then fails).
+# FAKE_CODESIGN_TERM=1: a logout (SIGTERM to the whole update) arrives while signing.
+case " $* " in *" --verify "*) exit 0;; esac
+if [ "${FAKE_CODESIGN_TERM:-0}" = 1 ] && [[ " $* " == *" --keychain "* ]] && [ ! -e "$FAKE/killed" ]; then
+  : > "$FAKE/killed"
+  echo "codesign: SIGTERM to the update (logout)" >> "$FAKE_LOG"
+  kill -TERM -- "-$(ps -o pgid= -p $$ | tr -d ' ')"
+  exec perl -e 'select(undef, undef, undef, 2)'
+fi
+[ -n "${FAKE_CODESIGN_SLEEP:-}" ] && exec perl -e "select(undef, undef, undef, $FAKE_CODESIGN_SLEEP)"   # hangs
+[ -d "${@: -1}" ] || { echo "codesign: ${@: -1}: No such file or directory" >&2; exit 1; }
+mkdir -p "${@: -1}/Contents/_CodeSignature"

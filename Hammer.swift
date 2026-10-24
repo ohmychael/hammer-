@@ -8,9 +8,8 @@
 // Install (builds it and keeps it updated from GitHub):
 //   curl -fsSL https://raw.githubusercontent.com/ohmychael/hammer-/main/install-hammer.sh | bash
 //
-// Build by hand:  swiftc -parse-as-library -O Hammer.swift HammerCore.swift Monitor.swift MonitorMac.swift \
-//                    Player.swift PlayerMac.swift Deliveries.swift DeliveryAlerts.swift -o Hammer
-//                 (the app also needs PlayerScript.js in its Resources: build.sh does this)
+// Build by hand:  bash build.sh  (runs the tests, compiles for the macOS this Mac runs, with
+//                 -swift-version 5 and -target, and installs ~/Applications/Hammer.app)
 // Tests:          swiftc HammerCore.swift Monitor.swift Player.swift Deliveries.swift Tests/main.swift -o hammer-tests && ./hammer-tests
 // Run:    ./Hammer                        menu bar app (hammer icon)
 //         If the icon is hidden behind the notch, open Hammer from Apps or
@@ -1026,6 +1025,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               let text = try? String(contentsOf: url, encoding: .utf8) else { return "dev" }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }()
+    /// "abc1234 · Oct 22": the version and the day it was made (VERSION-DATE, from build.sh).
+    static let versionText: String = {
+        guard let url = Bundle.main.url(forResource: "VERSION-DATE", withExtension: nil),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return version }
+        let parser = DateFormatter()
+        parser.locale = Locale(identifier: "en_US_POSIX")
+        parser.dateFormat = "yyyy-MM-dd"
+        guard let day = parser.date(from: text.trimmingCharacters(in: .whitespacesAndNewlines)) else { return version }
+        let formatter = DateFormatter()
+        let thisYear = Calendar.current.isDate(day, equalTo: Date(), toGranularity: .year)
+        formatter.setLocalizedDateFormatFromTemplate(thisYear ? "MMMd" : "yMMMd")
+        return version + " · " + formatter.string(from: day)
+    }()
     private var colorTargetID: String?
     private var hotKeyRef: EventHotKeyRef?
     private var playerHotKeyRef: EventHotKeyRef?
@@ -1094,6 +1106,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showMenuAtMouse()
         return false
+    }
+
+    /// Hammer was opened by you (Finder, Spotlight, `open`), not at login, by an update
+    /// (both pass --login) or for a tour: then its menu pops up at the pointer, so you
+    /// see it even when the menu bar icon is hidden.
+    static var openedByYou = false
+
+    private var iconHidden = false                   // the menu bar icon isn't showing
+    private var iconHiddenChecks = 0
+    private var iconTimer: Timer?
+
+    /// Every 10 seconds: is the menu bar icon actually on screen? macOS hides it when
+    /// the menu bar is too full (behind the camera notch) and, from macOS 26, when it's
+    /// turned off in Menu Bar settings. Not while the menu bar itself can be hidden
+    /// (full screen, or set to hide automatically) or the screen is off or locked.
+    private func watchIcon() {
+        let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkIcon() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        iconTimer = timer
+    }
+
+    private func checkIcon() {
+        guard NSMenu.menuBarVisible(), !UserDefaults.standard.bool(forKey: "_HIHideMenuBar"),
+              CGDisplayIsAsleep(CGMainDisplayID()) == 0,
+              (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool != true,
+              let window = statusItem.button?.window else { return }
+        iconHiddenChecks = window.occlusionState.contains(.visible) ? 0 : iconHiddenChecks + 1
+        let hidden = iconHiddenChecks >= 2
+        if hidden != iconHidden {
+            iconHidden = hidden
+            rebuildMenuSoon()
+        }
+    }
+
+    /// Opened by clicking the icon: then it plainly isn't hidden.
+    private func menuOpening(_ menu: NSMenu) {
+        guard let window = statusItem.button?.window, NSApp.currentEvent?.window === window else { return }
+        iconHiddenChecks = 0
+        iconHidden = false
+        menu.items.first { $0.action == #selector(explainHiddenIcon) }?.isHidden = true
+    }
+
+    @objc private func explainHiddenIcon() {
+        if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+        let alert = NSAlert()
+        alert.messageText = "Hammer's menu bar icon is hidden"
+        let meanwhile = "\n\nUntil then, press Control-Option-H, or open Hammer from Spotlight."
+        if #available(macOS 26, *) {
+            alert.informativeText = "In System Settings → Menu Bar, turn on Hammer under Allow in the Menu Bar. "
+                + "If it's on already, the menu bar is too full: quit an app with a menu bar icon to make room."
+                + meanwhile
+            alert.addButton(withTitle: "Open Menu Bar Settings")
+            alert.addButton(withTitle: "Cancel")
+        } else {
+            alert.informativeText = "The menu bar is too full, so macOS hides some icons (behind the camera, "
+                + "on a MacBook). Quit an app with a menu bar icon to make room." + meanwhile
+        }
+        guard alert.runModal() == .alertFirstButtonReturn, #available(macOS 26, *),
+              let url = URL(string: "x-apple.systempreferences:com.apple.ControlCenter-Settings.extension") else { return }
+        if !NSWorkspace.shared.open(url) {
+            NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/System Settings.app"))
+        }
     }
 
     func showMenuAtMouse() {
@@ -1534,9 +1610,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addYouTube(to: menu)
 
         menu.addItem(.separator())
-        menu.addItem(hint("Open this menu anywhere: Control-Option-H"))
-        menu.addItem(action("Check for Updates", #selector(checkForUpdates)))
-        menu.addItem(hint("Version \(Self.version) · updates automatically"))
+        addUpdates(to: menu)
         menu.addItem(NSMenuItem(title: "Quit Hammer", action: #selector(NSApplication.terminate(_:)),
                                 keyEquivalent: "q"))
         menu.delegate = self
@@ -1547,6 +1621,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// was busy with your phone shows up without a manual rescan.
     func menuWillOpen(_ menu: NSMenu) {
         menuIsOpen = true
+        menuOpening(menu)
         GoveeBluetooth.shared.rescan()
         // Catches changes made with the monitor's own buttons, and a monitor that
         // starts answering (e.g. DDC/CI switched on). Asking a silent one is slow,
@@ -1566,17 +1641,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var menuNeedsRebuild = false
     private var updateTimer: Timer?
 
-    /// Asks the background updater to look for a new version every 2 minutes.
-    /// It's quiet unless it installs something, then shows "Hammer updated".
+    /// Asks the background updater to look for a new version every 2 minutes (it's
+    /// quiet unless it installs something), and shows what it last did (UpdatesMac.swift).
+    /// Also, at launch: tells build.sh Hammer started, marks dialogs as busy, pops the
+    /// menu up if you opened Hammer, and keeps an eye on the menu bar icon.
     private func scheduleUpdateChecks() {
+        Updates.shared.onChange = { [weak self] in self?.rebuildMenuSoon() }
+        Updates.shared.start()
         let timer = Timer(timeInterval: 120, repeats: true) { _ in
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            task.arguments = ["kickstart", "gui/\(getuid())/local.hammer.updater"]
-            try? task.run()
+            MainActor.assumeIsolated { Updates.shared.kick() }
         }
         RunLoop.main.add(timer, forMode: .common)
         updateTimer = timer
+        Busy.watchDialogs()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { Updates.markLaunched(version: Self.version) }
+        if Self.openedByYou {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.showMenuAtMouse() }
+        }
+        watchIcon()
     }
 
     /// Rebuilds now, or once the menu closes if it's open (so it doesn't change under the pointer).
@@ -2804,17 +2886,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.runModal()
             return
         }
-        // Tell the updater this check was asked for, so it reports "up to date" too.
-        FileManager.default.createFile(atPath: home.appendingPathComponent("Hammer/.manual-check").path,
-                                       contents: nil)
+        if Updates.shared.off != nil {
+            Updates.shared.turnOn { Updates.shared.checkNow() }
+        } else {
+            Updates.shared.checkNow()
+        }
+    }
 
-        let job = "gui/\(getuid())/local.hammer.updater"
-        let plist = home.appendingPathComponent("Library/LaunchAgents/local.hammer.updater.plist").path
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/sh")
-        // Start the job; if it isn't loaded yet, load it first (loading also starts it).
-        task.arguments = ["-c", "launchctl kickstart '\(job)' || launchctl bootstrap 'gui/\(getuid())' '\(plist)'"]
-        try? task.run()
+    /// "Updates are off · Turn On…" (or opening at login): a login item was switched off.
+    @objc private func turnOnLoginItems() { Updates.shared.turnOn() }
+
+    /// The end of the menu: how to open it, updates, and the version.
+    private func addUpdates(to menu: NSMenu) {
+        if iconHidden { menu.addItem(action("Menu Bar Icon Is Hidden…", #selector(explainHiddenIcon))) }
+        // No hot key reference means Control-Option-H didn't register (another app has it).
+        menu.addItem(hint(hotKeyRef == nil ? "Another app has Control-Option-H, so open Hammer from Spotlight."
+                                           : "Open this menu anywhere: Control-Option-H"))
+        let updates = Updates.shared
+        if let off = updates.off { menu.addItem(action(off + " · Turn On…", #selector(turnOnLoginItems))) }
+        menu.addItem(action("Check for Updates", #selector(checkForUpdates)))
+        if let line = updates.menuLine { menu.addItem(hint(line)) }
+        menu.addItem(hint("Version " + Self.versionText))
     }
 }
 
@@ -2843,9 +2935,18 @@ enum Hammer {
                 AppDelegate.tour = (URL(fileURLWithPath: args[1]), demo)
                 if demo { AppDelegate.writeTourDeliveries() }
             case "govee": exit(runGoveeCommand(Array(args.dropFirst())))
-            default: break
+            case "make-icon":
+                guard args.count >= 2 else { print("usage: Hammer make-icon <folder>"); exit(2) }
+                exit(AppIcon.write(to: URL(fileURLWithPath: args[1])) ? 0 : 1)
+            case "help", "--help", "-h":
+                print(usage)
+                exit(0)
+            default:
+                // Only the menu bar app itself starts from here (no arguments, or --login).
+                guard Launch.startsMenuBarApp(args) else { print(usage); exit(2) }
             }
         }
+        AppDelegate.openedByYou = AppDelegate.tour == nil && !Launch.atLogin(args)
 
         let app = NSApplication.shared
         let delegate = AppDelegate()
@@ -2853,6 +2954,14 @@ enum Hammer {
         app.setActivationPolicy(.accessory)     // menu bar only, no Dock icon
         withExtendedLifetime(delegate) { app.run() }
     }
+
+    static let usage = """
+        usage: Hammer                          the menu bar app
+               Hammer get <brightness|contrast|volume|hex code>
+               Hammer set <brightness|contrast|volume|hex code> <value>
+               Hammer monitor check
+               Hammer govee list | on | off | brightness <1-100> | key <API key>
+        """
 
     static func runMonitorCommand(_ args: [String]) -> Int32 {
         guard args.count >= 2, let code = DDCCode.parse(args[1]) else {

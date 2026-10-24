@@ -1,0 +1,5 @@
+#!/bin/bash
+# Stand-in for PlistBuddy -c 'Print :CFBundleIdentifier' <plist>
+f="${@: -1}"
+[ -f "$f" ] || { echo "File Doesn't Exist" >&2; exit 1; }
+grep -o '<key>CFBundleIdentifier</key><string>[^<]*' "$f" | sed 's/.*<string>//'

@@ -1,0 +1,3 @@
+#!/bin/bash
+# Stand-in for vtool -show-build: FAKE_MINOS is the macOS the build says it needs.
+printf 'Load command 9\n      cmd LC_BUILD_VERSION\n platform MACOS\n    minos %s\n      sdk 26.0\n' "${FAKE_MINOS:-27.0}"

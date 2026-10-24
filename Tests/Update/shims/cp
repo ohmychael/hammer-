@@ -1,0 +1,6 @@
+#!/bin/bash
+# Stand-in for cp. FAKE_CP_FAIL_CLI=1: copying the Terminal binary ~/Hammer/Hammer fails.
+if [ "${FAKE_CP_FAIL_CLI:-0}" = 1 ] && { [ "${@: -1}" = "$HOME/Hammer/Hammer" ] || [ "${@: -1}" = "$HOME/Hammer/.Hammer.new" ]; }; then
+  echo "cp: ${@: -1}: No space left on device" >&2; exit 1
+fi
+for real in /bin/cp /usr/bin/cp; do [ -x "$real" ] && exec "$real" "$@"; done

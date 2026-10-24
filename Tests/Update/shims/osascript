@@ -1,0 +1,5 @@
+#!/bin/bash
+# Stand-in for osascript. Nothing should call it any more (Hammer posts the notifications).
+source "$(dirname "$0")/_log"
+log "osascript $*"
+echo "$*" >> "$FAKE_OSASCRIPT"
