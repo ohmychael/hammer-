@@ -109,6 +109,15 @@ enum GmailKeychain {
 
     static func deleteScriptURL() { tool.delete(service: service, account: scriptURLAccount) }
 
+    /// The script's address and key, saved together: if the key can't be saved, the
+    /// address is put back as it was, so the setup in use keeps working.
+    @discardableResult
+    static func saveScript(key: String, url: URL) -> Bool {
+        guard DeliveryScript.isKey(key) else { return false }
+        return tool.saveAll(service: service, [(scriptURLAccount, "Hammer-Gmail-script-URL", url.absoluteString),
+                                               (scriptAccount, "Hammer-Gmail-script", key)])
+    }
+
     @discardableResult
     static func save(email: String, password: String) -> Bool {
         guard DeliverySetup.isPlainEmail(email), DeliverySetup.cleanPassword(password) == password else { return false }
@@ -255,6 +264,10 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         get { DeliveryList.current(load([Delivery].self, "recentDeliveries") ?? []) }
         set { save(DeliveryList.current(newValue), "recentDeliveries") }
     }
+    /// Whether Hammer has shown any delivery since it was set up (for "No deliveries yet").
+    var hasSeenDeliveries: Bool {
+        UserDefaults.standard.bool(forKey: "deliverySeenAny") || !(load([Delivery].self, "recentDeliveries") ?? []).isEmpty
+    }
     /// Whether "Out for delivery" emails show a notification too (on unless turned off).
     var outForDeliveryAlerts: Bool {
         get { UserDefaults.standard.object(forKey: "deliveryOutForDelivery") == nil
@@ -307,7 +320,7 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
             case .success(let reply):
                 let account = reply.account ?? ""
                 let same = !account.isEmpty && account.lowercased() == previous.email.lowercased()
-                if GmailKeychain.saveScriptKey(key) && GmailKeychain.saveScriptURL(scriptURL) {
+                if GmailKeychain.saveScript(key: key, url: scriptURL) {
                     if previous.source == .appPassword, !previous.email.isEmpty { GmailKeychain.delete(email: previous.email) }
                     var start = ScriptState()
                     if same && lookBack != nil {                       // set up again: catch up on what was missed
@@ -321,10 +334,11 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
                                            advice: "Make sure your login Keychain is unlocked, then try again.")
                 }
             }
+            let finished = outcome, problem = failure
             DispatchQueue.main.async {
                 self.settingUp(false)
-                guard let outcome else {
-                    done(failure)
+                guard let outcome = finished else {
+                    done(problem)
                     return
                 }
                 self.source = .script
@@ -343,16 +357,15 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
     func turnOn(email: String, password: String, done: @escaping (CheckFailure?) -> Void) {
         let previous = (source: source, email: self.email ?? "")
         let sameAccount = previous.email.lowercased() == email.lowercased()
-        var start = DeliveryState()
-        var lookBack: Date?
+        var catchUp = DeliveryState()
         if sameAccount {                     // set up again: catch up on what arrived since the last good check
-            lookBack = lastSuccess
-            start.announced = Array((state.announced + recent.compactMap(\.messageID)).suffix(200))
+            catchUp.announced = Array((state.announced + recent.compactMap(\.messageID)).suffix(200))
             if previous.source == .appPassword {
-                start.uidValidity = state.uidValidity
-                start.lastUID = state.lastUID
+                catchUp.uidValidity = state.uidValidity
+                catchUp.lastUID = state.lastUID
             }
         }
+        let start = catchUp, lookBack = sameAccount ? lastSuccess : nil
         settingUp(true)
         queue.async {
             let result = DeliveryCheck.run(state: start, email: email, password: password, lookBack: lookBack,
@@ -377,10 +390,11 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
                                            advice: "Make sure your login Keychain is unlocked, then try again.")
                 }
             }
+            let finished = outcome, problem = failure
             DispatchQueue.main.async {
                 self.settingUp(false)
-                guard let outcome else {
-                    done(failure)
+                guard let outcome = finished else {
+                    done(problem)
                     return
                 }
                 self.source = .appPassword
@@ -404,7 +418,10 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
     private func started(secret: String, keepRecent: Bool) {
         generation += 1
         self.secret = secret
-        if !keepRecent { recent = [] }
+        if !keepRecent {
+            recent = []
+            UserDefaults.standard.removeObject(forKey: "deliverySeenAny")
+        }
         failure = nil
         needsSetup = false
         offlineStreak = 0
@@ -431,7 +448,8 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         needsSetup = false
         offlineStreak = 0
         lastChecked = nil
-        for key in ["deliveryState", "deliveryScriptState", "recentDeliveries", "deliveryLastSuccess", Self.oldScriptURLSetting] {
+        for key in ["deliveryState", "deliveryScriptState", "recentDeliveries", "deliveryLastSuccess", "deliverySeenAny",
+                    Self.oldScriptURLSetting] {
             UserDefaults.standard.removeObject(forKey: key)
         }
         queue.async {
@@ -480,7 +498,7 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
                                                  advice: "Set up Gmail again.", needsSetup: true, stopChecking: true))
                 }
             }
-            if let url = cached.url, let key { return .success((key, url, false)) }
+            if let url = cached.url, let key, oldSetting == nil { return .success((key, url, false)) }
             let stored = GmailKeychain.scriptURL()
             let found = DeliveryMigration.scriptAddress(keychain: stored, setting: oldSetting) { GmailKeychain.saveScriptURL($0) }
             guard let url = found.url, let key else {
@@ -590,10 +608,15 @@ final class DeliveryWatcher: NSObject, UNUserNotificationCenterDelegate {
         let known = Set(memory.announced)
         memory.announced = Array((memory.announced + deliveries.compactMap(\.messageID).filter { !known.contains($0) }).suffix(200))
         state = memory
-        let shown = deliveries.filter { $0.kind != .outForDelivery || outForDeliveryAlerts }
-        guard !shown.isEmpty else { return }
-        for delivery in shown { post(delivery) }
-        recent = DeliveryList.adding(shown, to: recent)
+        var list = recent
+        for var delivery in deliveries where delivery.kind != .outForDelivery || outForDeliveryAlerts {
+            // A "Delivered" shows in place of its package's "Out for delivery".
+            delivery.replaces = DeliveryList.replaced(by: delivery, in: list)?.notificationID
+            post(delivery)
+            list = DeliveryList.adding([delivery], to: list)
+            UserDefaults.standard.set(true, forKey: "deliverySeenAny")
+        }
+        if list != recent { recent = list }
     }
 
     private static func askScript(_ base: URL, key: String, after: Date?) -> Result<ScriptCheck.Reply, CheckFailure> {

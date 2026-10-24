@@ -1495,7 +1495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let recent = watcher.recent.prefix(3)
         if recent.isEmpty {
-            menu.addItem(hint("No deliveries in the last 7 days."))
+            menu.addItem(hint(watcher.hasSeenDeliveries ? "No deliveries in the last 7 days." : "No deliveries yet."))
         }
         for delivery in recent {
             let item = NSMenuItem(title: deliveryTitle(delivery), action: #selector(openDelivery(_:)), keyEquivalent: "")

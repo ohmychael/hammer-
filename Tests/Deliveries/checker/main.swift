@@ -18,7 +18,8 @@ var box: [String: Any] = ["password": "abcdefghijklmnop", "uidvalidity": 7, "mes
 func addMail(_ subject: String, from: String = "\"eBay\" <ebay@ebay.com>", id: String? = nil, authentication: String? = nil) {
     var messages = box["messages"] as! [[String: Any]]
     let uid = (messages.compactMap { $0["uid"] as? Int }.max() ?? 500) + 1
-    let checked = authentication.map { "Authentication-Results: \($0)\r\n" } ?? ""
+    let verdict = authentication ?? "mx.google.com; dkim=pass header.i=@\(DeliveryMail.domain(of: from))"   // Gmail's, on top
+    let checked = "Authentication-Results: \(verdict)\r\n"
     let headers = checked + "From: \(from)\r\nTo: you@gmail.com\r\nSubject: \(subject)\r\nDate: Sat, 17 Oct 2026 14:00:00 +0000\r\nMessage-ID: <\(id ?? "m\(uid)")@mail>\r\nContent-Type: text/plain\r\n"
     messages.append(["uid": uid, "headers": headers])
     box["messages"] = messages
@@ -62,7 +63,7 @@ case .success(let result):
                     "Delivered · Amazon | Anker 735 Charger +1 more",
                     "Out for delivery · Amazon | Cable",
                     "Delivery problem · UPS | Delivery Attempted",
-                    "Delivered · ups.com | UPS Update: Package Delivered"], "the right ones, in order: \(shown)")
+                    "Delivered · Unverified sender | UPS Update: Package Delivered"], "the right ones, in order: \(shown)")
     check(result.deliveries.first?.gmailID == String(1_000_532, radix: 16), "with Gmail's ID for each email")
     check(result.state.lastUID == 537, "moved past all new mail")
     state = result.state

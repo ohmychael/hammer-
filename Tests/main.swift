@@ -1895,6 +1895,155 @@ expect(nameCases == 128 && nameWrong.isEmpty, "product names never decide (\(nam
 expect(DeliveryMail.item(in: #"Delivered: "Box Was Delivered Poster" and 1 more item"#) == "Box Was Delivered Poster +1 more",
        "and the name still shows")
 
+// 107 more subjects a second reviewer collected, from stores and carriers in the US,
+// UK, Canada and Australia, with the look-alikes around them.
+let rAmazon = "Amazon.com <shipment-tracking@amazon.com>", rEbay = "eBay <ebay@ebay.com>", rUps = "UPS <mcinfo@ups.com>"
+let rUsps = "USPS <USPSInformeddelivery@email.informeddelivery.usps.com>", rFedex = "FedEx <TrackingUpdates@fedex.com>"
+let rDhl = "DHL <noreply@dhl.com>", rRoyal = "Royal Mail <no-reply@royalmail.com>", rEvri = "Evri <noreply@evri.com>"
+let rDpd = "DPD <notifications@dpd.co.uk>", rAuspost = "Australia Post <noreply@notifications.auspost.com.au>"
+let rShop = "Shop <no-reply@shop.app>", rApple = "Apple <noreply@email.apple.com>", rWalmart = "Walmart <help@walmart.com>"
+let rTarget = "Target <orders@oe1.target.com>", rIkea = "IKEA <noreply@order.ikea.com>", rAllbirds = "Allbirds <hello@allbirds.com>"
+let rDoordash = "DoorDash <no-reply@doordash.com>", rHello = "HelloFresh <hello@hellofresh.com>", rCanpost = "Canada Post <noreply@canadapost.ca>"
+let rAli = "AliExpress <transaction@notice.aliexpress.com>", rFlowers = "1-800-Flowers <orders@1800flowers.com>"
+let rFriend = "Pat <pat@gmail.com>", rWayfair = "Wayfair <shipping@wayfair.com>", rZara = "ZARA <noreply@zara.com>"
+
+let freshSubjects: [(subject: String, from: String, verdict: Delivery.Kind?)] = [
+    // delivered
+    (#"Delivered: "Fire TV Stick 4K Max streaming..." and 2 more items"#, rAmazon, .delivered),
+    ("Your Amazon Fresh order has been delivered", rAmazon, .delivered),
+    ("ORDER DELIVERED: Logitech MX Master 3S Wireless Mouse", rEbay, .delivered),
+    ("📦 Your package was delivered: Nintendo Switch OLED", rEbay, .delivered),
+    ("UPS Update: Your Package Has Been Delivered", rUps, .delivered),
+    ("UPS Delivery Notification, Tracking Number 1Z999AA10123456784", rUps, .delivered),
+    ("USPS® Item Delivered, Left with Individual 9400111899223344556677", rUsps, .delivered),
+    ("Delivered: Your FedEx shipment 771234567890", rFedex, .delivered),
+    ("Your shipment 1234567890 has been delivered", rDhl, .delivered),
+    ("Your Royal Mail parcel has been delivered", rRoyal, .delivered),
+    ("Your parcel from ASOS has been delivered", rEvri, .delivered),
+    ("Your DPD parcel has been delivered", rDpd, .delivered),
+    ("Your parcel has been delivered", rAuspost, .delivered),
+    ("Your item was delivered", rCanpost, .delivered),
+    ("A shipment from order #1045 has been delivered", rAllbirds, .delivered),
+    ("Your Allbirds order was delivered", rShop, .delivered),
+    ("Your order has been delivered.", rApple, .delivered),
+    ("Your Walmart order was delivered", rWalmart, .delivered),
+    ("Your Target order is delivered!", rTarget, .delivered),
+    ("Your IKEA order has been delivered", rIkea, .delivered),
+    ("Your Wayfair order has been delivered!", rWayfair, .delivered),
+    ("Your ZARA order has been delivered", rZara, .delivered),
+    ("Order 8187654321098765: package delivered", rAli, .delivered),
+    ("Your HelloFresh box has been delivered", rHello, .delivered),
+    ("Package delivered to your parcel locker", rDpd, .delivered),
+    ("We've delivered your parcel", rRoyal, .delivered),
+    ("Good news! Your package has been delivered", rFedex, .delivered),
+    ("Your package was delivered — see the photo", rAmazon, .delivered),
+    ("Your package has been delivered to a pickup point", rDpd, .delivered),
+    ("Delivered today: your order from Etsy", "Etsy <transaction@etsy.com>", .delivered),
+    // not delivered / other
+    ("Your package will be delivered today", rAmazon, nil),
+    ("Your order is out for delivery", rWalmart, .outForDelivery),
+    ("Out for Delivery: Your Walmart order", rWalmart, .outForDelivery),
+    ("Your package is out for delivery and will arrive by 8 PM", rFedex, .outForDelivery),
+    ("Your order will be out for delivery tomorrow", rTarget, nil),
+    ("Delivery update: your package is running late", rAmazon, nil),
+    ("Your delivery is scheduled for Tuesday", rUps, nil),
+    ("How was your delivery?", rAmazon, nil),
+    ("Rate your delivery experience with DoorDash", rDoordash, nil),
+    ("Your package is delayed", rUps, nil),
+    ("Track your package: 1Z999AA10123456784", rUps, nil),
+    ("Get free delivery on orders over $35", rWalmart, nil),
+    ("Your order has been dispatched", rZara, nil),
+    ("Your parcel has been collected by our courier", rEvri, nil),
+    ("Your return has been received", rAmazon, nil),
+    ("Your Instacart order is being delivered by Maria", "Instacart <orders@instacart.com>", nil),
+    ("Your DoorDash order is on its way", rDoordash, nil),
+    ("Delivery date changed for your order", rTarget, nil),
+    ("Your package was delayed and will be delivered tomorrow", rFedex, nil),
+    ("Delivered: Q3 board deck (final)", rFriend, nil),
+    ("Your flowers have been delivered!", rFlowers, nil),
+    ("Your order was cancelled and will not be delivered", rWalmart, nil),
+    ("Package available for pickup at your Post Office", rUsps, nil),
+    ("Your order has been delivered to the courier", rAli, nil),
+    ("Your order has arrived at the delivery station", rAmazon, nil),
+    ("Your package is at the local delivery facility", rUps, nil),
+    ("Delivered to you: our autumn catalogue", rWayfair, nil),
+    ("Your Prime delivery day is here: deals delivered", rAmazon, nil),
+    ("Smart lockers: never miss a delivery again", rUps, nil),
+    ("Your package delivery was rescheduled", rAmazon, nil),
+    // problems
+    ("We tried to deliver your package", rFedex, .problem),
+    ("Your package could not be delivered today — we'll try again tomorrow", rUps, .problem),
+    ("Action required: delivery attempt failed", rDhl, .problem),
+    ("We missed you! Your parcel couldn't be delivered", rRoyal, .problem),
+    ("Delivery Exception: Package Delayed", rFedex, .problem),
+    ("Missed delivery – reschedule now", rEvri, .problem),
+    ("Your package is being returned to the sender", rUsps, .problem),
+
+    ("FedEx: We couldn't deliver your package", rFedex, .problem),
+    ("UPS Update: We Were Unable to Deliver Your Package", rUps, .problem),
+    ("Delivery failed: we'll try again tomorrow", rUps, .problem),
+    ("Delivery attempt unsuccessful", rDpd, .problem),
+    ("Delivery complete: your Uber Eats order", "Uber Eats <uber@uber.com>", .delivered),
+    ("Your Evri parcel is delivered", rEvri, .delivered),
+    ("Delivered - Your order #W123456789", rWayfair, .delivered),
+    ("Your parcel was delivered to your safe place", rRoyal, .delivered),
+    ("Not home? Your package was delivered to a safe place", rAmazon, .delivered),
+    ("Don't worry, your package has been delivered", rFedex, .delivered),
+    ("Your order has arrived!", "Glossier <hello@glossier.com>", .delivered),
+    ("Shipment delivered", rFedex, .delivered),
+    ("Your Order From Best Buy Has Been Delivered", "Best Buy <BestBuyInfo@emailinfo.bestbuy.com>", .delivered),
+    ("Your order was delivered (Order #12345)", "Store <orders@store.example>", .delivered),
+    ("Part of your order has been delivered", rAmazon, .delivered),
+    ("Your Etsy Purchase from WoodCraftCo Has Been Delivered", "Etsy <transaction@etsy.com>", .delivered),
+    ("Amazon.com: Delivered: \"Kindle Paperwhite\"", rAmazon, .delivered),
+    ("Your next order, delivered", rWalmart, nil),
+    ("Your weekly groceries order, delivered free", "Ocado <hello@ocado.com>", nil),
+    ("Fresh flowers delivered to your door", rFlowers, nil),
+    ("Delivered by Friday: shop last-minute gifts", rTarget, nil),
+    ("Order delivered? Leave a review", rEbay, nil),
+    ("Your order has been delivered to our store and is ready for pickup", rTarget, nil),
+    ("Item delivered - not as described? Open a case", rEbay, nil),
+    ("Delivery driver feedback: how did we do?", rAmazon, nil),
+    ("Your order is expected to be delivered on Friday", rAmazon, nil),
+    ("Your package is being held at the Post Office", rUsps, nil),
+    ("Reminder: your package will be returned to sender in 5 days", rUsps, .problem),
+    ("Delivered: your password reset code", "Acme <no-reply@acme.io>", nil),
+    ("Your order has been delivered to the carrier and is on its way", "Store <orders@store.example>", nil),
+    ("Your 3 packages have been delivered", rAmazon, .delivered),
+    ("Package delivered: front porch", rAmazon, .delivered),
+    ("Your item was delivered to your mailbox", rUsps, .delivered),
+    ("Your package from Amazon was delivered", "Ring <no-reply@ring.com>", .delivered),
+    ("RE: Order #555 not delivered", "Support <support@shop.example>", nil),
+    ("AW: Your package was delivered", rFriend, nil),
+    ("Your package was delivered to a neighbor", rUps, .delivered),
+    ("Your DHL Express shipment is out for delivery today", rDhl, .outForDelivery),
+    ("Today: your parcel is out for delivery", rRoyal, .outForDelivery),
+    ("Your order is out for delivery! Track your driver", "Instacart <orders@instacart.com>", .outForDelivery),
+]
+expect(freshSubjects.count == 107, "107 more subjects")
+var freshWrong: [String] = []
+for c in freshSubjects where classified(c.subject, from: c.from) != c.verdict {
+    freshWrong.append("\(c.subject) → \(classified(c.subject, from: c.from).map(\.rawValue) ?? "nil")")
+}
+expect(freshWrong.isEmpty, "the second set all get their verdict: \(freshWrong)")
+// The general rules behind some of them, in other words.
+for (subject, verdict) in [("We were unable to deliver your parcel today", Delivery.Kind.problem),
+                           ("Our driver couldn't deliver your order", .problem), ("We attempted to deliver your package", .problem),
+                           ("Delivery unsuccessful: we'll try again", .problem), ("We have delivered your order", .delivered),
+                           ("Delivery complete: your Instacart order", .delivered), ("Shop update: Delivered", nil),
+                           ("Order #A1234: Shipped", nil), ("Store update: Out for delivery", .outForDelivery),
+                           ("Your order has been canceled", nil), ("Cancellation: your order will not be delivered", nil),
+                           ("Your parcel is ready to collect at the Post Office", nil), ("Ready for pickup: your order", nil),
+                           ("Your next delivery, half price", nil), ("SV: Your package was delivered", nil),
+                           ("Antw: Your package was delivered", nil), ("Package delivered? Rate your driver", nil),
+                           ("Order delivered - wrong item? Contact us", nil), ("Mail delivery failed: returning message", nil),
+                           ("Message delivery failed for your order update", nil)] {
+    expect(classified(subject, from: "Store <orders@tinyshop.co>") == verdict,
+           "general rule: \(subject) → \(verdict.map(\.rawValue) ?? "nil")")
+}
+expect(classified("Etsy: Delivered", from: "Etsy <transaction@etsy.com>") == .delivered,
+       "'Delivered' after a label, from a known store (an unknown one also needs a package word)")
+
 // Negatives and questions: a question isn't news; "wasn't delivered" is a problem.
 for (subject, verdict) in [("Your package hasn't been delivered", Delivery.Kind.problem),
                            ("Your order was never delivered", .problem), ("Order not yet delivered", .problem),
@@ -1936,6 +2085,33 @@ for spoof in ["UPS <x@ups.attacker.top>", "x@ups.com.attacker.net", "\"Amazon.co
 }
 expect(DeliveryMail.knownShipper(from: "x@mail.amazon.co.uk") == "Amazon" && DeliveryMail.knownShipper(from: "x@amazon.com.au") == "Amazon",
        "other Amazon domains")
+// The address, never text around it: comments and quoted names are left out, and two senders are none.
+for (from, domain) in [("evil@attacker.top (<mcinfo@ups.com>)", "attacker.top"),
+                       ("\"Shipping <x@amazon.com>\" <x@evil.io>", "evil.io"),
+                       ("\"UPS\" <mcinfo@ups.com> (via attacker.top)", "ups.com"),
+                       ("UPS (\"<mcinfo@ups.com>\") <evil@attacker.top>", "attacker.top"),
+                       ("\"a \\\" <x@ups.com>\" <evil@attacker.top>", "attacker.top"),
+                       ("Amazon <x@evil.io> (x@amazon.com)", "evil.io"),
+                       ("mcinfo@ups.com", "ups.com"), ("<mcinfo@ups.com>", "ups.com"),
+                       ("\"x\" <evil@attacker.top>, <mcinfo@ups.com>", ""), ("<x@amazon.com> <x@evil.io>", ""),
+                       ("x@amazon.com@evil.io", ""), ("Group: a@ups.com, b@evil.io;", ""), ("<mcinfo@ups.com> trailing", ""),
+                       ("UPS <mcinfo@ups.com", ""), ("\"unclosed <x@ups.com>", ""), ("(unclosed <x@ups.com>", ""),
+                       ("UPS <<mcinfo@ups.com>", ""), ("attacker.top, <mcinfo@ups.com>", ""), ("undisclosed-recipients:;", "")] {
+    expect(DeliveryMail.domain(of: from) == domain, "the sender's domain: \(from) → '\(DeliveryMail.domain(of: from))'")
+}
+expect(DeliveryMail.classify(headers: ["from": "evil@attacker.top (<mcinfo@ups.com>)", "subject": "UPS Update: Package Delivered"],
+                             uid: 0)?.store == "attacker.top", "script route: a comment doesn't make it UPS")
+expect(DeliveryMail.classify(headers: ["from": "\"x\" <evil@attacker.top>, <mcinfo@ups.com>", "subject": "UPS Update: Package Delivered"],
+                             uid: 0)?.store == "Unknown sender", "script route: two senders count as none")
+// Sellers and shops: not the marketplace's own name.
+expect(DeliveryMail.store(from: "Seller <abc123@marketplace.amazon.com>") == "Amazon seller"
+       && DeliveryMail.knownShipper(from: "Seller <abc123@marketplace.amazon.com>") == nil
+       && DeliveryMail.store(from: "x <m@members.ebay.com>") == "eBay seller", "a seller's message isn't Amazon's or eBay's")
+expect(DeliveryMail.classify(headers: ["from": "Seller <abc@marketplace.amazon.com>", "subject": #"Delivered: "Lamp""#], uid: 0) == nil,
+       "…so it needs a package word like any other sender")
+expect(DeliveryMail.knownShipper(from: "Cool Shop <mailer@shopify.com>") == nil
+       && DeliveryMail.store(from: "Cool Shop <mailer@shopify.com>") == "shopify.com"
+       && DeliveryMail.knownShipper(from: "Shop <no-reply@shop.app>") == "Shop", "shopify.com sends for every shop: not a known sender")
 expect(DeliveryMail.store(from: "Amazon <x@evil.example.com>") == "example.com", "a display name never names the store")
 let spoofProblem = DeliveryMail.classify(headers: ["subject": "Missed delivery: reschedule now",
                                                    "from": "UPS Support <help@ups-reschedule.top>"], uid: 1)
@@ -1959,15 +2135,61 @@ for (results, why) in [("mx.google.com; dkim=fail header.i=@ups.com", "failed"),
                        ("mx.google.com; spf=pass (\") dkim=pass header.i=@ups.com (\") smtp.mailfrom=x@evil.top", "a quote in a comment")] {
     expect(!DeliveryMail.signedBySender(results, domain: "ups.com"), "not signed by ups.com: \(why)")
 }
-let forged = DeliveryMail.classify(headers: ["subject": "UPS Update: Package Delivered", "from": "UPS <mcinfo@ups.com>",
-                                             "authentication-results": "mx.google.com; dkim=pass header.i=@evil.top; spf=fail"], uid: 1)
-expect(forged?.store == "ups.com", "a forged UPS email is treated as an unknown sender: \(forged?.store ?? "-")")
-expect(DeliveryMail.classify(headers: ["subject": #"Delivered: "Lamp""#, "from": "Target <orders@target.com>",
-                                       "authentication-results": "mx.google.com; dkim=fail header.i=@target.com"], uid: 1) == nil,
+/// Headers as the IMAP route passes them: Gmail had the chance to check, and (if given) its verdict.
+func checkedByGmail(_ subject: String, from: String, verdict: String?) -> Delivery? {
+    var headers = ["subject": subject, "from": from, ":gmail-checked": "1"]
+    if let verdict { headers[":gmail-verdict"] = verdict }
+    return DeliveryMail.classify(headers: headers, uid: 1)
+}
+let forged = checkedByGmail("UPS Update: Package Delivered", from: "UPS <mcinfo@ups.com>",
+                            verdict: "mx.google.com; dkim=pass header.i=@evil.top; spf=fail")
+expect(forged?.store == "Unverified sender", "a forged UPS email never shows as UPS or ups.com: \(forged?.store ?? "-")")
+expect(checkedByGmail("UPS Update: Delivery Attempted", from: "UPS <mcinfo@ups.com>",
+                      verdict: "mx.google.com; dkim=fail header.i=@ups.com") == nil,
+       "…and an unverified 'delivery problem' from a carrier's domain (the usual phishing) isn't shown")
+expect(checkedByGmail(#"Delivered: "Lamp""#, from: "Target <orders@target.com>",
+                      verdict: "mx.google.com; dkim=fail header.i=@target.com") == nil,
        "…and without a package word, it isn't announced at all")
-let signed = DeliveryMail.classify(headers: ["subject": "UPS Update: Package Delivered", "from": "UPS <mcinfo@ups.com>",
-                                             "authentication-results": gmailPass, ":gmail-id": "18c2f0a1b2c3d4e5"], uid: 1)
+expect(checkedByGmail("UPS Update: Package Delivered", from: "UPS <mcinfo@ups.com>", verdict: nil)?.store == "Unverified sender",
+       "no verdict from Gmail on the IMAP route: not verified (never 'skip')")
+var signedHeaders = ["subject": "UPS Update: Package Delivered", "from": "UPS <mcinfo@ups.com>", ":gmail-checked": "1",
+                     ":gmail-verdict": gmailPass, ":gmail-id": "18c2f0a1b2c3d4e5"]
+let signed = DeliveryMail.classify(headers: signedHeaders, uid: 1)
 expect(signed?.store == "UPS" && signed?.gmailID == "18c2f0a1b2c3d4e5", "a signed one keeps its name, and Gmail's ID")
+signedHeaders["authentication-results"] = gmailPass
+signedHeaders[":gmail-verdict"] = nil
+expect(DeliveryMail.classify(headers: signedHeaders, uid: 1)?.store == "Unverified sender",
+       "only the verdict the IMAP reader picked counts, not any Authentication-Results")
+// DMARC passing for the From domain counts too (senders whose DKIM is their mail provider's).
+let ontrac = checkedByGmail("OnTrac: Delivered", from: "OnTrac <noreply@ontrac.com>",
+                            verdict: "mx.google.com; spf=pass (google.com: domain of b@ontrac.com designates 1.2.3.4 as permitted sender) smtp.mailfrom=b@ontrac.com; dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=ontrac.com")
+expect(ontrac?.kind == .delivered && ontrac?.store == "OnTrac", "aligned SPF and DMARC: verified: \(ontrac?.store ?? "-")")
+let viaProvider = checkedByGmail("LaserShip: Delivered", from: "LaserShip <noreply@lasership.com>",
+                                 verdict: "mx.google.com; dkim=pass header.i=@sendgrid.net; dmarc=pass (p=NONE) header.from=lasership.com")
+expect(viaProvider?.store == "LaserShip", "DKIM by the mail provider, DMARC for the sender: verified")
+expect(checkedByGmail("UPS Update: Package Delivered", from: "UPS <mcinfo@ups.com>",
+                      verdict: "mx.google.com; dkim=pass header.i=@evil.top; dmarc=fail (p=REJECT) header.from=ups.com")?.store
+       == "Unverified sender", "DMARC failing: not verified")
+let gmailsFrom = checkedByGmail("Your package was delivered", from: "\"x\" <a@weird>",
+                                verdict: "mx.google.com; dkim=pass header.i=@tinyshop.co; dmarc=pass header.from=tinyshop.co")
+expect(gmailsFrom?.store == "tinyshop.co", "the domain Gmail read from the From header wins: \(gmailsFrom?.store ?? "-")")
+for (results, why) in [("mx.google.com; spf=pass (google.com: domain of x@attacker.top designates 1.2.3.4 as permitted sender; dkim=pass header.i=@ups.com) smtp.mailfrom=x@attacker.top", "dkim=pass inside a comment"),
+                       ("mx.google.com; spf=pass (x; dmarc=pass header.from=ups.com) smtp.mailfrom=x@attacker.top", "dmarc=pass inside a comment"),
+                       ("mx.google.com; dkim=pass header.i=@x.attacker.top\\\"; dkim=pass header.i=@ups.com", "a backslash outside quotes"),
+                       ("mx.google.com; dkim=pass header.d=ups.com.attacker.top", "a look-alike signer")] {
+    expect(!DeliveryMail.signedBySender(results, domain: "ups.com"), "not verified: \(why)")
+}
+for (verdict, why) in [("mx.google.com; spf=pass (google.com: x; dkim=pass header.i=@ups.com ) smtp.mailfrom=x@attacker.top", "dkim=pass in a comment"),
+                       ("mx.google.com; spf=pass (x; dmarc=pass header.from=ups.com ) smtp.mailfrom=x@attacker.top", "dmarc=pass in a comment"),
+                       ("mx.google.com; dkim=fail header.i=@ups.com; dmarc=pass (p=NONE)", "DMARC passing, but for which domain?")] {
+    expect(checkedByGmail("UPS Update: Package Delivered", from: "UPS <mcinfo@ups.com>", verdict: verdict)?.store == "Unverified sender",
+           "not verified: \(why)")
+}
+expect(checkedByGmail("UPS Update: Package Delivered", from: "UPS <mcinfo@ups.com>",
+                      verdict: "mx.google.com; dkim=pass header.i=@email.ups.com")?.store == "UPS"
+       && checkedByGmail("UPS Update: Package Delivered", from: "UPS <mcinfo@email.ups.com>",
+                         verdict: "mx.google.com; dkim=pass header.d=ups.com")?.store == "UPS",
+       "signed by the same domain or a subdomain of it: verified")
 
 // Item names
 expect(DeliveryMail.item(in: #"Delivered: "" and 1 more item"#) == "2 items", "no name, one more: 2 items")
@@ -2001,24 +2223,78 @@ expect(DeliveryMail.bodyText("UPS", store: "UPS") == "UPS", "nothing left: the s
 expect(DeliveryMail.bodyText("Your order 1Z999AA10123456784 was delivered", store: "tinyshop.co")
        == "Your order …6784 was delivered", "UPS-style numbers too")
 
-// Out for delivery, then delivered: one notification for the package.
+// Out for delivery, then delivered: the delivered one takes the out-for-delivery one's place.
 let outFirst = DeliveryMail.classify(headers: ["subject": #"Out for delivery: "Anker 735 Charger""#, "from": amazonFrom,
-                                               "message-id": "<a1@amazon.com>"], uid: 1)
-let thenDelivered = DeliveryMail.classify(headers: ["subject": #"Delivered: "Anker 735 Charger" and 1 more item"#,
-                                                    "from": amazonFrom, "message-id": "<a2@amazon.com>"], uid: 2)
+                                               "message-id": "<a1@amazon.com>", "date": "Sat, 17 Oct 2026 08:00:00 +0000"], uid: 1)
+let thenDelivered = DeliveryMail.classify(headers: ["subject": #"Delivered: "Anker 735 Charger""#,
+                                                    "from": amazonFrom, "message-id": "<a2@amazon.com>",
+                                                    "date": "Sat, 17 Oct 2026 13:00:00 +0000"], uid: 2)
 expect(outFirst?.title == "Out for delivery · Amazon" && outFirst?.body == "Anker 735 Charger", "out for delivery text")
-expect(outFirst?.notificationID != nil && outFirst?.notificationID == thenDelivered?.notificationID,
-       "same package, same notification: \(outFirst?.notificationID ?? "-")")
+if let outFirst, let thenDelivered {
+    let placed = DeliveryList.adding([thenDelivered], to: [outFirst], now: Date(timeIntervalSince1970: 1_792_250_000))
+    expect(placed.count == 1 && placed.first?.notificationID == outFirst.notificationID
+           && DeliveryList.replaced(by: thenDelivered, in: [outFirst])?.key == outFirst.key,
+           "same package, same notification: \(placed.map(\.notificationID))")
+    expect(DeliveryList.replaced(by: outFirst, in: [thenDelivered]) == nil, "never the other way round")
+}
 let uspsOut = DeliveryMail.classify(headers: ["subject": "USPS® Item Out for Delivery, 9400111899223344556677", "from": uspsFrom], uid: 1)
 let uspsIn = DeliveryMail.classify(headers: ["subject": "USPS® Item Delivered, In/At Mailbox 9400111899223344556677",
                                              "from": uspsFrom], uid: 2)
 expect(uspsOut?.package == "usps:9400111899223344556677" && uspsOut?.package == uspsIn?.package, "by tracking number")
-expect(DeliveryMail.packageKey(subject: "Your order 112-1234567-1234567 was delivered", store: "Amazon")
-       == "amazon:112-1234567-1234567", "by Amazon order number")
+expect(DeliveryMail.packageKey(subject: "Your order 112-1234567-1234567 was delivered", store: "Amazon") == nil
+       && DeliveryMail.packageKey(subject: #"Delivered: "Lamp" (order 112-1234567-1234567)"#, store: "Amazon")
+          == "amazon:112-1234567-1234567:lamp", "an order number only counts with the item: split shipments stay apart")
 let upsA = DeliveryMail.classify(headers: ["subject": "UPS Update: Package Delivered", "from": upsFrom, "message-id": "<u1@ups.com>"], uid: 1)
 expect(upsA?.package == nil && upsA?.notificationID == "delivery-<u1@ups.com>", "nothing to go on: one notification per email")
 let otherPackage = DeliveryMail.classify(headers: ["subject": #"Delivered: "Lamp""#, "from": amazonFrom], uid: 3)
 expect(otherPackage?.notificationID != thenDelivered?.notificationID, "another package, another notification")
+// Repeat orders and split shipments stay apart.
+func amazonEmail(_ subject: String, _ id: String, _ date: String) -> Delivery? {
+    DeliveryMail.classify(headers: ["subject": subject, "from": amazonFrom, "message-id": "<\(id)@amazon.com>", "date": date], uid: 1)
+}
+let packNow = Date(timeIntervalSince1970: 1_792_250_000)                 // Sat 17 Oct 2026
+if let firstOrder = amazonEmail(#"Delivered: "AA Batteries, 48 Count""#, "r1", "Tue, 13 Oct 2026 10:00:00 +0000"),
+   let repeatOut = amazonEmail(#"Out for delivery: "AA Batteries, 48 Count""#, "r2", "Sat, 17 Oct 2026 08:00:00 +0000"),
+   let repeatIn = amazonEmail(#"Delivered: "AA Batteries, 48 Count""#, "r3", "Sat, 17 Oct 2026 12:00:00 +0000"),
+   let oldOut = amazonEmail(#"Out for delivery: "AA Batteries, 48 Count""#, "r0", "Tue, 13 Oct 2026 07:00:00 +0000") {
+    var list = DeliveryList.adding([firstOrder], to: [], now: packNow)
+    list = DeliveryList.adding([repeatOut], to: list, now: packNow)
+    expect(list.map(\.key) == ["<r2@amazon.com>", "<r1@amazon.com>"] && repeatOut.notificationID != firstOrder.notificationID,
+           "a repeat order's 'Out for delivery' never replaces the last order's 'Delivered'")
+    list = DeliveryList.adding([repeatIn], to: list, now: packNow)
+    expect(list.map(\.key) == ["<r3@amazon.com>", "<r1@amazon.com>"] && list.first?.notificationID == repeatOut.notificationID,
+           "its own 'Delivered' replaces its 'Out for delivery': \(list.map(\.key))")
+    expect(DeliveryList.replaced(by: repeatIn, in: [oldOut]) == nil, "an 'Out for delivery' from 4 days before is another parcel")
+    let secondOut = amazonEmail(#"Out for delivery: "AA Batteries, 48 Count""#, "r4", "Sat, 17 Oct 2026 09:00:00 +0000")
+    let secondIn = amazonEmail(#"Delivered: "AA Batteries, 48 Count""#, "r5", "Sat, 17 Oct 2026 13:00:00 +0000")
+    expect(secondOut.map { DeliveryList.replaced(by: $0, in: [repeatOut]) } == .some(nil),
+           "an 'Out for delivery' never replaces another one")
+    expect(secondIn.map { DeliveryList.replaced(by: $0, in: [repeatIn]) } == .some(nil),
+           "a 'Delivered' only ever replaces an 'Out for delivery', not another 'Delivered'")
+}
+let splitOut = amazonEmail("Your order 112-1234567-1234567 is out for delivery", "s1", "Sat, 17 Oct 2026 08:00:00 +0000")
+let splitIn = amazonEmail("Your order 112-1234567-1234567 was delivered", "s2", "Sat, 17 Oct 2026 12:00:00 +0000")
+if let splitOut, let splitIn {
+    expect(DeliveryList.replaced(by: splitIn, in: [splitOut]) == nil && splitIn.notificationID != splitOut.notificationID,
+           "a split shipment (same order, no item or tracking number) stays apart")
+}
+let partA = amazonEmail(#"Out for delivery: "Lamp" (order 112-1234567-1234567)"#, "p1", "Sat, 17 Oct 2026 08:00:00 +0000")
+let partB = amazonEmail(#"Delivered: "Rug" (order 112-1234567-1234567)"#, "p2", "Sat, 17 Oct 2026 12:00:00 +0000")
+expect(partA?.package != nil && partA?.package != partB?.package, "same order, different items: different parcels")
+let cut1 = amazonEmail(#"Delivered: "Apple AirPods Pro (2nd..." and 1 more item"#, "c1", "Sat, 17 Oct 2026 12:00:00 +0000")
+let cut2 = amazonEmail(#"Out for delivery: "Apple AirPods Pro (2nd...""#, "c2", "Sat, 17 Oct 2026 08:00:00 +0000")
+expect(cut1?.package != cut2?.package, "a name cut short, with and without '+1 more': not the same parcel")
+let phone1 = DeliveryMail.classify(headers: ["subject": "Your Samsung order has been delivered — questions? Call 18005551234",
+                                             "from": "Samsung <noreply@samsung.com>"], uid: 1)
+expect(phone1?.package == nil && DeliveryMail.trackingNumbers(in: "Call 18005551234 or 8005551234").isEmpty,
+       "phone numbers aren't tracking numbers")
+expect(DeliveryMail.trackingNumbers(in: "1Z999AA10123456784 TBA123456789012 EA123456789US 771234567890 9400111899223344556677")
+       == ["1Z999AA10123456784", "TBA123456789012", "EA123456789US", "771234567890", "9400111899223344556677"],
+       "UPS, Amazon, USPS international, FedEx and USPS formats")
+expect(DeliveryMail.trackingNumbers(in: "Shipment 1234567890", store: "DHL") == ["1234567890"]
+       && DeliveryMail.trackingNumbers(in: "Shipment 1234567890").isEmpty, "10 digits only from DHL")
+expect(DeliveryMail.bodyText("Your order was delivered. Questions? Call 18005551234", store: "x.com")
+       == "Your order was delivered. Questions? Call 18005551234", "a phone number in the text stays whole")
 
 // The menu keeps a week of deliveries, and a package's newer email replaces its older one.
 let listNow = Date(timeIntervalSince1970: 1_792_250_000)
@@ -2125,6 +2401,34 @@ expect(storeTool.delete(service: "local.hammer.gmail", account: "script-url")
        && storeTool.find(service: "local.hammer.gmail", account: "script-url") == .missing
        && storeTool.delete(service: "local.hammer.gmail", account: "script-url"), "deleted; deleting again is fine")
 expect(!standIn("locked2", "exit 36\n").delete(service: "s", account: "a"), "a failed delete says so")
+// Saving the script's address and key together: if the key can't be saved, the address is put back.
+let shelf = keychainDir.appendingPathComponent("shelf").path
+try? FileManager.default.createDirectory(atPath: shelf, withIntermediateDirectories: true)
+let shelfTool = standIn("shelf-tool", """
+    account() { while [ $# -gt 0 ]; do [ "$1" = "-a" ] && { echo "$2"; return; }; shift; done; }
+    if [ "$1" = "-i" ]; then
+      line=$(cat); a=$(echo "$line" | sed -n 's/.* -a \\([^ ]*\\) .*/\\1/p'); v=$(echo "$line" | sed -n 's/.* -w \\([^ ]*\\)$/\\1/p')
+      [ -e '\(shelf)/refuse-'"$a" ] && exit 0
+      printf '%s' "$v" > '\(shelf)/'"$a"; exit 0
+    fi
+    a=$(account "$@")
+    if [ "$1" = "find-generic-password" ]; then [ -e '\(shelf)/'"$a" ] || exit 44; cat '\(shelf)/'"$a"; exit 0; fi
+    if [ "$1" = "delete-generic-password" ]; then [ -e '\(shelf)/'"$a" ] || exit 44; rm '\(shelf)/'"$a"; exit 0; fi
+    exit 1
+
+    """)
+let oldURL = "https://script.google.com/macros/s/AKfycbOLDONE/exec", newURL = "https://script.google.com/macros/s/AKfycbNEW/exec"
+_ = shelfTool.save(service: "s", account: "script-url", label: "L", secret: oldURL)
+_ = FileManager.default.createFile(atPath: shelf + "/refuse-script-key", contents: Data())
+expect(!shelfTool.saveAll(service: "s", [("script-url", "L", newURL), ("script-key", "K", String(repeating: "a", count: 64))])
+       && shelfTool.find(service: "s", account: "script-url") == .found(oldURL), "the key can't be saved: the old address is back")
+_ = shelfTool.delete(service: "s", account: "script-url")
+expect(!shelfTool.saveAll(service: "s", [("script-url", "L", newURL), ("script-key", "K", String(repeating: "a", count: 64))])
+       && shelfTool.find(service: "s", account: "script-url") == .missing, "…or gone, if there wasn't one")
+try? FileManager.default.removeItem(atPath: shelf + "/refuse-script-key")
+expect(shelfTool.saveAll(service: "s", [("script-url", "L", newURL), ("script-key", "K", String(repeating: "a", count: 64))])
+       && shelfTool.find(service: "s", account: "script-url") == .found(newURL)
+       && shelfTool.find(service: "s", account: "script-key") == .found(String(repeating: "a", count: 64)), "both saved")
 try? FileManager.default.removeItem(at: keychainDir)
 
 // The script's web address moves from Hammer's settings into the Keychain, once.
@@ -2263,6 +2567,37 @@ for size in ["-2", "9223372036854775807", "99999999999999999999", "9223372036854
     expect(fetchedFrom(odd)[5] == nil, "a literal of {\(size)} doesn't crash and isn't read")
 }
 expect(fetchedFrom("* 1 FETCH (UID 5 BODY[HEADER.FIELDS (SUBJECT)] {40}\r\nSubject: cut short").isEmpty, "a cut-off literal")
+// Only Gmail's own verdict counts: the first Authentication-Results, which Gmail puts on top.
+func fetchedDelivery(_ lines: [String]) -> Delivery? {
+    let block = lines.joined(separator: "\r\n") + "\r\n\r\n"
+    let answer = "* 1 FETCH (UID 7 X-GM-MSGID 4660 BODY[HEADER.FIELDS (FROM SUBJECT AUTHENTICATION-RESULTS)] {\(block.utf8.count)}\r\n\(block))\r\n"
+    return IMAPReply.fetchedHeaders(Array(answer.utf8))[7].flatMap { DeliveryMail.classify(headers: $0, uid: 7) }
+}
+let upsLines = ["From: UPS <mcinfo@ups.com>", "Subject: UPS Update: Package Delivered"]
+expect(fetchedDelivery(["Authentication-Results: mx.google.com;", "\tdkim=pass header.i=@ups.com header.s=s1;", "\tspf=pass"] + upsLines)?.store
+       == "UPS", "Gmail's verdict on top, folded: verified")
+expect(fetchedDelivery(["Authentication-Results: mx.google.com; dkim=fail header.i=@ups.com"] + upsLines
+                       + ["Authentication-Results: mx.google.com; dkim=pass header.i=@ups.com"])?.store == "Unverified sender",
+       "the sender's own (passing) header further down never counts")
+expect(fetchedDelivery(["Authentication-Results: mx.google.com; dkim=fail header.i=@attacker.top",
+                        "Authentication-Results: mx.google.com; dkim=pass header.i=@ups.com"] + upsLines)?.store == "Unverified sender",
+       "two before From: the first is Gmail's")
+expect(fetchedDelivery(upsLines + ["Authentication-Results: mx.google.com; dkim=pass header.i=@ups.com"])?.store == "Unverified sender",
+       "none from Gmail, the sender's own below From: not verified")
+expect(fetchedDelivery(upsLines)?.store == "Unverified sender", "no verdict at all on the IMAP route: not verified")
+expect(fetchedDelivery(["Authentication-Results: spoof.example; dkim=pass header.i=@ups.com",
+                        "Authentication-Results: mx.google.com; dkim=pass header.i=@ups.com"] + upsLines)?.store == "Unverified sender",
+       "the first isn't Gmail's: not verified (never the next one)")
+expect(HeaderText.parse(Array("Subject: first\r\nSubject: second\r\n  continued\r\n".utf8))["subject"] == "first",
+       "a repeated header: the first counts, and the second's folded lines aren't added")
+// Headers are only ever read from the BODY[HEADER…] literal, never another one.
+let helloBlock = "Subject: UPS Update: Hello\r\n\r\n"
+let labelsFirst = "* 1 FETCH (UID 9 X-GM-LABELS ({6}\r\nInbox!) BODY[HEADER.FIELDS (SUBJECT)] {\(helloBlock.utf8.count)}\r\n\(helloBlock))\r\n"
+expect(IMAPReply.fetchedHeaders(Array(labelsFirst.utf8))[9]?["subject"] == "UPS Update: Hello",
+       "another literal before the headers isn't read as headers")
+let labelsAfter = "* 1 FETCH (UID 9 BODY[HEADER.FIELDS (SUBJECT)] {\(helloBlock.utf8.count)}\r\n\(helloBlock) X-GM-LABELS ({6}\r\nInbox!))\r\n"
+expect(IMAPReply.fetchedHeaders(Array(labelsAfter.utf8))[9]?["subject"] == "UPS Update: Hello",
+       "…or after them")
 expect(IMAPConnection.literalSize(at: Array("x {99999999999999999999}".utf8)) == Int.max, "a huge literal size is refused later")
 
 // Login refusals: a wrong password stops checks; IMAP turned off isn't "temporary" forever.
@@ -2276,11 +2611,22 @@ let imapOff = loginError("[ALERT] Your account is not enabled for IMAP use. Plea
 expect(imapOff == .notAllowed("[ALERT] Your account is not enabled for IMAP use. Please visit your Gmail settings page and enable your account for IMAP access. (Failure)"),
        "IMAP turned off: a lasting refusal")
 let imapOffFailure = imapOff.map(CheckFailure.init)
-expect(imapOffFailure?.message == "IMAP is turned off for this Gmail account." && imapOffFailure?.needsSetup == true
+expect(imapOffFailure?.message == "IMAP is turned off for this account." && imapOffFailure?.needsSetup == true
        && imapOffFailure?.stopChecking == false && imapOffFailure?.hasFix == true, "says so, offers a fix, keeps checking")
 let domainOff = loginError("[ALERT] IMAP access is disabled for your domain. Please contact your domain administrator. (Failure)").map(CheckFailure.init)
-expect(domainOff?.message == "IMAP is turned off for your organization." && domainOff?.advice.contains("Google script") == true,
-       "turned off by an administrator: use the script")
+expect(domainOff?.advice == "Your Google Workspace administrator can turn it on.",
+       "only an administrator can turn IMAP off (personal Gmail always has it since 2025)")
+for failure in [imapOffFailure, domainOff, unknownRefusalFor("[ALERT] Account suspended (Failure)")].compactMap({ $0 }) {
+    expect(!failure.setupMessage.lowercased().contains("script"), "the app-password window doesn't talk about the script: \(failure.setupMessage)")
+}
+func unknownRefusalFor(_ text: String) -> CheckFailure? { loginError(text).map(CheckFailure.init) }
+let browser = loginError("[ALERT] Please log in via your web browser: https://support.google.com/mail/accounts/answer/78754 (Failure)")
+expect(browser.map { if case .badLogin = $0 { return true }; return false } == true
+       && browser.map(CheckFailure.init)?.message == "Google wants you to sign in to Gmail in your browser.",
+       "'log in via your web browser' is lasting: sign in to Gmail in the browser")
+for passing in ["[OVERQUOTA] Account exceeded command or bandwidth limits. (Failure)", "[SERVERBUG] Internal server error (Failure)"] {
+    expect(loginError(passing) == .failed("Gmail is having trouble right now."), "passing: \(passing)")
+}
 let unknownRefusal = loginError("[ALERT] Account suspended (Failure)").map(CheckFailure.init)
 expect(unknownRefusal?.message == "Gmail turned down the sign-in." && unknownRefusal?.advice.contains("“Account suspended”") == true,
        "anything else lasting: Gmail's own words: \(unknownRefusal?.advice ?? "-")")
@@ -2310,10 +2656,12 @@ final class FakeInbox {
     var messages: [(uid: Int, headers: String)] = []
     var log: [String] = []
     var failOn: String?
+    /// Like Gmail, puts its verdict on top: by default that the sender's domain signed it.
     func add(_ subject: String, from: String = "\"eBay\" <ebay@ebay.com>", date: String = "Sat, 17 Oct 2026 14:00:00 +0000",
-             id: String? = nil) {
+             id: String? = nil, verdict: String? = "") {
         let uid = (messages.map(\.uid).max() ?? 100) + 1
-        messages.append((uid, "From: \(from)\r\nSubject: \(subject)\r\nDate: \(date)\r\nMessage-ID: <\(id ?? "m\(uid)")@x>\r\n\r\n"))
+        let checked = verdict.map { "Authentication-Results: " + ($0.isEmpty ? "mx.google.com; dkim=pass header.i=@\(DeliveryMail.domain(of: from))" : $0) + "\r\n" } ?? ""
+        messages.append((uid, checked + "From: \(from)\r\nSubject: \(subject)\r\nDate: \(date)\r\nMessage-ID: <\(id ?? "m\(uid)")@x>\r\n\r\n"))
     }
     func answer(_ command: String) throws -> IMAPResponse {
         log.append(command)
@@ -2422,6 +2770,7 @@ do {
 // Setting up again after it stopped working looks back to the last good check (at most 3 days).
 let missedInbox = FakeInbox()
 missedInbox.add("Your package was delivered: Old lamp", date: "Mon, 12 Oct 2026 10:00:00 +0000")    // before the last good check
+missedInbox.add(#"Delivered: "Clock""#, from: amazonFrom, date: "Sat, 17 Oct 2026 02:00:00 +0000", id: "clock")  // before it: seen then
 missedInbox.add(#"Delivered: "Rug""#, from: amazonFrom, date: "Sat, 17 Oct 2026 09:00:00 +0000", id: "rug")
 missedInbox.add(#"Delivered: "Mug""#, from: amazonFrom, date: "Sat, 17 Oct 2026 11:00:00 +0000", id: "mug")
 missedInbox.add("lunch?", from: "f@gmail.com", date: "Sat, 17 Oct 2026 12:00:00 +0000")
@@ -2433,11 +2782,11 @@ do {
     let again = try DeliveryCheck.run(state: DeliveryState(announced: ["<mug@x>"]), now: now, lookBack: lastGood,
                                       command: missedInbox.answer)
     expect(again.deliveries.map(\.body) == ["Rug"], "set up again: what arrived meanwhile, minus what was shown: \(again.deliveries.map(\.body))")
-    expect(missedInbox.log.contains("UID SEARCH SINCE 16-Oct-2026") && again.state.lastUID == 104 && again.state.uidValidity == 7,
+    expect(missedInbox.log.contains("UID SEARCH SINCE 16-Oct-2026") && again.state.lastUID == 105 && again.state.uidValidity == 7,
            "searched from the day before, and carries on from the newest: \(missedInbox.log)")
     let weekAgo = try DeliveryCheck.run(state: DeliveryState(), now: now, lookBack: now.addingTimeInterval(-9 * 86_400),
                                         command: missedInbox.answer)
-    expect(weekAgo.deliveries.map(\.body) == ["Rug", "Mug"], "never more than 3 days back")
+    expect(weekAgo.deliveries.map(\.body) == ["Clock", "Rug", "Mug"], "never more than 3 days back")
 } catch {
     expect(false, "look-back failed: \(error)")
 }

@@ -11,7 +11,8 @@ func addMail(_ subject: String, from: String = "\"eBay\" <ebay@ebay.com>") {
     var messages = box["messages"] as! [[String: Any]]
     let uid = (messages.compactMap { $0["uid"] as? Int }.max() ?? 100) + 1
     let date = DateFormatter(); date.locale = Locale(identifier: "en_US_POSIX"); date.dateFormat = "EEE, d MMM yyyy HH:mm:ss Z"
-    messages.append(["uid": uid, "headers": "From: \(from)\r\nSubject: \(subject)\r\nDate: \(date.string(from: Date()))\r\nMessage-ID: <m\(uid)@x>\r\n"])
+    let verdict = "Authentication-Results: mx.google.com; dkim=pass header.i=@\(DeliveryMail.domain(of: from))\r\n"   // Gmail's, on top
+    messages.append(["uid": uid, "headers": verdict + "From: \(from)\r\nSubject: \(subject)\r\nDate: \(date.string(from: Date()))\r\nMessage-ID: <m\(uid)@x>\r\n"])
     box["messages"] = messages
     try! JSONSerialization.data(withJSONObject: box).write(to: URL(fileURLWithPath: boxPath))
 }
@@ -45,6 +46,7 @@ check(watcher.isOn && watcher.email == "you@gmail.com", "on, for that account")
 check(GmailKeychain.password(for: "you@gmail.com") == .found("abcdefghijklmnop"), "app password in the Keychain")
 check(simAsked == 1, "asked for permission to show notifications")
 check(watcher.recent.isEmpty && simPosted.isEmpty, "old mail not announced")
+check(!watcher.hasSeenDeliveries, "the menu says 'No deliveries yet'")
 
 print("[a delivery arrives]")
 addMail("Your package was delivered: Apple iPhone 15 Pro Max")
@@ -57,6 +59,7 @@ check(simPosted.first?.2 == "https://mail.google.com/mail/?authuser=you@gmail.co
       "clicking it opens the email itself (by Gmail's ID): \(simPosted.first?.2 ?? "-")")
 check(watcher.recent.map(\.body) == ["Apple iPhone 15 Pro Max"] && watcher.problem == nil && watcher.lastChecked != nil,
       "listed in the menu")
+check(watcher.hasSeenDeliveries, "and from now on an empty list means 'none in the last 7 days'")
 watcher.checkNow()
 wait(2)
 check(simPosted.count == 1, "not announced again")
@@ -98,7 +101,7 @@ let outID = simPostedIDs.last
 addMail(#"Delivered: "Desk lamp""#, from: "Amazon.com <a@amazon.com>")
 watcher.checkNow()
 wait(2)
-check(simPosted.last?.0 == "Delivered · Amazon" && simPostedIDs.last == outID && outID == "delivery-amazon:desk lamp",
+check(simPosted.last?.0 == "Delivered · Amazon" && simPostedIDs.last == outID && outID?.hasPrefix("delivery-<m") == true,
       "delivered replaces it (same notification): \(simPostedIDs.suffix(2))")
 check(watcher.recent.first?.title == "Delivered · Amazon" && !watcher.recent.contains { $0.kind == .outForDelivery },
       "and in the menu, one line for the lamp")
@@ -296,14 +299,54 @@ wait(2)
 check(upgraded.problem == nil && simPosted.last?.1 == "Kettle", "still works: \(upgraded.problem ?? "-")")
 check(GmailKeychain.scriptURL() == .found(scriptAddress.absoluteString)
       && UserDefaults.standard.string(forKey: "deliveryScriptURL") == nil, "moved into the Keychain, and gone from the settings")
+// A Keychain that won't take one account: the real stand-in, except that saves for it are dropped.
+let refusals = FileManager.default.temporaryDirectory.appendingPathComponent("refused-\(getpid()).log").path
+func refusing(_ account: String) -> KeychainTool {
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("refusing-\(account)-\(getpid())").path
+    let script = """
+        #!/bin/sh
+        if [ "$1" = "-i" ]; then
+          line=$(cat)
+          case "$line" in *" -a \(account) "*) echo "\(account)" >> '\(refusals)'; exit 0;; esac
+          printf '%s\\n' "$line" | '\(securityPath)' -i; exit $?
+        fi
+        exec '\(securityPath)' "$@"
+
+        """
+    _ = FileManager.default.createFile(atPath: path, contents: Data(script.utf8), attributes: [.posixPermissions: 0o755])
+    return KeychainTool(path: path, timeout: 10)
+}
+GmailKeychain.deleteScriptURL()
 UserDefaults.standard.set(scriptAddress.absoluteString, forKey: "deliveryScriptURL")
-GmailKeychain.tool = KeychainTool(path: "/bin/false", timeout: 5)    // can't save now: keep using the setting
+GmailKeychain.tool = refusing("script-url")                    // can't save the address now: keep using the setting
 let lockedUpgrade = DeliveryWatcher()
+scriptMail("new5", #"Delivered: "Toaster""#, from: "Amazon.com <a@amazon.com>")
 lockedUpgrade.checkNow()
 wait(2)
-check(UserDefaults.standard.string(forKey: "deliveryScriptURL") != nil, "if the Keychain can't take it yet, the setting stays")
+check(((try? String(contentsOfFile: refusals, encoding: .utf8)) ?? "").contains("script-url"), "it did try to move it")
+check(lockedUpgrade.problem == nil && simPosted.last?.1 == "Toaster", "the check still works, with the setting's address")
+check(UserDefaults.standard.string(forKey: "deliveryScriptURL") != nil && GmailKeychain.scriptURL() == .missing,
+      "if the Keychain can't take it yet, the setting stays")
 GmailKeychain.tool = KeychainTool(path: securityPath, timeout: 10)
-UserDefaults.standard.removeObject(forKey: "deliveryScriptURL")
+lockedUpgrade.checkNow()
+wait(2)
+check(UserDefaults.standard.string(forKey: "deliveryScriptURL") == nil && GmailKeychain.scriptURL() == .found(scriptAddress.absoluteString),
+      "and it moves at the next check that can")
+
+print("[script: set up again, but the key can't be saved]")
+let otherAddress = URL(string: "http://127.0.0.1:\(scriptPort)/macros/s/AKfycbOTHER/exec")!
+let freshKey = DeliveryScript.newKey()
+scriptBox["key"] = freshKey; saveScriptBox()                    // a new script, with a new key
+GmailKeychain.tool = refusing("script-key")
+answer = .none
+watcher.turnOn(scriptURL: otherAddress, key: freshKey) { answer = .some($0) }
+wait(2)
+scriptBox["key"] = scriptKey; saveScriptBox()
+check(answer != nil && (answer!)?.message.contains("Keychain") == true, "says so: \(String(describing: answer))")
+check(GmailKeychain.scriptURL() == .found(scriptAddress.absoluteString) && GmailKeychain.scriptKey() == .found(scriptKey),
+      "the address in use is put back, with its key")
+GmailKeychain.tool = KeychainTool(path: securityPath, timeout: 10)
+try? FileManager.default.removeItem(atPath: refusals)
 
 print("[the script on the clipboard]")
 let board = NSPasteboard.general

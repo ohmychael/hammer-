@@ -27,7 +27,8 @@ struct Delivery: Codable, Equatable {
     var date: Date?
     let uid: Int
     var gmailID: String? = nil // Gmail's own ID for the email (X-GM-MSGID in hex, or from the Google script)
-    var package: String? = nil // the same package across its emails: "Delivered" replaces "Out for delivery"
+    var package: String? = nil // the same package across its emails (DeliveryMail.packageKey)
+    var replaces: String? = nil // the notification this one took the place of (its "Out for delivery")
 
     /// Identifies this delivery in the menu.
     var key: String { messageID ?? gmailID ?? "uid:\(uid)" }
@@ -39,8 +40,9 @@ struct Delivery: Codable, Equatable {
         }
     }
     var body: String { item ?? DeliveryMail.bodyText(subject, store: store) }
-    /// One notification per package, so "Delivered" replaces that package's "Out for delivery".
-    var notificationID: String { "delivery-" + (package ?? key) }
+    /// One notification per email, except that a "Delivered" takes the place of its
+    /// package's "Out for delivery" (DeliveryList.replaced).
+    var notificationID: String { replaces ?? "delivery-" + key }
 
     /// Opens this email in Gmail in the browser (in the right account), or nil if
     /// there's no email to open (e.g. the test notification). Gmail's own ID opens the
@@ -75,12 +77,29 @@ enum DeliveryMail {
         let subject = headers["subject"] ?? ""
         let from = headers["from"] ?? ""
         guard !isBounce(from: from), let kind = kind(ofSubject: subject) else { return nil }
+        let sender = sender(from: from, headers: headers)
+        let name = shipperName(domain: sender.domain)
+        var store: String
+        var trusted = false
+        if let name, sender.verified != false {
+            // A store or carrier Hammer knows. (Without Gmail's check, on the script route,
+            // the address can't be verified; the README says so.)
+            store = name
+            trusted = !name.hasSuffix(" seller")
+        } else if name != nil {
+            // A known store's or carrier's domain that Gmail couldn't verify: maybe forged.
+            // Never shown as that store, and its "delivery problems" (the usual phishing,
+            // "pay a redelivery fee") aren't shown at all.
+            guard kind != .problem else { return nil }
+            store = "Unverified sender"
+        } else {
+            let domain = registeredDomain(sender.domain)
+            store = domain.isEmpty ? "Unknown sender" : shorten(domain, to: 40)
+        }
         // "Your message was delivered", "Your report has been delivered": the wording alone
         // isn't enough. It has to come from a known store or carrier, or be about a package.
         // The same goes for problems: a "missed delivery" from anyone else needs a package word.
-        let known = knownShipper(from: from, authentication: headers["authentication-results"])
-        if known == nil && !mentionsAPackage(subject) { return nil }
-        let store = known ?? senderDomain(from)
+        if !trusted && !mentionsAPackage(subject) { return nil }
         let gmailID = headers[":gmail-id"].flatMap { $0.isEmpty ? nil : $0 }
         return Delivery(kind: kind, store: store, item: kind == .problem ? nil : item(in: subject),
                         subject: subject, messageID: headers["message-id"],
@@ -96,29 +115,40 @@ enum DeliveryMail {
         while full.hasPrefix("["), let close = full.firstIndex(of: "]"), full.distance(from: full.startIndex, to: close) < 24 {
             full = String(full[full.index(after: close)...]).trimmingCharacters(in: .whitespaces)
         }
-        if full.hasPrefix("re:") || full.hasPrefix("re :") { return nil }        // a conversation, not a notice
+        // A conversation, not a notice: "Re:", and "AW:", "SV:", "Antw:" from other mail programs.
+        if matches(full, #"^(re|aw|sv|antw)\s?:"#) { return nil }
 
         // Product names can't decide: 'Shipped: "Package Delivered Sign"' is a shipping
         // update, 'Delivered: "Expected Value"' a delivery.
         let text = withoutQuotes(full)
         let trimmed = text.trimmingCharacters(in: .whitespaces)
-        // How the subject starts decides: Amazon's "Shipped: …", "Arriving today: …".
-        if matches(trimmed, #"^(shipped|ordered|shipping confirmation)\s*([:\-–—|]|$)"#)
-            || matches(trimmed, #"^(now )?arriving\b"#)
+        // How the subject starts decides: Amazon's "Shipped: …", "Arriving today: …", also
+        // after a short label ("Amazon.com: Delivered: …", "Order #1045: Shipped").
+        let label = #"^([^:]{1,25}:\s*)?"#
+        if matches(trimmed, label + #"(shipped|ordered|shipping confirmation)\s*([:\-–—|]|$)"#)
+            || matches(trimmed, label + #"(now )?arriving\b"#)
             || matches(trimmed, #"^your (\S+ ){0,2}(order|package|item|shipment|parcel)s? (has|have) (been )?shipped\b"#) {
             return nil
         }
-        if matches(trimmed, #"^out for delivery\b"#) { return .outForDelivery }
-        if matches(trimmed, #"^delivered\s*[:\-–—|]"#) { return .delivered }
+        if matches(trimmed, label + #"out for delivery\b"#) { return .outForDelivery }
+        if matches(trimmed, label + #"delivered( today| yesterday| this morning)?\s*([:\-–—|]|!?$)"#) { return .delivered }
 
-        // Questions ask rather than tell: "Was your order delivered on time?", "Item not delivered? Get help".
+        // Questions ask rather than tell: "Was your order delivered on time?", "Item not delivered? Get help",
+        // and a question followed by a prompt is a help page: "Item delivered - not as described? Open a case".
         let s = " " + withoutQuestions(text) + " "
         guard !s.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
-        // Returns you sent, parcels handed to the carrier, "New items have arrived": not yours arriving.
+        let prompt = #"\b(open a (case|claim|dispute)|request a refund|leave (a )?(review|feedback)|rate (your|us)|tell us|let us know|get help|contact (us|support)|here's what to do|report (it|a problem))\b"#
+        if text.contains("?") && matches(s, prompt) { return nil }
+        // Not a parcel arriving for you: returns you sent, parcels handed to the carrier,
+        // cancelled orders, parcels waiting to be picked up, ads for your next order.
         let notYours = [#"\byour return\b"#, #"\breturn (package|parcel|shipment|item|order|label|request)s?\b"#,
                         #"\bdrop[- ]?off\b[^.]*\breturn"#,
                         #"\bdelivered to (the |a |an |our |your )?(carrier|courier|seller|merchant|retailer|shipper|warehouse|post office|postal service|airline|shipping (company|carrier|partner|provider)|logistics( partner| provider| company)?)\b"#,
-                        #"\b(handed|given) (over )?to (the |a )?(carrier|courier)\b"#]
+                        #"\b(handed|given) (over )?to (the |a )?(carrier|courier)\b"#,
+                        #"\b(cancell?ed|cancell?ation)\b"#,
+                        #"\b(ready|available) (for|to be) (pick ?up|picked up|collection|collected)\b"#,
+                        #"\bready to (pick ?up|collect)\b"#,
+                        #"\bnext (order|delivery|box|shipment)\b"#, #"\bdelivered free\b"#]
         if notYours.contains(where: { matches(s, $0) }) { return nil }
         let aboutAPackage = ["package", "parcel", "shipment", "order"].contains { s.contains($0) }
 
@@ -132,22 +162,31 @@ enum DeliveryMail {
                              "delivery exception", "missed delivery"]
         let problemWithPackage = ["not delivered", "not been delivered", "couldn't be delivered",
                                   "could not be delivered", "wasn't delivered", "unable to deliver", "undeliverable",
-                                  "delivery failed", "failed delivery", "returned to sender", "return to sender",
+                                  "failed delivery", "returned to sender", "return to sender",
                                   "being returned"]
         // "was never delivered", "hasn't been delivered", "not yet delivered"
         let negated = #"(\bnot|\bnever|n't)\s+([a-z]+\s+){0,2}delivered\b"#
-        if alwaysProblem.contains(where: { s.contains($0) })
-            || (aboutAPackage && (problemWithPackage.contains(where: { s.contains($0) }) || matches(s, negated))) {
+        // "We couldn't deliver…", "We tried to deliver…", "Delivery failed" (not "Mail delivery failed")
+        let couldNot = #"\b(couldn't|could not|can't|cannot|unable to|tried to|failed to|attempted to|weren't able to|were not able to)\s+(deliver|be delivered)\b"#
+        let failed = #"(?<!mail )(?<!message )\bdelivery (has |was )?(failed|unsuccessful)\b"#
+        if alwaysProblem.contains(where: { s.contains($0) }) || matches(s, failed)
+            || (aboutAPackage && (problemWithPackage.contains(where: { s.contains($0) }) || matches(s, negated)
+                                  || matches(s, couldNot))) {
             return .problem
         }
         if matches(s, negated) { return nil }
 
         // Plainly past tense: delivered, whatever else the subject says.
         let delivered = ["was delivered", "were delivered", "has been delivered", "have been delivered",
-                         "got delivered", "item delivered", "items delivered", "package delivered",
-                         "parcel delivered", "order delivered", "shipment delivered", "was dropped off",
-                         "been dropped off"]
+                         "is delivered", "are delivered", "got delivered", "item delivered", "items delivered",
+                         "package delivered", "parcel delivered", "order delivered", "shipment delivered",
+                         "was dropped off", "been dropped off"]
         if delivered.contains(where: { s.contains($0) }) && !s.contains("will have been") { return .delivered }
+        if matches(s, #"\bwe('ve| have)? delivered (your|the)\b|\bdelivery (is |was )?(complete|completed|successful)\b"#) {
+            return .delivered
+        }
+        // UPS's own "UPS Delivery Notification, Tracking Number 1Z…"
+        if matches(s, #"\bdelivery notification\b"#) && !trackingNumbers(in: s).isEmpty { return .delivered }
         if hasArrived(s) { return .delivered }
 
         if s.contains("out for delivery")
@@ -227,6 +266,9 @@ enum DeliveryMail {
     /// Stores and carriers whose "delivered" emails need no package word, by the
     /// domain they send from. A subdomain counts ("email.ups.com" is UPS); a domain
     /// that merely contains the name doesn't ("ups.attacker.top", "groups.com").
+    /// Domains anyone can send from aren't here (shopify.com sends for every Shopify
+    /// shop), and messages a marketplace passes on from its sellers count as the
+    /// seller's (shipperName).
     static let knownShippers: [String: String] = {
         var names: [String: String] = [:]
         let list: [(String, [String])] = [
@@ -241,7 +283,7 @@ enum DeliveryMail {
             ("Australia Post", ["auspost.com.au"]), ("Purolator", ["purolator.com"]), ("DPD", ["dpd.co.uk", "dpd.com"]),
             ("Evri", ["evri.com"]), ("Walmart", ["walmart.com", "walmart.ca"]), ("Target", ["target.com"]),
             ("Best Buy", ["bestbuy.com", "bestbuy.ca"]), ("Apple", ["apple.com"]), ("Etsy", ["etsy.com"]),
-            ("Shop", ["shop.app", "shopify.com"]), ("Costco", ["costco.com", "costco.ca"]),
+            ("Shop", ["shop.app"]), ("Costco", ["costco.com", "costco.ca"]),
             ("Home Depot", ["homedepot.com"]), ("Lowe's", ["lowes.com"]), ("Wayfair", ["wayfair.com"]),
             ("Chewy", ["chewy.com"]), ("Temu", ["temu.com"]), ("SHEIN", ["shein.com"]),
             ("AliExpress", ["aliexpress.com"]), ("Back Market", ["backmarket.com"]), ("Nike", ["nike.com"]),
@@ -250,17 +292,43 @@ enum DeliveryMail {
         return names
     }()
 
-    /// The sender's email domain, lowercased: "Amazon.com <a@email.amazon.com>" → "email.amazon.com".
-    static func domain(of raw: String) -> String {
-        let from = HeaderText.decode(String(raw.prefix(2000)))
-        let address: String
-        if let lt = from.lastIndex(of: "<"), let gt = from.lastIndex(of: ">"), lt < gt {
-            address = String(from[from.index(after: lt)..<gt])
-        } else {
-            address = from.trimmingCharacters(in: .whitespaces)
+    /// The sender's address from a From header, or nil unless there's exactly one.
+    /// Comments "(…)" and quoted names "…" are left out first, so the address is never
+    /// taken from text the sender wrote around it: `evil@attacker.top (<x@ups.com>)` is
+    /// evil@attacker.top, and `"x" <a@attacker.top>, <x@ups.com>` (two senders) is nil.
+    static func senderAddress(_ raw: String) -> String? {
+        var plain = ""
+        var depth = 0, quoted = false, escaped = false
+        for c in raw.prefix(2000) {
+            if escaped { escaped = false; continue }
+            if (quoted || depth > 0) && c == "\\" { escaped = true; continue }
+            if quoted { if c == "\"" { quoted = false; plain.append(" ") }; continue }
+            if c == "(" { depth += 1; continue }
+            if depth > 0 { if c == ")" { depth -= 1; if depth == 0 { plain.append(" ") } }; continue }
+            if c == "\"" { quoted = true; continue }
+            plain.append(c)
         }
-        guard address.contains("@") else { return "" }
-        let domain = (address.split(separator: "@").last.map { $0.lowercased() } ?? "")
+        guard !quoted, depth == 0, !plain.contains(","), !plain.contains(";") else { return nil }
+        let opens = plain.filter { $0 == "<" }.count, closes = plain.filter { $0 == ">" }.count
+        var address: String
+        if opens == 0 && closes == 0 {
+            address = plain.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !address.contains(where: { $0.isWhitespace }) else { return nil }
+        } else {
+            guard opens == 1, closes == 1, let lt = plain.firstIndex(of: "<"), let gt = plain.firstIndex(of: ">"), lt < gt,
+                  plain[plain.index(after: gt)...].allSatisfy({ $0.isWhitespace }) else { return nil }
+            address = String(plain[plain.index(after: lt)..<gt]).trimmingCharacters(in: .whitespaces)
+        }
+        let parts = address.split(separator: "@", omittingEmptySubsequences: false)
+        guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return nil }
+        return address
+    }
+
+    /// The sender's email domain, lowercased: "Amazon.com <a@email.amazon.com>" → "email.amazon.com";
+    /// "" if there isn't exactly one sender with a plain domain.
+    static func domain(of raw: String) -> String {
+        guard let address = senderAddress(raw) else { return "" }
+        let domain = String(address.split(separator: "@").last ?? "").lowercased()
             .trimmingCharacters(in: CharacterSet(charactersIn: ". "))
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789.-")
         guard domain.contains("."), domain.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return "" }
@@ -278,52 +346,107 @@ enum DeliveryMail {
         return labels.suffix(take).joined(separator: ".")
     }
 
-    /// The store or carrier's name if the email comes from one Hammer knows, by its
-    /// domain. Display names don't count: anyone can call themselves "Amazon". With
-    /// Gmail's Authentication-Results (the app-password route), the email must also be
-    /// signed (DKIM) by that domain, so a forged From address doesn't count either.
-    static func knownShipper(from raw: String, authentication: String? = nil) -> String? {
-        let domain = domain(of: raw)
+    /// The name of the store or carrier that sends from this domain, if Hammer knows it.
+    /// Messages Amazon and eBay pass on from their sellers ("marketplace.amazon.com",
+    /// "members.ebay.com") are the seller's: "Amazon seller".
+    static func shipperName(domain: String) -> String? {
         let labels = domain.split(separator: ".")
         guard labels.count >= 2 else { return nil }
-        var name: String?
         for start in 0..<(labels.count - 1) {
-            if let found = knownShippers[labels[start...].joined(separator: ".")] { name = found; break }
+            guard let name = knownShippers[labels[start...].joined(separator: ".")] else { continue }
+            let below = Set(labels[..<start])
+            if (name == "Amazon" && below.contains("marketplace")) || (name == "eBay" && below.contains("members")) {
+                return name + " seller"
+            }
+            return name
         }
-        guard let name else { return nil }
-        if let authentication, !signedBySender(authentication, domain: domain) { return nil }
+        return nil
+    }
+
+    /// The store or carrier's name if the email comes from one Hammer knows, by the
+    /// domain of its address. Display names don't count: anyone can call themselves
+    /// "Amazon". (Whether the address is genuine is checked in `sender`.)
+    static func knownShipper(from raw: String) -> String? {
+        guard let name = shipperName(domain: domain(of: raw)), !name.hasSuffix(" seller") else { return nil }
         return name
     }
 
-    /// Whether Gmail's verdict (its own Authentication-Results header, "mx.google.com; …")
-    /// says the email was signed by the sender's domain: "dkim=pass header.i=@ups.com".
-    /// Comments and quoted text are left out first, since they can carry text the
-    /// sender chose.
-    static func signedBySender(_ results: String, domain: String) -> Bool {
-        let sender = registeredDomain(domain)
-        guard !sender.isEmpty else { return false }
+    /// Who sent an email, as far as Hammer can tell. `verified` is nil when there's
+    /// nothing to check against (the Google script passes on no checks), true when
+    /// Gmail's own check says the address is genuine, and false otherwise: on the IMAP
+    /// route a missing or failed check means "not verified", never "skip".
+    struct Sender: Equatable {
+        let domain: String
+        let verified: Bool?
+    }
+
+    /// The IMAP route marks its headers with ":gmail-checked", and passes Gmail's own
+    /// Authentication-Results as ":gmail-verdict" (see IMAPReply.fetchedHeaders). The
+    /// domain is the one Gmail read from the From header (header.from=) when it says;
+    /// the sender is verified if that domain signed the email (DKIM) or DMARC passed.
+    static func sender(from raw: String, headers: [String: String]) -> Sender {
+        let parsed = domain(of: raw)
+        guard headers[":gmail-checked"] != nil else { return Sender(domain: parsed, verified: nil) }
+        guard let text = headers[":gmail-verdict"], let verdict = gmailVerdict(text) else {
+            return Sender(domain: parsed, verified: false)
+        }
+        let domain = verdict.headerFrom ?? parsed
+        let organization = registeredDomain(domain)
+        guard !organization.isEmpty else { return Sender(domain: domain, verified: false) }
+        let signed = verdict.dkimSigners.contains { registeredDomain($0) == organization }
+        let dmarc = verdict.dmarcPass && verdict.headerFrom.map(registeredDomain) == organization
+        return Sender(domain: domain, verified: signed || dmarc)
+    }
+
+    struct GmailVerdict: Equatable {
+        var headerFrom: String?          // the From domain, as Gmail read it
+        var dkimSigners: [String] = []   // domains whose DKIM signature passed
+        var dmarcPass = false
+    }
+
+    /// Reads Gmail's Authentication-Results: "mx.google.com; dkim=pass header.i=@ups.com …;
+    /// dmarc=pass (p=REJECT) header.from=ups.com". Nil if it isn't Gmail's (another
+    /// authserv-id). Comments and quoted text are left out first, since they can carry
+    /// text the sender chose.
+    static func gmailVerdict(_ results: String) -> GmailVerdict? {
         var plain = ""
         var depth = 0, quoted = false, escaped = false
         for c in results.prefix(4000) {
             if escaped { escaped = false; continue }
-            if c == "\\" { escaped = true; continue }
+            if (quoted || depth > 0) && c == "\\" { escaped = true; continue }
             if quoted { if c == "\"" { quoted = false }; continue }
-            if c == "\"" && depth == 0 { quoted = true; continue }
             if c == "(" { depth += 1; continue }
-            if c == ")" { depth = max(0, depth - 1); continue }
-            if depth == 0 { plain.append(c) }
+            if depth > 0 { if c == ")" { depth -= 1 }; continue }
+            if c == "\"" { quoted = true; continue }
+            plain.append(c)
         }
         let parts = plain.lowercased().split(separator: ";")
-        guard parts.first?.split(separator: " ").first == "mx.google.com" else { return false }   // only Gmail's own
+        guard parts.first?.split(whereSeparator: { $0 == " " || $0 == "\t" }).first == "mx.google.com" else { return nil }
+        var verdict = GmailVerdict()
         for part in parts.dropFirst() {
             let tokens = part.split(whereSeparator: { $0 == " " || $0 == "\t" })
-            guard tokens.first == "dkim=pass" else { continue }
-            for token in tokens.dropFirst() where token.hasPrefix("header.i=") || token.hasPrefix("header.d=") {
-                let signer = String(token.dropFirst(9).split(separator: "@").last ?? "")
-                if !signer.isEmpty && registeredDomain(signer) == sender { return true }
+            guard let method = tokens.first else { continue }
+            for token in tokens.dropFirst() {
+                if method == "dkim=pass", token.hasPrefix("header.i=") || token.hasPrefix("header.d=") {
+                    let signer = String(token.dropFirst(9).split(separator: "@").last ?? "")
+                    if !signer.isEmpty { verdict.dkimSigners.append(signer) }
+                } else if method.hasPrefix("dmarc="), token.hasPrefix("header.from=") {
+                    let domain = String(token.dropFirst(12))
+                    if !domain.isEmpty && verdict.headerFrom == nil { verdict.headerFrom = domain }
+                }
             }
+            if method == "dmarc=pass" { verdict.dmarcPass = true }
         }
-        return false
+        return verdict
+    }
+
+    /// Whether Gmail's verdict says the email was signed (DKIM) by this domain, or
+    /// passed DMARC as it.
+    static func signedBySender(_ results: String, domain: String) -> Bool {
+        let sender = registeredDomain(domain)
+        guard !sender.isEmpty, let verdict = gmailVerdict(results) else { return false }
+        return verdict.dkimSigners.contains { registeredDomain($0) == sender }
+            || (verdict.dmarcPass && verdict.headerFrom.map(registeredDomain) == sender)
     }
 
     /// Whether the subject is about a package rather than, say, a message or report.
@@ -333,11 +456,11 @@ enum DeliveryMail {
                                         "shipments", "item", "items", "purchase", "purchases", "delivery", "box"])
     }
 
-    /// The store or carrier, from the sender: a name Hammer knows (by domain, see
-    /// knownShipper), or else the sender's domain ("tinyshop.co"). The name an email
-    /// shows isn't used: anyone can call themselves "Amazon" or "USPS".
-    static func store(from raw: String, authentication: String? = nil) -> String {
-        knownShipper(from: raw, authentication: authentication) ?? senderDomain(raw)
+    /// The store or carrier, from the sender's address alone: a name Hammer knows, or
+    /// else the sender's domain ("tinyshop.co"). The name an email shows isn't used:
+    /// anyone can call themselves "Amazon" or "USPS".
+    static func store(from raw: String) -> String {
+        shipperName(domain: domain(of: raw)) ?? senderDomain(raw)
     }
 
     static func senderDomain(_ raw: String) -> String {
@@ -345,28 +468,47 @@ enum DeliveryMail {
         return domain.isEmpty ? "Unknown sender" : shorten(domain, to: 40)
     }
 
-    /// Which package an email is about, so "Delivered" can replace its "Out for
-    /// delivery": a tracking or order number in the subject, or else the quoted item
-    /// name. Nil if there's neither (then each email gets its own notification).
+    /// Which package an email is about, so a "Delivered" can take the place of its "Out
+    /// for delivery" (DeliveryList): its tracking number, or else the item named in
+    /// quotes (with the order number, if there is one, and "+N" for more items). Nil if
+    /// there's neither: a split shipment's emails that only give the order number stay
+    /// apart.
     static func packageKey(subject: String, store: String) -> String? {
         let text = tidy(subject)
         let prefix = store.lowercased() + ":"
-        if let order = text.range(of: #"\b\d{3}-\d{7}-\d{7}\b"#, options: .regularExpression) {
-            return prefix + text[order]                                       // Amazon's order numbers
+        if let number = trackingNumbers(in: text, store: store).first { return prefix + number.uppercased() }
+        guard let quoted = quotedName(text) else { return nil }
+        var name = quoted.name.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        guard !name.isEmpty else { return nil }
+        if let more = quoted.after.lowercased().range(of: #"and \d+ more"#, options: .regularExpression) {
+            name += " +" + quoted.after.lowercased()[more].filter(\.isNumber)
         }
-        if let number = trackingNumbers(in: text).first { return prefix + number.lowercased() }
-        if let quoted = quotedName(text) {
-            let name = quoted.name.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
-            if !name.isEmpty { return prefix + String(name.prefix(80)) }
+        let order = orderNumber(in: text).map { $0 + ":" } ?? ""
+        return prefix + order + String(name.prefix(80))
+    }
+
+    /// An order number: Amazon's "112-1234567-1234567", or "#W123456789".
+    static func orderNumber(in text: String) -> String? {
+        if let found = text.range(of: #"\b\d{3}-\d{7}-\d{7}\b"#, options: .regularExpression) { return String(text[found]) }
+        if let found = text.range(of: #"#\s?[A-Za-z0-9-]{4,}"#, options: .regularExpression) {
+            return text[found].filter { $0 != "#" && $0 != " " }.uppercased()
         }
         return nil
     }
 
-    /// Words of 10 or more letters and digits with at least 8 digits: "9400111899223344556677",
-    /// "771234567890", "1Z999AA10123456784".
-    static func trackingNumbers(in text: String) -> [String] {
-        text.split(whereSeparator: { !($0.isASCII && ($0.isLetter || $0.isNumber)) })
-            .filter { $0.count >= 10 && $0.filter(\.isNumber).count >= 8 }.map(String.init)
+    /// Tracking numbers, by the carriers' formats: UPS "1Z…", Amazon "TBA…", USPS's 20–22
+    /// digits or "EA123456789US", FedEx's 12 or 15 digits, and DHL's 10 digits (only from
+    /// DHL: other 10- and 11-digit numbers are usually phone numbers).
+    static func trackingNumbers(in text: String, store: String = "") -> [String] {
+        text.split(whereSeparator: { !($0.isASCII && ($0.isLetter || $0.isNumber)) }).map(String.init).filter { word in
+            let upper = word.uppercased()
+            let digits = word.allSatisfy(\.isNumber)
+            if upper.hasPrefix("1Z") && word.count == 18 { return true }
+            if upper.hasPrefix("TBA") && word.count == 15 && word.dropFirst(3).allSatisfy(\.isNumber) { return true }
+            if word.count == 13, upper.range(of: #"^[A-Z]{2}\d{9}[A-Z]{2}$"#, options: .regularExpression) != nil { return true }
+            if digits && [12, 15, 20, 22].contains(word.count) { return true }
+            return digits && word.count == 10 && store == "DHL"
+        }
     }
 
     /// The notification text when no item is named: the subject without the store's
@@ -384,7 +526,7 @@ enum DeliveryMail {
             }
             if rest.contains(where: { $0.isLetter }) { text = String(rest) }
         }
-        for number in Set(trackingNumbers(in: text)) where number.count > 6 {
+        for number in Set(trackingNumbers(in: text, store: store)) {
             text = text.replacingOccurrences(of: number, with: "…" + number.suffix(4))
         }
         if let first = text.first, first.isLowercase { text = first.uppercased() + text.dropFirst() }
@@ -581,8 +723,12 @@ enum HeaderText {
     /// Splits raw header lines into lowercase name → value, joining folded lines. The
     /// first of a repeated header wins (for Authentication-Results, that's Gmail's own,
     /// added on top). Each line is read as UTF-8, or as Latin-1 if it isn't valid UTF-8.
-    static func parse(_ data: [UInt8]) -> [String: String] {
+    static func parse(_ data: [UInt8]) -> [String: String] { parseInOrder(data).fields }
+
+    /// The same, and the header names in the order they first appear.
+    static func parseInOrder(_ data: [UInt8]) -> (fields: [String: String], order: [String]) {
         var result: [String: String] = [:]
+        var order: [String] = []
         var name: String?
         var start = 0
         while start <= data.count {
@@ -600,6 +746,7 @@ enum HeaderText {
                 guard !key.isEmpty, !key.contains(" ") else { name = nil; continue }
                 if result[key] == nil {
                     name = key
+                    order.append(key)
                     result[key] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
                 } else {
                     name = nil                                    // a repeat: its folded lines aren't added either
@@ -608,7 +755,7 @@ enum HeaderText {
                 name = nil
             }
         }
-        return result
+        return (result, order)
     }
 
     /// Decodes "=?UTF-8?B?…?=" / "=?utf-8?Q?…?=" words (RFC 2047), the way mail
@@ -831,18 +978,25 @@ final class IMAPConnection {
         return bytes
     }
 
-    /// Gmail turned the password down (as opposed to a passing problem on Gmail's side).
+    /// Gmail turned the sign-in down: the password, or Google wants a sign-in in the
+    /// browser first ("[ALERT] Please log in via your web browser").
     static func isRefusedLogin(_ text: String) -> Bool {
         let t = text.lowercased()
         return t.contains("authenticationfailed") || t.contains("invalid credentials")
-            || t.contains("application-specific password") || t.contains("webalert")
+            || t.contains("application-specific password") || needsBrowserSignIn(text)
     }
 
-    /// A passing problem on Gmail's side: worth trying again later.
+    static func needsBrowserSignIn(_ text: String) -> Bool {
+        let t = text.lowercased()
+        return t.contains("webalert") || t.contains("web browser") || t.contains("web login")
+    }
+
+    /// A passing problem on Gmail's side: worth trying again later ("[UNAVAILABLE]",
+    /// "[SERVERBUG]", "Account exceeded command or bandwidth limits").
     static func isPassing(_ text: String) -> Bool {
         let t = text.lowercased()
         return ["unavailable", "inuse", "[limit]", "overquota", "temporar", "try again", "too many", "simultaneous",
-                "later", "busy", "throttl"].contains { t.contains($0) }
+                "later", "busy", "throttl", "serverbug", "exceeded", "bandwidth"].contains { t.contains($0) }
     }
 
     /// "… {123}" → 123 (also "{123+}"). A number too big for Int gives Int.max, which
@@ -885,9 +1039,12 @@ enum IMAPReply {
     /// "* 3 FETCH (UID 12 X-GM-MSGID 1278… BODY[HEADER.FIELDS (…)] {n}\r\n<n bytes>)" → [12: headers].
     /// Each response is read on its own, its literals by their length, so an unsolicited
     /// "* 2 FETCH (UID 50 FLAGS (\Seen))" between two emails can't move headers onto
-    /// the wrong email, and text inside a literal is never read as a response. Gmail's
-    /// own ID for the email (X-GM-MSGID, in hex as Gmail's links use it) is added as
-    /// ":gmail-id", a name no real header can have.
+    /// the wrong email, and text inside a literal is never read as a response. Added,
+    /// under names no real header can have: ":gmail-id", Gmail's own ID for the email
+    /// (X-GM-MSGID, in hex as Gmail's links use it); ":gmail-checked", saying Gmail had
+    /// the chance to check the sender; and ":gmail-verdict", Gmail's check. That's the
+    /// first Authentication-Results, which Gmail puts on top of every email it receives,
+    /// and only if it comes before From: one further down is the sender's own.
     static func fetchedHeaders(_ bytes: [UInt8]) -> [Int: [String: String]] {
         var result: [Int: [String: String]] = [:]
         var index = 0
@@ -916,8 +1073,13 @@ enum IMAPReply {
             let response = String(decoding: text, as: UTF8.self)
             guard response.hasPrefix("* "), response.uppercased().contains(" FETCH ("), let headers,
                   let uid = number(after: "UID", in: response) else { continue }
-            var fields = HeaderText.parse(headers)
-            fields[":gmail-id"] = nil
+            let parsed = HeaderText.parseInOrder(headers)
+            var fields = parsed.fields
+            fields[":gmail-checked"] = "1"
+            if let verdict = parsed.order.firstIndex(of: "authentication-results"),
+               verdict < (parsed.order.firstIndex(of: "from") ?? parsed.order.count) {
+                fields[":gmail-verdict"] = fields["authentication-results"]
+            }
             if let found = response.range(of: #"\bX-GM-MSGID\s+\d{1,20}"#, options: [.regularExpression, .caseInsensitive]),
                let id = UInt64(response[found].split(separator: " ").last ?? "") {
                 fields[":gmail-id"] = String(id, radix: 16)
@@ -1100,6 +1262,29 @@ struct KeychainTool {
         else { return false }
         _ = run(["-i"], input: "add-generic-password -U -s \(service) -a \(account) -l \(label) -w \(secret)\n")
         return find(service: service, account: account) == .found(secret)
+    }
+
+    /// Saves several items as one: if one can't be saved, the ones saved before it are
+    /// put back as they were, so a failed save never leaves half of a setup behind.
+    @discardableResult
+    func saveAll(service: String, _ items: [(account: String, label: String, secret: String)]) -> Bool {
+        var saved: [(account: String, label: String, before: KeychainRead)] = []
+        for item in items {
+            let before = find(service: service, account: item.account)
+            if save(service: service, account: item.account, label: item.label, secret: item.secret) {
+                saved.append((item.account, item.label, before))
+                continue
+            }
+            for done in saved.reversed() {
+                switch done.before {
+                case .found(let old): save(service: service, account: done.account, label: done.label, secret: old)
+                case .missing: delete(service: service, account: done.account)
+                case .unavailable: break                        // can't tell what was there: leave it
+                }
+            }
+            return false
+        }
+        return true
     }
 
     /// True if the item is gone (or was never there).
@@ -1317,32 +1502,27 @@ struct CheckFailure: Error, Equatable {
                           advice: "Your regular Google password doesn't work here. Make an app password "
                             + "(2-Step Verification has to be on) and paste it below.",
                           needsSetup: true, stopChecking: true, link: CheckFailure.appPasswords)
-            } else if text.localizedCaseInsensitiveContains("webalert") {
-                self.init(message: "Google blocked the sign-in as unusual.",
-                          advice: "Open Gmail in your browser once, then try again.",
-                          needsSetup: true, stopChecking: true)
+            } else if IMAPConnection.needsBrowserSignIn(text) {
+                self.init(message: "Google wants you to sign in to Gmail in your browser.",
+                          advice: "Sign in to Gmail in your browser once, then try again.",
+                          needsSetup: true, stopChecking: true, link: "https://mail.google.com")
             } else {
                 self.init(message: "Gmail didn't accept the app password.",
                           advice: "Check the address, or make a new app password and paste it below.",
                           needsSetup: true, stopChecking: true, link: CheckFailure.appPasswords)
             }
         case .notAllowed(let text):
+            // Personal Gmail accounts can't turn IMAP off (since January 2025); a Google
+            // Workspace administrator can.
             let lower = text.lowercased()
             if lower.contains("imap") && (lower.contains("not enabled") || lower.contains("disabled")) {
-                if lower.contains("domain") || lower.contains("administrator") {
-                    self.init(message: "IMAP is turned off for your organization.",
-                              advice: "Set up Gmail again with the Google script instead.", needsSetup: true)
-                } else {
-                    self.init(message: "IMAP is turned off for this Gmail account.",
-                              advice: "Turn it on in Gmail's settings (Forwarding and POP/IMAP), or set up Gmail "
-                                + "again with the Google script.", needsSetup: true)
-                }
+                self.init(message: "IMAP is turned off for this account.",
+                          advice: "Your Google Workspace administrator can turn it on.", needsSetup: true)
             } else {
                 let said = text.replacingOccurrences(of: #"^(\[[^\]]*\]\s*)+|\s*\((Failure|Success)\)\s*$"#, with: "",
                                                      options: .regularExpression)
                 self.init(message: "Gmail turned down the sign-in.",
-                          advice: "Gmail said: “\(DeliveryMail.shorten(said, to: 160))” Set up Gmail again, "
-                            + "or use the Google script instead.", needsSetup: true)
+                          advice: "Gmail said: “\(DeliveryMail.shorten(said, to: 160))”", needsSetup: true)
             }
         case .offline: self = .offline
         case .failed(let text): self.init(message: text)
@@ -1521,12 +1701,31 @@ enum DeliveryList {
         }.prefix(maxCount))
     }
 
-    /// The list with new deliveries (oldest first) added at the top. A package's newer
-    /// email replaces its older one: "Delivered" takes the place of "Out for delivery".
+    /// A "Delivered" and an "Out for delivery" for the same package (DeliveryMail.packageKey)
+    /// are the same parcel only if they're this close together: a repeat order of the
+    /// same thing weeks later is another parcel.
+    static let samePackageWithin: TimeInterval = 2 * 24 * 3600
+
+    /// The "Out for delivery" a new delivery takes the place of, if any: only a
+    /// "Delivered" replaces, only an "Out for delivery", of the same package, sent within
+    /// 2 days before it. Never the other way round.
+    static func replaced(by delivery: Delivery, in list: [Delivery]) -> Delivery? {
+        guard delivery.kind == .delivered, let package = delivery.package, let date = delivery.date else { return nil }
+        return list.first { old in
+            guard old.kind == .outForDelivery, old.package == package, let then = old.date else { return false }
+            return date >= then && date.timeIntervalSince(then) <= samePackageWithin
+        }
+    }
+
+    /// The list with new deliveries (oldest first) added at the top. A "Delivered" takes
+    /// the place of its package's "Out for delivery", and its notification (`replaces`).
     static func adding(_ new: [Delivery], to list: [Delivery], now: Date = Date()) -> [Delivery] {
         var result = list
-        for delivery in new {
-            if let package = delivery.package { result.removeAll { $0.package == package } }
+        for var delivery in new {
+            if let old = replaced(by: delivery, in: result) {
+                delivery.replaces = delivery.replaces ?? old.notificationID
+                result.removeAll { $0.key == old.key }
+            }
             result.removeAll { $0.key == delivery.key }
             result.insert(delivery, at: 0)
         }
