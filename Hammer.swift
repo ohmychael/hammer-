@@ -1483,19 +1483,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(action("Set Up Delivery Alerts…", #selector(setUpDeliveries)))
             return
         }
-        if let problem = watcher.problem {
-            for line in Self.wrap(problem) { menu.addItem(hint(line)) }
-        }
-        if watcher.needsSetup {
-            menu.addItem(action("Set Up Gmail Again…", #selector(setUpDeliveries)))
+        if let failure = watcher.failure {
+            menu.addItem(hint(failure.message))                     // one short line; Fix… says what to do
+            if failure.hasFix || watcher.needsSetup { menu.addItem(action("Fix…", #selector(fixDeliveries))) }
+        } else if watcher.needsSetup {
+            menu.addItem(action("Set Up Gmail Again…", #selector(setUpGmailAgain)))
         }
         if watcher.notificationsOff {
-            menu.addItem(hint("Notifications are off for Hammer, so alerts can't show."))
+            menu.addItem(hint("Notifications are off for Hammer."))
             menu.addItem(action("Turn On Notifications…", #selector(openNotificationSettings)))
         }
         let recent = watcher.recent.prefix(3)
         if recent.isEmpty {
-            menu.addItem(hint("No deliveries yet. Hammer checks Gmail every 3 minutes."))
+            menu.addItem(hint("No deliveries in the last 7 days."))
         }
         for delivery in recent {
             let item = NSMenuItem(title: deliveryTitle(delivery), action: #selector(openDelivery(_:)), keyEquivalent: "")
@@ -1515,6 +1515,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         settings.addItem(action("Check Now", #selector(checkDeliveriesNow)))
         settings.addItem(action("Send Test Notification", #selector(sendTestDelivery)))
+        settings.addItem(checked(action("Out for Delivery Alerts", #selector(toggleOutForDeliveryAlerts)),
+                                 watcher.outForDeliveryAlerts))
         settings.addItem(.separator())
         settings.addItem(action("Change Gmail Account…", #selector(setUpDeliveries)))
         settings.addItem(action("Turn Off Delivery Alerts", #selector(turnOffDeliveries)))
@@ -1525,7 +1527,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// "eBay · Apple iPhone 15 Pro Max · 2:14 PM" (or the date, if not today).
     private func deliveryTitle(_ delivery: Delivery) -> String {
-        var title = DeliveryMail.shorten("\(delivery.kind == .problem ? "⚠︎ " : "")\(delivery.store) · \(delivery.body)", to: 48)
+        let mark = delivery.kind == .problem ? "⚠︎ " : delivery.kind == .outForDelivery ? "Out for delivery · " : ""
+        var title = DeliveryMail.shorten("\(mark)\(delivery.store) · \(delivery.body)", to: 48)
         if let date = delivery.date {
             if Calendar.current.isDateInToday(date) {
                 title += " · " + clockTime(date)
@@ -1538,24 +1541,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return title
     }
 
-    /// Splits a long note into menu-width lines.
-    private static func wrap(_ text: String, width: Int = 52) -> [String] {
-        var lines: [String] = []
-        var line = ""
-        for word in text.split(separator: " ") {
-            if !line.isEmpty && line.count + word.count + 1 > width {
-                lines.append(line)
-                line = ""
-            }
-            line += line.isEmpty ? String(word) : " " + word
-        }
-        if !line.isEmpty { lines.append(line) }
-        return lines
+    private func activateForDialog() {
+        if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
     }
 
+    /// Choose how Hammer reads Gmail: the Google script (suggested) or an app password.
     @objc private func setUpDeliveries() {
         guard !DeliveryWatcher.shared.isSettingUp else { return }      // the first check is still running
-        if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+        activateForDialog()
         let alert = NSAlert()
         alert.messageText = "Delivery alerts from Gmail"
         alert.informativeText = """
@@ -1564,30 +1557,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         To read them, you add a small script to your own Google account. It takes \
         about 2 minutes and needs no app password. The script only tells Hammer the \
-        sender and subject of recent delivery emails.
+        sender, subject and date of recent delivery emails.
         """
         alert.addButton(withTitle: "Start")
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Use an App Password Instead")
         switch alert.runModal() {
         case .alertFirstButtonReturn: setUpWithScript()
-        case .alertThirdButtonReturn: setUpWithAppPassword()
+        case .alertThirdButtonReturn: setUpWithAppPassword(note: nil)
         default: return
         }
+    }
+
+    /// Set up the same way again: straight to the app password, or a fresh script.
+    @objc private func setUpGmailAgain() {
+        guard !DeliveryWatcher.shared.isSettingUp else { return }
+        switch DeliveryWatcher.shared.source {
+        case .appPassword: setUpWithAppPassword(note: nil)
+        case .script: setUpWithScript()
+        case nil: setUpDeliveries()
+        }
+    }
+
+    /// What's wrong and what to do about it, from the one-line problem in the menu.
+    @objc private func fixDeliveries() {
+        let watcher = DeliveryWatcher.shared
+        guard !watcher.isSettingUp, let failure = watcher.failure else { return setUpGmailAgain() }
+        if watcher.source == .appPassword && failure.stopChecking {
+            return setUpWithAppPassword(note: failure.setupMessage)    // e.g. a refused app password: type a new one
+        }
+        activateForDialog()
+        let alert = NSAlert()
+        alert.messageText = failure.message
+        alert.informativeText = failure.advice.isEmpty ? "Hammer will try again in a few minutes." : failure.advice
+        var choices: [() -> Void] = []
+        if let link = failure.link, let url = URL(string: link) {
+            alert.addButton(withTitle: link.contains("script.google.com") ? "Open Google Apps Script" : "Open Google Account")
+            choices.append { NSWorkspace.shared.open(url) }
+        }
+        if failure.needsSetup || watcher.needsSetup {
+            alert.addButton(withTitle: "Set Up Gmail Again…")
+            // An app-password problem that isn't the password (IMAP turned off): maybe use the script instead.
+            choices.append { [weak self] in
+                if watcher.source == .appPassword { self?.setUpDeliveries() } else { self?.setUpGmailAgain() }
+            }
+        }
+        alert.addButton(withTitle: choices.isEmpty ? "OK" : "Cancel")
+        let response = alert.runModal()
+        let index = response == .alertFirstButtonReturn ? 0 : response == .alertSecondButtonReturn ? 1 : 2
+        if index < choices.count { choices[index]() }
     }
 
     /// Copies the script, opens a new Google Apps Script project, and walks through
     /// deploying it; then asks for the web app address.
     private func setUpWithScript() {
         let key = DeliveryScript.newKey()
-        copyScript(key: key)
+        ScriptClipboard.copy(DeliveryScript.source(key: key))
         if let url = URL(string: "https://script.new") { NSWorkspace.shared.open(url) }
         askForScriptAddress(key: key, address: "", note: nil)
-    }
-
-    private func copyScript(key: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(DeliveryScript.source(key: key), forType: .string)
     }
 
     /// The steps, and a box for the web app address. Shown again, with the problem,
@@ -1596,13 +1623,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var address = address
         var note = note
         while true {
-            if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+            activateForDialog()
             let alert = NSAlert()
             alert.messageText = "Add the script to your Google account"
             alert.informativeText = (note.map { "⚠︎ " + $0 + "\n\n" } ?? "") + """
-            The script is copied, and a new Google Apps Script project is open in your browser. \
-            It has to be in the Google account your deliveries go to: if you use several, check \
-            the picture at the top right of the editor. Drag this window aside as you go.
+            The script is copied (on this Mac only), and a new Google Apps Script project is \
+            open in your browser. It has to be in the Google account your deliveries go to: if \
+            you use several, check the picture at the top right of the editor. Drag this window \
+            aside as you go.
 
             1. Click in the code, press ⌘A then ⌘V to replace it, and press ⌘S to save.
             2. Click Deploy → New deployment. Click the gear ⚙ next to "Select type" and choose Web app.
@@ -1613,7 +1641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             5. Copy the Web app URL (it ends in /exec), paste it below, and click Turn On.
 
             Google's permission screen lists everything a Gmail script could do. This one only \
-            reads the sender and subject of delivery emails; you can see that in the code.
+            reads the sender, subject and date of delivery emails; you can see that in the code.
             """
             let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
             field.placeholderString = "https://script.google.com/macros/s/…/exec"
@@ -1634,23 +1662,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let choice = alert.runModal()
             address = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if choice == .alertThirdButtonReturn {
-                copyScript(key: key)
+                ScriptClipboard.copy(DeliveryScript.source(key: key))
                 note = "Copied again."
                 continue
             }
-            guard choice == .alertFirstButtonReturn else { return }
+            guard choice == .alertFirstButtonReturn else {
+                ScriptClipboard.clearIfOurs()                 // the key is no use now
+                return
+            }
             guard let url = DeliveryScript.webAppURL(address) else {
                 note = "That isn't the web app URL. It starts with https://script.google.com/macros/s/ and ends in /exec."
                 continue
             }
             let tried = address
-            DeliveryWatcher.shared.turnOn(scriptURL: url, key: key) { [weak self] error in
+            DeliveryWatcher.shared.turnOn(scriptURL: url, key: key) { [weak self] failure in
                 guard let delegate = self else { return }
                 Task { @MainActor in
-                    if let error {
-                        delegate.askForScriptAddress(key: key, address: tried, note: error)
+                    if let failure {
+                        delegate.askForScriptAddress(key: key, address: tried, note: failure.setupMessage)
                     } else {
-                        delegate.deliverySetupFinished(error: nil) {}
+                        ScriptClipboard.clearIfOurs()         // Hammer has the key now
+                        delegate.deliverySetupFinished()
                     }
                 }
             }
@@ -1658,17 +1690,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func setUpWithAppPassword() {
-        if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
-        var email = DeliveryWatcher.shared.email ?? ""
-        var note: String?
+    /// The email and app password, with what went wrong last time (if anything) at the top.
+    private func setUpWithAppPassword(note: String?, email typed: String? = nil) {
+        activateForDialog()
+        var email = typed ?? DeliveryWatcher.shared.email ?? ""
+        var note = note
         while true {
             let alert = NSAlert()
             alert.messageText = "Delivery alerts from Gmail"
             alert.informativeText = (note.map { "⚠︎ " + $0 + "\n\n" } ?? "") + """
             Hammer looks at your Gmail every 3 minutes for "delivered" emails from eBay, \
             Amazon, UPS, USPS, FedEx and other stores, and shows a notification. It reads \
-            only the sender and subject, and never marks anything as read.
+            only a few headers (sender, subject, date), and never marks anything as read.
 
             It needs a Gmail app password, not your regular password:
             1. Click Get App Password (2-Step Verification has to be on).
@@ -1692,7 +1725,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let choice = alert.runModal()
             email = emailField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if choice == .alertSecondButtonReturn {
-                if let url = URL(string: "https://myaccount.google.com/apppasswords") { NSWorkspace.shared.open(url) }
+                if let url = URL(string: CheckFailure.appPasswords) { NSWorkspace.shared.open(url) }
                 note = nil
                 continue
             }
@@ -1705,34 +1738,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 note = "That isn't an app password. It's 16 letters, shown in four groups of four."
                 continue
             }
-            DeliveryWatcher.shared.turnOn(email: email, password: password) { [weak self] error in
+            let tried = email
+            DeliveryWatcher.shared.turnOn(email: email, password: password) { [weak self] failure in
                 guard let delegate = self else { return }
-                Task { @MainActor in delegate.deliverySetupFinished(error: error) { delegate.setUpWithAppPassword() } }
+                Task { @MainActor in
+                    if let failure {
+                        delegate.setUpWithAppPassword(note: failure.setupMessage, email: tried)
+                    } else {
+                        delegate.deliverySetupFinished()
+                    }
+                }
             }
             return
         }
     }
 
-    private func deliverySetupFinished(error: String?, tryAgain: () -> Void) {
+    private func deliverySetupFinished() {
         rebuildMenuSoon()
-        if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+        activateForDialog()
         let alert = NSAlert()
-        if let error {
-            alert.messageText = "Couldn't turn on delivery alerts"
-            alert.informativeText = error
-            alert.addButton(withTitle: "Try Again")
-            alert.addButton(withTitle: "Cancel")
-            if alert.runModal() == .alertFirstButtonReturn { tryAgain() }
-        } else {
-            alert.messageText = "Delivery alerts are on"
-            let account = DeliveryWatcher.shared.email ?? ""
-            alert.informativeText = (account.isEmpty ? "" : "Reading deliveries from \(account). ")
-                + "Hammer will show a notification when a package is delivered. "
-                + "If macOS asks, allow notifications from Hammer."
-            alert.addButton(withTitle: "Done")
-            alert.addButton(withTitle: "Send Test Notification")
-            if alert.runModal() == .alertSecondButtonReturn { DeliveryWatcher.shared.sendTest() }
-        }
+        alert.messageText = "Delivery alerts are on"
+        let account = DeliveryWatcher.shared.email ?? ""
+        alert.informativeText = (account.isEmpty ? "" : "Reading deliveries from \(account). ")
+            + "Hammer will show a notification when a package is delivered. "
+            + "If macOS asks, allow notifications from Hammer."
+        alert.addButton(withTitle: "Done")
+        alert.addButton(withTitle: "Send Test Notification")
+        if alert.runModal() == .alertSecondButtonReturn { DeliveryWatcher.shared.sendTest() }
     }
 
     @objc private func openDelivery(_ sender: NSMenuItem) {
@@ -1749,8 +1781,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DeliveryWatcher.shared.sendTest()
     }
 
+    @objc private func toggleOutForDeliveryAlerts() {
+        DeliveryWatcher.shared.outForDeliveryAlerts.toggle()
+    }
+
     @objc private func turnOffDeliveries() {
-        DeliveryWatcher.shared.turnOff()
+        let route = DeliveryWatcher.shared.turnOff()
+        ScriptClipboard.clearIfOurs()
+        guard route == .script else { return }
+        activateForDialog()
+        let alert = NSAlert()
+        alert.messageText = "Delivery alerts are off"
+        alert.informativeText = "Your Google script is still deployed. To remove it, delete its project at script.google.com."
+        alert.addButton(withTitle: "Done")
+        alert.addButton(withTitle: "Open Google Apps Script")
+        if alert.runModal() == .alertSecondButtonReturn, let url = URL(string: CheckFailure.scripts) {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     @objc private func openNotificationSettings() {
@@ -2666,6 +2713,7 @@ enum Hammer {
             case "dim-check": exit(runDimCheck())
             case "player-check": PlayerCheck.run(args)
             case "edge-check": EdgeCheck.run()
+            case "keychain-check": exit(KeychainCheck.run())
             case "tour":
                 guard args.count >= 2 else { print("usage: Hammer tour <folder> [--demo]"); exit(2) }
                 let demo = args.contains("--demo")

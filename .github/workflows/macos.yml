@@ -78,6 +78,16 @@ jobs:
           cat /tmp/dim.txt
           grep -q "^exit 0$" /tmp/dim.txt
 
+      - name: Keychain check (delivery alerts' way of keeping secrets, round trip)
+        timeout-minutes: 2
+        run: |
+          set +e
+          perl -e 'alarm shift; exec @ARGV' 60 /tmp/Hammer keychain-check > /tmp/keychain.txt 2>&1
+          echo "exit $?" >> /tmp/keychain.txt
+          cat /tmp/keychain.txt
+          echo "::notice title=Keychain check::$(tr '\n' ' ' < /tmp/keychain.txt)"
+          grep -q "^exit 0$" /tmp/keychain.txt
+
       - name: Install with signing
         timeout-minutes: 20
         run: |
