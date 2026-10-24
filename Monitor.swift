@@ -645,6 +645,7 @@ struct MonitorCheck {
     /// (nil from Terminal, which can't tell).
     var softwareDim: SoftwareDimState?
     var softwareDimLevel = 100            // the Brightness slider's level, while dimming in software
+    var missingCalls: [String] = []       // private macOS calls Hammer couldn't find (a later macOS may drop one)
 
     /// Runs the check. `bus` gives the connection for a registry ID (nil if macOS gives none);
     /// `defaultBus` is macOS's default connection, tried last if no port answers.
@@ -811,6 +812,7 @@ struct MonitorCheck {
         let external = ports.filter { !$0.port.isDefault }.count
         lines.append("External connections: \(external)"
                      + (otherConnections.isEmpty ? "" : " · also \(otherConnections.joined(separator: ", "))"))
+        if !missingCalls.isEmpty { lines.append("Not in this macOS: " + missingCalls.joined(separator: ", ")) }
         if let line = softwareDimLine { lines.append(line) }
 
         var shown: [[String]] = []
@@ -913,7 +915,8 @@ struct MonitorCheck {
     var advice: [String] {
         var lines = steps
         if softwareDim == .on && answering == nil {
-            lines.append("Meanwhile Hammer dims the picture in software (\(softwareDimLevel)%).")
+            lines.append(softwareDimLevel < 100 ? "Meanwhile Hammer dims the picture in software (\(softwareDimLevel)%)."
+                         : "Meanwhile Hammer's Brightness slider dims the picture in software.")
         }
         return lines
     }

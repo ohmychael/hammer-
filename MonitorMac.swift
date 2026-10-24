@@ -31,6 +31,13 @@ enum AVServiceCalls {
     private static let writeFunction = lookUp("IOAVServiceWriteI2C", as: TransferI2C.self)
     private static let unsupported = Int32(bitPattern: 0xE00002C7)     // kIOReturnUnsupported
 
+    /// The calls this macOS doesn't have, for the check's report.
+    static var missing: [String] {
+        [("IOAVServiceCreate", createFunction == nil), ("IOAVServiceCreateWithService", createWithServiceFunction == nil),
+         ("IOAVServiceReadI2C", readFunction == nil), ("IOAVServiceWriteI2C", writeFunction == nil),
+         ("IOAVServiceCopyEDID", !AVServiceBus.canCopyEDID)].filter { $0.1 }.map { $0.0 }
+    }
+
     /// macOS's default display connection: what plain `m1ddc set …` talks to.
     static func createDefault() -> IOAVService? {
         guard let create = createFunction, let service = create(nil) else { return nil }
@@ -80,6 +87,8 @@ final class AVServiceBus: DDCBus {
         let edid = Unmanaged<CFData>.fromOpaque(data).takeRetainedValue() as Data   // ours to release either way
         return status == 0 ? [UInt8](edid) : nil
     }
+
+    static var canCopyEDID: Bool { copyEDIDFunction != nil }
 
     /// IOAVServiceCopyEDID(service, &data): private like the rest, looked up at run
     /// time so a macOS without it still builds and runs Hammer.
@@ -261,9 +270,11 @@ enum MacMonitors {
     /// The full check. Call `scan()` on the main thread first; this part talks to
     /// the monitor and takes a few seconds, so run it on the monitor queue.
     static func check(_ scan: Scan) -> MonitorCheck {
-        MonitorCheck.run(mac: mac(), screens: scan.screens, entries: scan.entries,
-                         bus: { id in scan.services[id].map { AVServiceBus($0) } },
-                         defaultBus: scan.defaultService.map { AVServiceBus($0) })    // run() decides whether to use it
+        var check = MonitorCheck.run(mac: mac(), screens: scan.screens, entries: scan.entries,
+                                     bus: { id in scan.services[id].map { AVServiceBus($0) } },
+                                     defaultBus: scan.defaultService.map { AVServiceBus($0) })    // run() decides whether to use it
+        check.missingCalls = AVServiceCalls.missing
+        return check
     }
 }
 

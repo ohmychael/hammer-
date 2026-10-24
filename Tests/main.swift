@@ -1009,10 +1009,17 @@ check.softwareDim = .on; check.softwareDimLevel = 40
 expect(check.advice.count == 4 && check.advice.last == "Meanwhile Hammer dims the picture in software (40%)."
        && check.details.contains("External connections: 1\nSoftware dimming: on, at 40%"),
        "dimming in software meanwhile: said, and in the report\n\(check.text)")
+check.softwareDimLevel = 100
+expect(check.advice.last == "Meanwhile Hammer's Brightness slider dims the picture in software.",
+       "at 100%: no \"dims (100%)\"")
 check.softwareDim = .cantDim
 expect(!check.advice.joined().contains("Meanwhile")
        && check.details.contains("Software dimming: needed, but another app is changing the colors"), "can't dim: the report says why")
 check = runCheck(airEntries, airScreens, [201: FakeMonitor()])
+expect(!check.details.contains("Not in this macOS"), "every private call there: not mentioned")
+check.missingCalls = ["IOAVServiceReadI2C"]
+expect(check.details.contains("(Embedded)\nNot in this macOS: IOAVServiceReadI2C\n"),
+       "a private call macOS dropped: named in the report")
 check.softwareDim = .on
 expect(!check.advice.joined().contains("Meanwhile") && check.details.contains("Software dimming: on"),
        "the monitor answers: nothing about \"meanwhile\" (Hammer stops dimming in software)")
