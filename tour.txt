@@ -1,0 +1,51 @@
+tour: starting (demo: false)
+tour: plain-01-menu: opening
+tour: plain-01-menu: picture taken
+tour: plain-01-menu: open returned
+tour: plain-02-sub-youtube-options: opening
+tour: plain-02-sub-youtube-options: picture taken
+tour: plain-02-sub-youtube-options: open returned
+tour: plain-20-monitor-check: opening
+tour: plain-20-monitor-check: open returned
+tour: plain-20-monitor-check: picture taken
+tour: plain-21-youtube-dropdown: opening
+tour: plain-21-youtube-dropdown: open returned
+tour: plain-21-youtube-dropdown: picture taken
+Tour finished.
+exit 0
+tour: starting (demo: true)
+tour: demo-01-menu: opening
+tour: demo-01-menu: picture taken
+tour: demo-01-menu: open returned
+tour: demo-02-sub-all-lights--3-: opening
+tour: demo-02-sub-all-lights--3-: picture taken
+tour: demo-02-sub-all-lights--3-: open returned
+tour: demo-03-sub-bedroom-bulb---cloud: opening
+tour: demo-03-sub-bedroom-bulb---cloud: picture taken
+tour: demo-03-sub-bedroom-bulb---cloud: open returned
+tour: demo-04-sub-desk-strip: opening
+tour: demo-04-sub-desk-strip: picture taken
+tour: demo-04-sub-desk-strip: open returned
+tour: demo-05-sub-hallway-bulb---cloud: opening
+tour: demo-05-sub-hallway-bulb---cloud: picture taken
+tour: demo-05-sub-hallway-bulb---cloud: open returned
+tour: demo-06-sub-other-lights--1-: opening
+tour: demo-06-sub-other-lights--1-: picture taken
+tour: demo-06-sub-other-lights--1-: open returned
+tour: demo-07-sub-delivery-alerts: opening
+tour: demo-07-sub-delivery-alerts: picture taken
+tour: demo-07-sub-delivery-alerts: open returned
+tour: demo-08-sub-youtube-options: opening
+tour: demo-08-sub-youtube-options: picture taken
+tour: demo-08-sub-youtube-options: open returned
+tour: demo-20-turn-on-at: opening
+tour: demo-20-turn-on-at: picture taken
+tour: demo-20-turn-on-at: open returned
+tour: demo-21-rename: opening
+tour: demo-21-rename: picture taken
+tour: demo-21-rename: open returned
+tour: demo-22-delivery-setup: opening
+tour: demo-22-delivery-setup: picture taken
+tour: demo-22-delivery-setup: open returned
+Tour finished.
+exit 0
