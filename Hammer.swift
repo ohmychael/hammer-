@@ -2598,9 +2598,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Stands in for "every light" wherever a light ID is expected.
     private let allLightsID = "all-lights"
 
+    /// On or off as the bulb itself last reported (nil: no word from it, e.g. not connected).
+    private func reportedPower(_ light: GoveeLight) -> Bool? {
+        tourPower[light.id] ?? light.bluetoothID.flatMap { GoveeBluetooth.shared.isOn($0) }
+    }
+
     /// On or off as the bulbs themselves last reported, if they all agree.
     private func powerState(forID id: String) -> Bool? {
-        let states = lightsMatching(id).map { light in light.bluetoothID.flatMap { GoveeBluetooth.shared.isOn($0) } }
+        let states = lightsMatching(id).map(reportedPower)
         guard let first = states.first, let state = first, states.allSatisfy({ $0 == state }) else { return nil }
         return state
     }
@@ -2695,10 +2700,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.submenu = submenu
         // "On", "Off" or "2 on" on the right, from what the bulbs last reported.
-        let states = lightsMatching(id).map { light in
-            tourPower[light.id] ?? light.bluetoothID.flatMap { GoveeBluetooth.shared.isOn($0) }
+        if #available(macOS 14, *), let badge = LightBadge.text(lightsMatching(id).map(reportedPower)) {
+            item.badge = NSMenuItemBadge(string: badge)
         }
-        if #available(macOS 14, *), let badge = LightBadge.text(states) { item.badge = NSMenuItemBadge(string: badge) }
         return item
     }
 
