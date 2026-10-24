@@ -262,7 +262,7 @@ final class EdgePlayer {
             if outcome == .opened || outcome == .shown { self.cameFrom = from }   // where to go back to on the next hide
             let next = self.queued
             self.queued = nil
-            guard self.handle(outcome), let next else { return }
+            guard await self.handle(outcome), let next else { return }
             // The shortcut pressed again during a slow open (Edge starting, macOS's question) would
             // tuck the new window straight away: only a quick double press counts. A video to play
             // always does (it never tucks anything away).
@@ -286,7 +286,7 @@ final class EdgePlayer {
 
     /// Deals with how a press went. false: it showed you something, so a press that came
     /// meanwhile is dropped.
-    private func handle(_ outcome: EdgeController.Outcome) -> Bool {
+    private func handle(_ outcome: EdgeController.Outcome) async -> Bool {
         switch outcome {
         case .opened, .shown:
             permissionNeeded(false)
@@ -316,11 +316,12 @@ final class EdgePlayer {
             alert.informativeText = "To keep YouTube's Edge window in the corner and tuck it away with the shortcut, "
                 + "Hammer needs your OK: System Settings → Privacy & Security → Automation → Hammer → turn on Microsoft Edge."
                 + (openedAnyway ? "\n\nYouTube opened in Edge anyway." : "")
-                + "\n\nHammer only finds that window and opens, moves and minimizes it. It never reads your tabs, cookies, passwords or history."
+                + "\n\nHammer only finds that window and opens, moves and minimizes it. Its scripts tell Hammer only which window "
+                + "that is and where; your tabs' addresses, cookies, passwords and history never reach Hammer."
             alert.addButton(withTitle: "Open Settings")
             alert.addButton(withTitle: "Use Hammer's Player")
             alert.addButton(withTitle: "Not Now")
-            switch show(alert) {
+            switch await show(alert) {
             case .alertFirstButtonReturn:
                 Self.openAutomationSettings()
             case .alertSecondButtonReturn:
@@ -335,18 +336,19 @@ final class EdgePlayer {
             alert.informativeText = message
             alert.addButton(withTitle: "OK")
             alert.addButton(withTitle: "Use Hammer's Player")
-            if show(alert) == .alertSecondButtonReturn { useHammerPlayer() }
+            if await show(alert) == .alertSecondButtonReturn { useHammerPlayer() }
             return false
         }
         return true
     }
 
-    /// Presses while it's up are dropped, so alerts never stack.
-    private func show(_ alert: NSAlert) -> NSApplication.ModalResponse {
+    /// Presses while it's up are dropped, so alerts never stack. Shown from the run loop
+    /// (see `fromRunLoop` in Hammer.swift), so it doesn't hold up the rest of Hammer.
+    private func show(_ alert: NSAlert) async -> NSApplication.ModalResponse {
         busySince = Date()
         defer { busySince = nil }
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
-        return alert.runModal()
+        return await runModalFromRunLoop(alert)
     }
 }
 

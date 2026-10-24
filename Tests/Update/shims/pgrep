@@ -1,3 +1,11 @@
 #!/bin/bash
-# Stand-in for pgrep: is Hammer "running"?
+# Stand-in for pgrep: is Hammer "running"? $FAKE/crash-after: it crashes after that many more looks.
+if [ -f "$FAKE/crash-after" ]; then
+  n="$(cat "$FAKE/crash-after")"
+  if [ "$n" -le 0 ]; then
+    /bin/rm -f "$FAKE/crash-after" "$FAKE/running"
+  else
+    echo $((n - 1)) > "$FAKE/crash-after"
+  fi
+fi
 [ -f "$FAKE/running" ]

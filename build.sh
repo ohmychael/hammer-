@@ -248,7 +248,7 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
   <key>LSUIElement</key><true/>
   <key>NSLocalNetworkUsageDescription</key><string>Hammer looks for your Govee lights on your Wi-Fi network.</string>
   <key>NSBluetoothAlwaysUsageDescription</key><string>Hammer controls your Govee bulbs over Bluetooth.</string>
-  <key>NSAppleEventsUsageDescription</key><string>Hammer opens YouTube in your Microsoft Edge and keeps its window in the top-right corner. It never reads your tabs, cookies, passwords or history.</string>
+  <key>NSAppleEventsUsageDescription</key><string>Hammer opens YouTube in your Microsoft Edge and keeps its window in the top-right corner. Its scripts tell Hammer only which window that is and where; your tabs' addresses, cookies, passwords and history never reach Hammer.</string>
 </dict>
 </plist>
 PLIST
@@ -266,7 +266,7 @@ hammer_busy() {
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o comm= 2>/dev/null | grep -q 'Hammer$'
 }
 if hammer_busy; then
-  why="$(sed -n 2p "$BUSY" 2>/dev/null | tr -cd '[:alnum:] ,.-')"
+  why="$(sed -n 2p "$BUSY" 2>/dev/null | tr -cd '[:alnum:] ,.-' || true)"   # it may be gone already
   echo "Hammer is busy (${why:-in use}), so the update waits until you're done (at most 30 minutes)."
   if [ -n "${HAMMER_STATUS_FILE:-}" ]; then
     printf 'state=waiting\ntime=%s\nversion=%s\nmessage=%s\ndetail=\n' "$(date +%s)" "$VERSION" \
@@ -279,16 +279,27 @@ fi
 # 4. Swap it in. The current Hammer is kept aside until the new one has started
 # (it writes ~/Hammer/.launched); if it doesn't, the current one goes back, so
 # you're never left without it.
-started() {   # the new Hammer said it has started, and it's still running
+# The new Hammer must say it has started (within 20 s), then keep running for
+# another 20 s: most of its work with your lights, monitor and Gmail happens in
+# its first seconds, so a version that crashes there goes back too.
+STAY=20
+started() {
+  local i
   for ((i = 0; i < 40; i++)); do
-    if [ "$(sed -n 1p "$LAUNCHED" 2>/dev/null)" = "$VERSION" ]; then
-      sleep 1
-      pgrep -x Hammer >/dev/null 2>&1
-      return
-    fi
+    [ "$(sed -n 1p "$LAUNCHED" 2>/dev/null)" = "$VERSION" ] && break
     sleep 0.5
   done
-  return 1
+  if [ "$i" -ge 40 ]; then
+    echo "Hammer $VERSION opened but didn't finish starting within 20 seconds."
+    return 1
+  fi
+  for ((i = 0; i < STAY; i++)); do
+    sleep 1
+    if ! pgrep -x Hammer >/dev/null 2>&1; then
+      echo "Hammer $VERSION started, then quit within $STAY seconds."
+      return 1
+    fi
+  done
 }
 put_back() {
   stop_hammer
@@ -316,7 +327,6 @@ if ! open "$APP" --args --login; then
   exit 3
 fi
 if ! started; then
-  echo "Hammer $VERSION opened but didn't finish starting within 20 seconds."
   put_back
   exit 3
 fi

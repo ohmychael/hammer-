@@ -37,6 +37,7 @@ app = open(f"{repo}/Hammer.swift").read()
 start = app.index("    // MARK: Deliveries (see DeliveryAlerts.swift")
 end = app.index("    // MARK: Light modes (for the checkmarks)")
 open(f"{work}/Menu.swift", "w").write('''import Foundation
+@MainActor func fromRunLoop(_ body: @escaping @MainActor () -> Void) { body() }
 @MainActor final class MenuShell {
     private func label(_ t: String) -> NSMenuItem { NSMenuItem(title: t, action: nil, keyEquivalent: "") }
     private func hint(_ t: String) -> NSMenuItem { label(t) }

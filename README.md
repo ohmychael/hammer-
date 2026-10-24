@@ -6,9 +6,9 @@ A small Mac menu bar app for the desk:
 - **Govee lights** — on/off, brightness, color and white presets, one at a time or all together. Reaches each light the best way available:
   - **Wi-Fi** for lights with LAN Control turned on in the Govee Home app
   - **Bluetooth** for nearby bulbs without LAN Control (H6004, H6006, H6008, H6009, H600A, H600D and H6010)
-  - **Govee cloud** with an API key, for everything else (set from Terminal: `~/Hammer/Hammer govee key <API key>`)
+  - **Govee cloud** with an API key, for everything else (set from Terminal: run `~/Hammer/Hammer govee key` and paste the key when it asks)
 
-  On macOS 14 or later, each Bluetooth bulb's row says **On** or **Off** on the right, from what the bulb last reported, and All Lights says how many are on. Lights that haven't said (not connected, or on Wi-Fi or the cloud) show nothing there.
+  On macOS 14 or later, each Bluetooth bulb's row says **On** or **Off** on the right, from what the bulb last reported, and All Lights says **On**, **Off**, or how many are on. Lights that haven't said (not connected, or on Wi-Fi or the cloud) show nothing there.
 
   Lights in your Govee account (with a cloud API key) are yours. A light found only nearby could be someone else's: Bluetooth reaches through walls, and dorms and offices share Wi-Fi. Those start under **Other Lights**, where Hammer won't control them (not with All Lights, the sleep timer or Turn On At either) until you choose **Add to My Lights**. Each Bluetooth bulb shows roughly how far away it is, and **Blink to Identify** flashes just that one, twice, and leaves it on or off as it was. A bulb found over Bluetooth counts as one of your account's lights only when its Bluetooth name matches that light's device ID; otherwise it waits under Other Lights, where you can add it. If the cloud doesn't answer (say, at login before Wi-Fi is up), Hammer goes by your account's lights from the last time it did. When you updated, lights on your network that you'd renamed or colored in an older Hammer were added for you, at the first scan that reached your network; add any others from Other Lights.
 - **Turn On At** (in All Lights, or in your light's own menu if you have just one) — pick a time, once or every day, and your lights come on with the color and brightness they last had. Optionally wakes the Mac a minute before (macOS asks for your password). Changing the time, unticking the wake or choosing **Cancel Turn On** cancels exactly the wake Hammer set. A daily wake uses macOS's repeating schedule, which holds only one wake, so if your Mac already has its own repeating wake or sleep schedule, Hammer leaves it alone and says so.
@@ -120,9 +120,9 @@ Opening Hammer from Spotlight, Finder or Apps shows its menu at the pointer, so 
 
 Each build is signed with a certificate made once on your Mac (in `~/Hammer/signing`, its own keychain, not your login keychain), so macOS recognizes every update as the same Hammer and doesn't ask for Bluetooth and other permissions again. You'll be asked one last time after the first build that uses it. If that certificate can't be made or used, the build is signed ad hoc as before, and the update log (`~/Hammer/update.log`) says which happened: "Signed with Hammer Local Signing" or "Signed ad hoc".
 
-Hammer checks this repo at login and every 5 minutes, and every 2 minutes while it's running. When there's a new commit it rebuilds and restarts itself. Every update first runs the tests in `Tests/main.swift`; if a test fails or the new version doesn't build, the update stops and the current one keeps running. The new version is kept only once it has started properly; if it doesn't, the one you had comes back. You can also choose **Check for Updates** in the menu. The menu shows what the last check found (for example "Up to date · checked 2:14 PM"), and Hammer shows a notification when it has updated.
+Hammer checks this repo at login and every 5 minutes, and every 2 minutes while it's running. When there's a new commit it rebuilds and restarts itself. Every update first runs the tests in `Tests/main.swift`; if a test fails or the new version doesn't build, the update stops and the current one keeps running. The new version is kept only once it has started properly and kept running for 20 seconds; if it doesn't, the one you had comes back. You can also choose **Check for Updates** in the menu. The menu shows what the last check found (for example "Up to date · checked 2:14 PM"), and Hammer shows a notification when it has updated.
 
-- An update doesn't restart Hammer while one of its dialogs is open, or while Hammer's own YouTube player is open or playing; it waits until you're done, for up to 30 minutes. (A video in Edge isn't affected: it plays in Edge.)
+- An update doesn't restart Hammer while one of its dialogs is open, while Hammer's own YouTube player is open or playing, or while it's in the middle of Turn On At's password prompt, Blink to Identify or Check Monitor Connection; it waits until you're done, for up to 30 minutes. (A video in Edge isn't affected: it plays in Edge. The color picker isn't covered: it isn't a dialog.)
 - Problems with your Mac rather than the update (Apple's command-line tools need reinstalling after a macOS upgrade, the disk is almost full) are shown in the menu with what to do, and the update is tried again later.
 - An update cut off part-way (by a logout or a shutdown) puts the Hammer you had back on the next run, even offline.
 
@@ -138,7 +138,7 @@ The log is at `~/Hammer/update.log`.
 ~/Hammer/Hammer monitor check           if the monitor doesn't respond: tests each step and says why
 ~/Hammer/Hammer govee list              find Wi-Fi and cloud lights
 ~/Hammer/Hammer govee on | off          all your Wi-Fi and cloud lights (not Bluetooth bulbs)
-~/Hammer/Hammer govee key <API key>     save a Govee cloud API key
+~/Hammer/Hammer govee key               save a Govee cloud API key (paste it when asked)
 ```
 
 Bluetooth bulbs are controlled from the menu bar app only: `govee on` from Terminal doesn't reach them. It skips lights you've removed, and lights found only on the network that you haven't added.
@@ -158,7 +158,7 @@ Bluetooth bulbs are controlled from the menu bar app only: `govee on` from Termi
 | `Tests/Player/` | Tests for `PlayerScript.js` in node with a stand-in page |
 | `Deliveries.swift` | Delivery alerts logic (Foundation only): which emails are deliveries, reading Gmail over IMAP |
 | `DeliveryAlerts.swift` | Delivery alerts on the Mac: secure connection to Gmail, Keychain, notifications |
-| `Tests/main.swift` | Tests for `HammerCore.swift`, `Monitor.swift` and `Deliveries.swift`, run before every install. The monitor tests use stand-in monitors and Macs: picky, silent, locked and broken monitors, empty ports, the M1 HDMI converter, DisplayLink |
+| `Tests/main.swift` | Tests for `HammerCore.swift`, `Monitor.swift`, `Player.swift` and `Deliveries.swift`, run before every install. The monitor tests use stand-in monitors and Macs: picky, silent, locked and broken monitors, empty ports, the M1 HDMI converter, DisplayLink |
 | `Tests/Deliveries/` | Delivery alerts end to end: fake Gmail and Google script servers, and the script itself in node |
 | `Tests/Bluetooth/` | Bluetooth scenarios (phone grabs the bulb, failures, resets…) against a stand-in CoreBluetooth; run on Linux |
 | `build.sh` | Compiles and installs `~/Applications/Hammer.app` |

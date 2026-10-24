@@ -3,6 +3,7 @@
 # $FAKE/running and, like the real Hammer once it has started, ~/Hammer/.launched.
 # Like LaunchServices, opening an app that's already running just brings it forward.
 # FAKE_KILL_AT_OPEN=KILL: the update is killed just before the new app opens.
+# FAKE_CRASH_LATER_VERSION: that version starts (writes .launched), then crashes a few seconds in.
 source "$(dirname "$0")/_log"
 app="$1"
 v="$(cat "$app/Contents/Resources/VERSION" 2>/dev/null || echo '?')"
@@ -22,4 +23,9 @@ if [ -f "$FAKE/running" ]; then log "open: brought the running Hammer $(cat "$FA
 if [ -n "${FAKE_CRASH_VERSION:-}" ] && [ "$v" = "$FAKE_CRASH_VERSION" ]; then log "open OK ($v)$args, then it crashed"; exit 0; fi
 echo "$v" > "$FAKE/running"
 mkdir -p "$HOME/Hammer" && printf '%s\n%s\n' "$v" 4242 > "$HOME/Hammer/.launched"
+if [ -n "${FAKE_CRASH_LATER_VERSION:-}" ] && [ "$v" = "$FAKE_CRASH_LATER_VERSION" ]; then
+  echo 3 > "$FAKE/crash-after"        # pgrep sees it 3 more times, then it's gone
+  log "open OK ($v)$args, it started, then it crashed a few seconds in"
+  exit 0
+fi
 log "open OK ($v)$args"

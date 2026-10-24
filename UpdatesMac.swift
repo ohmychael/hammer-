@@ -14,10 +14,10 @@ import UserNotifications
 private let hammerFolder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Hammer")
 
 /// Tells build.sh not to restart Hammer for an update just now (it waits up to 30
-/// minutes). Dialogs are covered by `watchDialogs()`, and Hammer's own YouTube player
-/// sets "YouTube" while it's open or playing. Anything else that shouldn't be cut off
-/// can call `Busy.set("<what>", true)` while it's going, and `Busy.set("<what>", false)`
-/// once it's done.
+/// minutes). Dialogs are covered by `watchDialogs()`; Hammer's own YouTube player sets
+/// "YouTube" while it's open or playing; Turn On At's password prompt, Blink to Identify
+/// and Check Monitor Connection use `begin`/`end`. Anything else that shouldn't be cut
+/// off can do the same.
 @MainActor
 enum Busy {
     private static var reasons: Set<String> = []
@@ -36,6 +36,19 @@ enum Busy {
             try? FileManager.default.createDirectory(at: hammerFolder, withIntermediateDirectories: true)
             try? text.write(to: file, atomically: true, encoding: .utf8)
         }
+    }
+
+    /// For things that can overlap (two Blinks, two wake changes): busy until every
+    /// `begin` has had its `end`.
+    private static var counts: [String: Int] = [:]
+    static func begin(_ reason: String) {
+        counts[reason, default: 0] += 1
+        set(reason, true)
+    }
+    static func end(_ reason: String) {
+        let left = Swift.max(0, (counts[reason] ?? 0) - 1)
+        counts[reason] = left == 0 ? nil : left
+        set(reason, left > 0)
     }
 
     /// Any dialog open (an alert, or a window that runs modally) counts as busy.
@@ -205,7 +218,7 @@ final class Updates {
         let script = Self.repo.appendingPathComponent("agents.sh").path
         run("/bin/bash '\(script)'") { [weak self] _ in
             self?.checkLoginItems { stillOff in
-                if stillOff { self?.explainLoginItems() } else { next?() }
+                if stillOff { fromRunLoop { self?.explainLoginItems() } } else { next?() }
             }
         }
     }

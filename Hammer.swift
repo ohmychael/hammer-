@@ -26,7 +26,7 @@
 //         ./Hammer govee list             find your lights
 //         ./Hammer govee on | off         all your Wi-Fi and cloud lights (not Bluetooth bulbs)
 //         ./Hammer govee brightness 40    the same, 1–100
-//         ./Hammer govee key <API key>    save a Govee cloud API key (optional)
+//         ./Hammer govee key              save a Govee cloud API key (optional; it asks for it)
 //
 // Govee lights are reached one of three ways:
 //   • Bluetooth — for nearby bulbs without LAN Control (H6004/H6006/H6008/H6009
@@ -35,7 +35,7 @@
 //     in the Govee Home app (device page → settings). Not every model has it.
 //   • Govee cloud — works for other Wi-Fi models, a little slower. Request a
 //     free API key in the Govee Home app ("Apply for API Key" in settings),
-//     then save it with `./Hammer govee key ...`.
+//     then save it with `./Hammer govee key` (paste it when asked).
 
 import AppKit
 import Carbon.HIToolbox     // global keyboard shortcut
@@ -1079,6 +1079,21 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
 
 // MARK: - Menu bar app
 
+/// Runs `body` from the main run loop, once no dialog or menu is open, rather than from
+/// inside a main-queue job. A dialog or menu stays open inside whatever opened it, and
+/// while a main-queue job (a `Task { @MainActor … }`, `DispatchQueue.main.async`) is held
+/// up like that, no other one can start: the sleep timer, Turn On At, dimming after a
+/// wake and Bluetooth news would all wait for the dialog to close. Opened from here, they don't.
+@MainActor func fromRunLoop(_ body: @escaping @MainActor () -> Void) {
+    let timer = Timer(timeInterval: 0, repeats: false) { _ in MainActor.assumeIsolated { body() } }
+    RunLoop.main.add(timer, forMode: .default)     // not while a dialog or menu is open: no stacking
+}
+
+/// `alert.runModal()` from the run loop (see `fromRunLoop`), for async code.
+@MainActor func runModalFromRunLoop(_ alert: NSAlert) async -> NSApplication.ModalResponse {
+    await withCheckedContinuation { done in fromRunLoop { done.resume(returning: alert.runModal()) } }
+}
+
 /// Called by macOS when ⌃⌥H (id 1), ⌃⌥Y (id 2) or ⌘Y (id 3) is pressed.
 func hotKeyPressed(_ call: EventHandlerCallRef?, _ event: EventRef?, _ userData: UnsafeMutableRawPointer?) -> OSStatus {
     guard let userData else { return noErr }
@@ -1336,10 +1351,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func showMenuAtMouse() {
         guard let menu = statusItem.menu else { return }
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 150_000_000)   // let the app launcher close first
-            menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+        // A moment later (the app launcher closes first), and from the run loop: see `fromRunLoop`.
+        let later = Timer(timeInterval: 0.15, repeats: false) { _ in
+            MainActor.assumeIsolated { menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) }
         }
+        RunLoop.main.add(later, forMode: .default)
     }
 
     /// Control-Option-H opens the menu from anywhere; Control-Option-Y the YouTube player.
@@ -1820,7 +1836,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RunLoop.main.add(timer, forMode: .common)
         updateTimer = timer
         Busy.watchDialogs()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { Updates.markLaunched(version: Self.version) }
+        // A run-loop timer, so an open menu or dialog can't hold it up (build.sh waits for it).
+        let launched = Timer(timeInterval: 2, repeats: false) { _ in
+            MainActor.assumeIsolated { Updates.markLaunched(version: Self.version) }
+        }
+        RunLoop.main.add(launched, forMode: .common)
         if Self.openedByYou {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.showMenuAtMouse() }
         }
@@ -2046,11 +2066,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DeliveryWatcher.shared.turnOn(scriptURL: url, key: key) { [weak self] failure in
                 guard let delegate = self else { return }
                 Task { @MainActor in
-                    if let failure {
-                        delegate.askForScriptAddress(key: key, address: tried, note: failure.setupMessage)
-                    } else {
-                        ScriptClipboard.clearIfOurs()         // Hammer has the key now
-                        delegate.deliverySetupFinished()
+                    fromRunLoop {
+                        if let failure {
+                            delegate.askForScriptAddress(key: key, address: tried, note: failure.setupMessage)
+                        } else {
+                            ScriptClipboard.clearIfOurs()         // Hammer has the key now
+                            delegate.deliverySetupFinished()
+                        }
                     }
                 }
             }
@@ -2110,10 +2132,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DeliveryWatcher.shared.turnOn(email: email, password: password) { [weak self] failure in
                 guard let delegate = self else { return }
                 Task { @MainActor in
-                    if let failure {
-                        delegate.setUpWithAppPassword(note: failure.setupMessage, email: tried)
-                    } else {
-                        delegate.deliverySetupFinished()
+                    fromRunLoop {
+                        if let failure {
+                            delegate.setUpWithAppPassword(note: failure.setupMessage, email: tried)
+                        } else {
+                            delegate.deliverySetupFinished()
+                        }
                     }
                 }
             }
@@ -2458,18 +2482,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func checkMonitor() {
         guard !checkingMonitor else { return }
         checkingMonitor = true
+        Busy.begin("checking the monitor")          // it moves the brightness, then puts it back
         rebuildMenuSoon()
         let scan = MacMonitors.scan()
         ddcQueue.async {
             let found = MacMonitors.check(scan)
             Task { @MainActor in
+                Busy.end("checking the monitor")
                 var check = found
                 check.softwareDim = self.softwareDimState      // what dimming in software was doing meanwhile
                 check.softwareDimLevel = self.softwareDimLevel
                 self.checkingMonitor = false
                 self.findMonitors()            // start fresh, in case something changed (e.g. DDC/CI turned on)
                 self.rebuildMenuSoon()
-                self.showMonitorCheck(check)
+                fromRunLoop { self.showMonitorCheck(check) }
             }
         }
     }
@@ -2962,8 +2988,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stayAwake = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled],
                                                            reason: "Hammer sleep timer")
         let check = Timer(timeInterval: 20, repeats: true) { [weak self] _ in
-            guard let delegate = self else { return }
-            Task { @MainActor in delegate.checkSchedules() }
+            MainActor.assumeIsolated { self?.checkSchedules() }   // right here: a dialog can't hold it up
         }
         RunLoop.main.add(check, forMode: .common)     // keeps ticking while the menu is open
         timerCheck = check
@@ -3088,8 +3113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Checks the schedule every 30 seconds and right after the Mac wakes.
     private func startClock() {
         let tick = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
-            guard let delegate = self else { return }
-            Task { @MainActor in delegate.checkSchedules() }
+            MainActor.assumeIsolated { self?.checkSchedules() }   // right here: a dialog can't hold it up
         }
         RunLoop.main.add(tick, forMode: .common)
         clock = tick
@@ -3104,13 +3128,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Give Bluetooth a few seconds to come back before sending anything (commands
         // for your bulbs wait for it anyway). The timer and Turn On At are checked
         // together, so the one scheduled later wins.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            guard let delegate = self else { return }
-            Task { @MainActor in
-                delegate.checkSchedules()
-                delegate.reapplyIfDimming()                 // macOS resets screens' color curves on wake
+        let later = Timer(timeInterval: 5, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {                      // a run-loop timer: a dialog can't hold it up
+                self?.checkSchedules()
+                self?.reapplyIfDimming()                    // macOS resets screens' color curves on wake
             }
         }
+        RunLoop.main.add(later, forMode: .common)
     }
 
     /// After Turn On At came due (sent, or skipped as too late): the same time on the
@@ -3194,7 +3218,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// settings changed; it's only used if nothing is saved yet.
     private func updateMacWake(legacy: MacWake.Event?, to wanted: MacWake.Event?) {
         wakeBlocked = false
+        // An update mustn't restart Hammer while macOS asks for your password: the wake
+        // would be set, but Hammer wouldn't know it had set it.
+        Busy.begin("setting when the Mac wakes")
         wakeQueue.async { [weak self] in
+            defer { Task { @MainActor in Busy.end("setting when the Mac wakes") } }
             // Read and saved here, one change at a time, so two quick changes can't lose a wake.
             let saved = UserDefaults.standard.string(forKey: "macWake")
             let current = saved == nil ? legacy : MacWake.Event(saved: saved ?? "")
@@ -3275,12 +3303,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               let light = foundLights.first(where: { $0.id == id }) else { return }
         let mine = isMine(light)
         let activity = self.activity, started = Date()
+        Busy.begin("Blink to Identify")             // an update now would leave the light flashed on or off
         blinkQueue.async { [weak self] in
             Blink.run(mine: mine,
                       readPower: { Govee.readPower(light) },          // over Bluetooth this connects first
                       setPower: { on in self?.landed(light, .power, Govee.setPower(light, on: on)) },
                       interrupted: { activity.touched(light.id, since: started) },   // you sent it something since
                       pause: { usleep(700_000) })
+            Task { @MainActor in Busy.end("Blink to Identify") }
         }
     }
 
@@ -3432,7 +3462,7 @@ enum Hammer {
                Hammer get <brightness|contrast|volume|hex code>
                Hammer set <brightness|contrast|volume|hex code> <value>
                Hammer monitor check
-               Hammer govee list | on | off | brightness <1-100> | key <API key>
+               Hammer govee list | on | off | brightness <1-100> | key
         """
 
     static func runMonitorCommand(_ args: [String]) -> Int32 {
@@ -3490,13 +3520,34 @@ enum Hammer {
     }
 
     static func runGoveeCommand(_ args: [String]) -> Int32 {
-        let usage = "usage: Hammer govee list | on | off | brightness <1-100> | key <API key>"
+        let usage = "usage: Hammer govee list | on | off | brightness <1-100> | key"
         let command = args.first ?? ""
 
         if command == "key" {
-            guard args.count >= 2 else { print(usage); return 2 }
+            // Read after you press Return, never from the command line, where it would stay
+            // in your shell history and be visible to other programs while this runs.
+            guard args.count == 1 else {
+                print("Leave the key off the command line (it would stay in your shell history).")
+                print("Run ~/Hammer/Hammer govee key and paste the key when it asks.")
+                return 2
+            }
+            var saved = termios()
+            let typing = isatty(STDIN_FILENO) == 1 && tcgetattr(STDIN_FILENO, &saved) == 0
+            if typing {
+                print("Paste your Govee API key, then press Return (it won't show): ", terminator: "")
+                fflush(stdout)
+                var quiet = saved
+                quiet.c_lflag &= ~tcflag_t(ECHO)
+                tcsetattr(STDIN_FILENO, TCSANOW, &quiet)
+            }
+            let key = (readLine() ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if typing {
+                tcsetattr(STDIN_FILENO, TCSANOW, &saved)
+                print("")
+            }
+            guard !key.isEmpty else { print("No key given, so nothing was saved."); return 2 }
             do {
-                try Govee.saveAPIKey(args[1])
+                try Govee.saveAPIKey(key)
                 print("Saved to \(Govee.keyFile.path)")
                 return 0
             } catch {
@@ -3521,7 +3572,7 @@ enum Hammer {
         let found = Govee.discover(savedAccount: account).lights
         if found.isEmpty {
             print("No lights found. Turn on LAN Control for each light in the Govee Home app,")
-            print("or save a cloud API key with: Hammer govee key <API key>")
+            print("or save a cloud API key with: Hammer govee key")
             return 1
         }
         let names = settings.dictionary(forKey: "lightNames") as? [String: String] ?? [:]

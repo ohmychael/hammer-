@@ -388,6 +388,27 @@ scenario_t_minos() {
   check '[ "$(app_version)" = "$B" ]' "then installs it"
 }
 
+scenario_crash_later() {
+  echo "[the new Hammer starts, then crashes a few seconds in]"
+  B="$(commit B)"
+  FAKE_CRASH_LATER_VERSION="$B" upd
+  check '[ "$(app_version)" = "$A" ] && [ "$(running)" = "$A" ] && [ "$(failed_version)" = "$B" ]' \
+    "the Hammer you had is back; B failed"
+  check 'said "started, then quit within 20 seconds"' "…and the log says why"
+  upd
+  check '[ "$(app_version)" = "$A" ] && [ "$(builds)" = 1 ]' "no retry loop"
+}
+
+scenario_t_crash_later() {
+  echo "[the old update.sh, and the new app crashes a few seconds in]"
+  B="$(commit_new B)"
+  FAKE_CRASH_LATER_VERSION="$B" upd
+  check '[ "$(app_version)" = "$A" ] && [ "$(running)" = "$A" ] && [ "$(failed_version)" = "$B" ]' "the Hammer you had is back; B failed"
+  : > "$FAKE_OSASCRIPT"                 # the old update.sh's own failure notice
+  upd
+  check '[ "$(app_version)" = "$A" ] && [ "$(builds)" = 1 ]' "no retry loop"
+}
+
 scenario_t_crash() {
   echo "[the old update.sh, and the new app crashes at launch]"
   B="$(commit_new B)"
@@ -681,7 +702,7 @@ scenario_bad_version() {
 all=(update restart_loop swap_fails killed_mid_swap logout_mid_swap logout_twice cut_off_after_move
      put_back_blocked stopped_after_success leftover_previous lock installer installer_restores fresh_install crash_at_launch
      open_during_swap mac_problems hangs no_perl not_yours login_items login_items_move cli_binary local_edits
-     signing_logout busy no_icon bad_version t_ok t_exit4 t_minos t_crash t_term)
+     signing_logout busy no_icon bad_version crash_later t_ok t_exit4 t_minos t_crash t_crash_later t_term)
 chosen=("$@")
 [ ${#chosen[@]} -gt 0 ] || chosen=("${all[@]}")
 for name in "${chosen[@]}"; do
