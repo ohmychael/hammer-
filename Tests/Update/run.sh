@@ -399,6 +399,19 @@ scenario_crash_later() {
   check '[ "$(app_version)" = "$A" ] && [ "$(builds)" = 1 ]' "no retry loop"
 }
 
+scenario_quit_later() {
+  echo "[the new Hammer starts, then you quit it a few seconds in]"
+  B="$(commit B)"
+  printf '%s\n' "$B" > "$HOME/Hammer/.quit"          # a note from before this update mustn't count
+  FAKE_CRASH_LATER_VERSION="$B" upd
+  check '[ "$(app_version)" = "$A" ] && [ "$(failed_version)" = "$B" ]' "an old quit note doesn't count: put back"
+  C="$(commit C)"
+  FAKE_QUIT_LATER_VERSION="$C" upd
+  check '[ "$(app_version)" = "$C" ] && [ "$(failed_version)" != "$C" ] && said "then you quit it"' \
+    "quitting it yourself isn't a crash: the new version stays"
+  check '[ -z "$(find "$HOME" -name Hammer-previous.app 2>/dev/null)" ]' "…and the old one is gone"
+}
+
 scenario_t_crash_later() {
   echo "[the old update.sh, and the new app crashes a few seconds in]"
   B="$(commit_new B)"
@@ -702,7 +715,7 @@ scenario_bad_version() {
 all=(update restart_loop swap_fails killed_mid_swap logout_mid_swap logout_twice cut_off_after_move
      put_back_blocked stopped_after_success leftover_previous lock installer installer_restores fresh_install crash_at_launch
      open_during_swap mac_problems hangs no_perl not_yours login_items login_items_move cli_binary local_edits
-     signing_logout busy no_icon bad_version crash_later t_ok t_exit4 t_minos t_crash t_crash_later t_term)
+     signing_logout busy no_icon bad_version crash_later quit_later t_ok t_exit4 t_minos t_crash t_crash_later t_term)
 chosen=("$@")
 [ ${#chosen[@]} -gt 0 ] || chosen=("${all[@]}")
 for name in "${chosen[@]}"; do

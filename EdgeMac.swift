@@ -345,6 +345,13 @@ final class EdgePlayer {
     /// Presses while it's up are dropped, so alerts never stack. Shown from the run loop
     /// (see `fromRunLoop` in Hammer.swift), so it doesn't hold up the rest of Hammer.
     private func show(_ alert: NSAlert) async -> NSApplication.ModalResponse {
+        // Another of Hammer's dialogs is open: rather than wait behind it and pop up out
+        // of context later, a sound says something needs you (the menu has Allow Edge Control…).
+        if let dialog = NSApp.modalWindow {
+            dialog.makeKeyAndOrderFront(nil)
+            NSSound.beep()
+            return .cancel
+        }
         busySince = Date()
         defer { busySince = nil }
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }

@@ -21,6 +21,7 @@ STAGE="$BUILD/Hammer.app"
 PREVIOUS="$BUILD/Hammer-previous.app"  # the Hammer you had, while a new one is tried
 SWAPPING="$BUILD/.swapping"            # while the app is being swapped
 LAUNCHED="$HOME_DIR/.launched"         # Hammer writes its version here once it has started
+QUIT="$HOME_DIR/.quit"                 # ...and here when you quit it (Quit Hammer, or logging out)
 BUSY="$HOME_DIR/.busy"                 # Hammer is busy: a dialog, or its YouTube player (its PID, then why)
 RETRY="$HOME_DIR/.retry-later"
 BUNDLE_ID="local.hammer"
@@ -296,6 +297,10 @@ started() {
   for ((i = 0; i < STAY; i++)); do
     sleep 1
     if ! pgrep -x Hammer >/dev/null 2>&1; then
+      if [ "$(sed -n 1p "$QUIT" 2>/dev/null || true)" = "$VERSION" ]; then
+        echo "Hammer $VERSION started, then you quit it."
+        return 0
+      fi
       echo "Hammer $VERSION started, then quit within $STAY seconds."
       return 1
     fi
@@ -320,7 +325,7 @@ if [ -e "$APP" ]; then mv "$APP" "$PREVIOUS"; fi
 mkdir -p "$apps_folder"
 mv "$STAGE" "$APP"
 stop_hammer           # in case Hammer was opened again meanwhile (at login), from the old copy
-rm -f "$LAUNCHED"
+rm -f "$LAUNCHED" "$QUIT"
 if ! open "$APP" --args --login; then
   echo "macOS wouldn't open Hammer $VERSION (the error is just above)."
   put_back

@@ -103,6 +103,13 @@ final class Updates {
                                                atomically: true, encoding: .utf8)
     }
 
+    /// Tells build.sh you quit this Hammer yourself (Quit Hammer, or logging out), so
+    /// quitting a new version in its first seconds doesn't count as it crashing.
+    /// (build.sh's own stop for an update is a plain kill, which doesn't come here.)
+    static func markQuit(version: String) {
+        try? "\(version)\n".write(to: hammerFolder.appendingPathComponent(".quit"), atomically: true, encoding: .utf8)
+    }
+
     // MARK: The menu line
 
     /// The line under Check for Updates ("Up to date · checked 2:14 PM"), or nil.

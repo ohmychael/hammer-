@@ -1094,6 +1094,9 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     await withCheckedContinuation { done in fromRunLoop { done.resume(returning: alert.runModal()) } }
 }
 
+/// The Terminal's settings before `Hammer govee key` hid the typing, for putting them back.
+var terminalBeforeKey = termios()
+
 /// Called by macOS when ⌃⌥H (id 1), ⌃⌥Y (id 2) or ⌘Y (id 3) is pressed.
 func hotKeyPressed(_ call: EventHandlerCallRef?, _ event: EventRef?, _ userData: UnsafeMutableRawPointer?) -> OSStatus {
     guard let userData else { return noErr }
@@ -1279,6 +1282,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Opening Hammer again (from Apps, Spotlight or Finder) shows its menu
     /// right where the pointer is, so it works even when the menu bar icon
     /// is hidden behind the notch.
+    func applicationWillTerminate(_ notification: Notification) {
+        Updates.markQuit(version: Self.version)
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showMenuAtMouse()
         return false
@@ -1351,9 +1358,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func showMenuAtMouse() {
         guard let menu = statusItem.menu else { return }
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+        // One of Hammer's dialogs is open: bring it forward (the menu would wait behind it).
+        if let dialog = NSApp.modalWindow {
+            dialog.makeKeyAndOrderFront(nil)
+            return
+        }
         // A moment later (the app launcher closes first), and from the run loop: see `fromRunLoop`.
         let later = Timer(timeInterval: 0.15, repeats: false) { _ in
-            MainActor.assumeIsolated { menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) }
+            MainActor.assumeIsolated {
+                _ = menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+            }
         }
         RunLoop.main.add(later, forMode: .default)
     }
@@ -3531,18 +3545,23 @@ enum Hammer {
                 print("Run ~/Hammer/Hammer govee key and paste the key when it asks.")
                 return 2
             }
-            var saved = termios()
-            let typing = isatty(STDIN_FILENO) == 1 && tcgetattr(STDIN_FILENO, &saved) == 0
+            let typing = isatty(STDIN_FILENO) == 1 && tcgetattr(STDIN_FILENO, &terminalBeforeKey) == 0
             if typing {
                 print("Paste your Govee API key, then press Return (it won't show): ", terminator: "")
                 fflush(stdout)
-                var quiet = saved
+                // Control-C puts the Terminal back as it was (typing shows again), then quits.
+                signal(SIGINT) { _ in
+                    tcsetattr(STDIN_FILENO, TCSANOW, &terminalBeforeKey)
+                    _exit(130)
+                }
+                var quiet = terminalBeforeKey
                 quiet.c_lflag &= ~tcflag_t(ECHO)
                 tcsetattr(STDIN_FILENO, TCSANOW, &quiet)
             }
             let key = (readLine() ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             if typing {
-                tcsetattr(STDIN_FILENO, TCSANOW, &saved)
+                tcsetattr(STDIN_FILENO, TCSANOW, &terminalBeforeKey)
+                signal(SIGINT, SIG_DFL)
                 print("")
             }
             guard !key.isEmpty else { print("No key given, so nothing was saved."); return 2 }
