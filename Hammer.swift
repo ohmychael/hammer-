@@ -2666,7 +2666,6 @@ enum Hammer {
             case "dim-check": exit(runDimCheck())
             case "player-check": PlayerCheck.run(args)
             case "edge-check": EdgeCheck.run()
-            case "keychain-check": exit(KeychainCheck.run(args))
             case "tour":
                 guard args.count >= 2 else { print("usage: Hammer tour <folder> [--demo]"); exit(2) }
                 let demo = args.contains("--demo")
