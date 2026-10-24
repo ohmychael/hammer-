@@ -1503,7 +1503,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func addYouTube(to menu: NSMenu) {
-        menu.addItem(label("YouTube"))
+        menu.addItem(header("YouTube"))
         let inEdge = youTubeInEdge
         // In Hammer's player with a video playing in the dropdown, this pops it back out.
         let backToMini = !inEdge && youTube?.place == .dropdown && youTube?.playing == true
@@ -1744,11 +1744,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuildMenu() {
         let menu = NSMenu()
 
-        menu.addItem(label("Monitor"))
+        menu.addItem(header("Monitor"))
         addMonitor(to: menu)
 
         menu.addItem(.separator())
-        menu.addItem(label("Govee Lights"))
+        menu.addItem(header("Govee Lights"))
         if let problem = GoveeBluetooth.shared.problem {
             menu.addItem(hint(problem))
         }
@@ -1841,7 +1841,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func addDeliveries(to menu: NSMenu) {
         let watcher = DeliveryWatcher.shared
-        menu.addItem(label("Deliveries"))
+        menu.addItem(header("Deliveries"))
         if watcher.isSettingUp {
             menu.addItem(hint("Checking your Gmail setup…"))
             return
@@ -2165,6 +2165,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.isEnabled = false
         return item
+    }
+
+    /// A section's name, as macOS's own section header where there is one (macOS 14+).
+    private func header(_ title: String) -> NSMenuItem {
+        if #available(macOS 14, *) { return NSMenuItem.sectionHeader(title: title) }
+        return label(title)
     }
 
     /// Small gray instruction text.
@@ -2586,6 +2592,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// On or off for the tour's stand-in lights (`Hammer tour --demo` only), for the menu's notes.
+    private var tourPower: [String: Bool] = [:]
+
     /// Stands in for "every light" wherever a light ID is expected.
     private let allLightsID = "all-lights"
 
@@ -2685,6 +2694,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if hasTimer, let next = turnOnNext { title += " · on at \(clockTime(next))" }
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.submenu = submenu
+        // "On", "Off" or "2 on" on the right, from what the bulbs last reported.
+        let states = lightsMatching(id).map { light in
+            tourPower[light.id] ?? light.bluetoothID.flatMap { GoveeBluetooth.shared.isOn($0) }
+        }
+        if #available(macOS 14, *), let badge = LightBadge.text(states) { item.badge = NSMenuItemBadge(string: badge) }
         return item
     }
 
@@ -2829,7 +2843,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The sleep timer section at the bottom of All Lights.
     private func addSleepTimer(to submenu: NSMenu) {
         submenu.addItem(.separator())
-        submenu.addItem(label("Sleep Timer"))
+        submenu.addItem(header("Sleep Timer"))
         if let end = timerEnd {
             submenu.addItem(hint("Your lights go off at \(clockTime(end))."))
             submenu.addItem(action("Cancel Timer", #selector(cancelTimer)))
@@ -3003,7 +3017,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func addTurnOnTime(to submenu: NSMenu) {
         submenu.addItem(.separator())
-        submenu.addItem(label("Turn On At"))
+        submenu.addItem(header("Turn On At"))
         if let next = turnOnNext {
             let when = turnOnRepeats ? "every day at \(clockTime(next))" : "at \(clockTime(next))"
             submenu.addItem(hint("Your lights turn on \(when)."))
@@ -3515,6 +3529,7 @@ extension AppDelegate {
     }
 
     private func applyTourDemo() {
+        tourPower = ["D1:7A:A4:C1:38:42:11:90": true, "C3:12:A4:C1:38:9B:20:4E": false]   // the Hallway Bulb hasn't said
         networkLights = [
             GoveeLight(id: "D1:7A:A4:C1:38:42:11:90", sku: "H6159", name: "Desk Strip", lanIP: "192.168.1.40", inAccount: true),
             GoveeLight(id: "C3:12:A4:C1:38:9B:20:4E", sku: "H6006", name: "Bedroom Bulb", lanIP: nil, inAccount: true),

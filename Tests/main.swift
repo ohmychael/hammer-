@@ -429,6 +429,17 @@ expect(menuNotes.lines(now: at(LightNotes.scheduledFor + 1)).isEmpty, "a missed 
 
 // MARK: Lights: sleep timer and Turn On At
 
+// MARK: The on/off note on each light's row
+
+expect(LightBadge.text([]) == nil, "no lights: no note")
+expect(LightBadge.text([nil]) == nil, "a bulb that hasn't said: no note")
+expect(LightBadge.text([true]) == "On" && LightBadge.text([false]) == "Off", "one bulb: On or Off")
+expect(LightBadge.text([true, true]) == "On" && LightBadge.text([false, false]) == "Off", "all agree: On or Off")
+expect(LightBadge.text([true, false]) == "1 on", "some on: how many")
+expect(LightBadge.text([true, true, nil]) == "2 on", "some on, one silent: how many are known to be on")
+expect(LightBadge.text([false, nil]) == nil, "off and silent: can't say they're all off")
+expect(LightBadge.text([nil, nil]) == nil, "none have said: no note")
+
 var lightsDue = LightSchedule.decide(timerEnd: at(100), turnOnAt: at(200), now: at(50))
 expect(lightsDue == LightSchedule.Decision(), "nothing due yet")
 lightsDue = LightSchedule.decide(timerEnd: at(100), turnOnAt: nil, now: at(130))

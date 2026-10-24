@@ -203,6 +203,21 @@ struct GoveeLight {
     var route: Route { lanIP != nil ? .lan : bluetoothID != nil ? .bluetooth : .cloud }
 }
 
+/// On the right of a light's row in the menu: what the bulbs last said about being on,
+/// so you can see which are lit without opening each one. Only what they reported
+/// (`nil` = no word from that bulb, e.g. not connected): "On", "Off", or "2 on" when
+/// some are on. Nothing when it can't be told (e.g. one is off and one hasn't said).
+enum LightBadge {
+    static func text(_ states: [Bool?]) -> String? {
+        let known = states.compactMap { $0 }
+        let on = known.filter { $0 }.count
+        if !known.isEmpty && known.count == states.count && (on == 0 || on == known.count) {
+            return on == 0 ? "Off" : "On"
+        }
+        return on > 0 ? "\(on) on" : nil
+    }
+}
+
 enum LightList {
     /// Puts the bulbs found nearby over Bluetooth together with the lights from your
     /// Govee account and Wi-Fi. A Bluetooth bulb and a cloud light are the same bulb
