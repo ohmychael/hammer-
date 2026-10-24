@@ -107,6 +107,7 @@ public var simKnown: [UUID: CBPeripheral] = [:]          // what retrievePeriphe
 public var simConnectCalls: [UUID: Int] = [:]
 public var simCancelCalls: [UUID: Int] = [:]
 public var simRetrieveCalls = 0
+public var simScanning = false                            // between scanForPeripherals and stopScan
 
 open class CBCentralManager: CBManager {
     unowned(unsafe) open var delegate: CBCentralManagerDelegate?
@@ -120,8 +121,10 @@ open class CBCentralManager: CBManager {
         precondition(state == .poweredOn, "API MISUSE: retrieve while not powered on")
         return identifiers.compactMap { simKnown[$0] }
     }
-    open func scanForPeripherals(withServices serviceUUIDs: [CBUUID]?, options: [String: Any]? = nil) {}
-    open func stopScan() {}
+    open func scanForPeripherals(withServices serviceUUIDs: [CBUUID]?, options: [String: Any]? = nil) {
+        simScanning = true
+    }
+    open func stopScan() { simScanning = false }
     open func connect(_ peripheral: CBPeripheral, options: [String: Any]? = nil) {
         precondition(state == .poweredOn, "API MISUSE: connect while not powered on")
         simConnectCalls[peripheral.identifier, default: 0] += 1

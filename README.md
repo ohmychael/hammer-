@@ -5,14 +5,14 @@ A small Mac menu bar app for the desk:
 - **Dell monitor** — real brightness and contrast over DDC/CI (like MonitorControl), for Apple Silicon Macs. When the monitor can't be controlled (e.g. HDMI from a USB-C adapter), Hammer dims the picture in software instead. See [Monitor](#monitor).
 - **Govee lights** — on/off, brightness, color and white presets, one at a time or all together. Reaches each light the best way available:
   - **Wi-Fi** for lights with LAN Control turned on in the Govee Home app
-  - **Bluetooth** for nearby bulbs without LAN Control (H6004/H6006/H6008/H6009 family)
+  - **Bluetooth** for nearby bulbs without LAN Control (H6004, H6006, H6008, H6009, H600A, H600D and H6010)
   - **Govee cloud** with an API key, for everything else (set from Terminal: `~/Hammer/Hammer govee key <API key>`)
 
-  Bluetooth reaches through walls, so a bulb found only over Bluetooth could be a neighbor's. Those start under **Other Lights**, where Hammer never controls them (not even with All Lights), until you choose **Add to My Lights**. Each shows roughly how far away it is, and **Blink to Identify** helps you tell which is which.
-- **Turn On At** (in All Lights) — pick a time, once or every day, and your lights come on with the color and brightness they last had. Optionally wakes the Mac a minute before (macOS asks for your password once).
+  Lights in your Govee account (with a cloud API key) are yours. A light found only nearby could be someone else's: Bluetooth reaches through walls, and dorms and offices share Wi-Fi. Those start under **Other Lights**, where Hammer won't control them (not with All Lights, the sleep timer or Turn On At either) until you choose **Add to My Lights**. Each Bluetooth bulb shows roughly how far away it is, and **Blink to Identify** flashes just that one, twice, and leaves it on or off as it was. A bulb found over Bluetooth counts as one of your account's lights only when its Bluetooth name matches that light's device ID; otherwise it waits under Other Lights, where you can add it. If the cloud doesn't answer (say, at login before Wi-Fi is up), Hammer goes by your account's lights from the last time it did. When you updated, lights on your network that you'd renamed or colored in an older Hammer were added for you, at the first scan that reached your network; add any others from Other Lights.
+- **Turn On At** (in All Lights, or in your light's own menu if you have just one) — pick a time, once or every day, and your lights come on with the color and brightness they last had. Optionally wakes the Mac a minute before (macOS asks for your password). Changing the time, unticking the wake or choosing **Cancel Turn On** cancels exactly the wake Hammer set. A daily wake uses macOS's repeating schedule, which holds only one wake, so if your Mac already has its own repeating wake or sleep schedule, Hammer leaves it alone and says so.
 - **Delivery alerts** — a Mac notification when a package is delivered ("Delivered · eBay — Apple iPhone 15 Pro Max"), from the delivery emails in your Gmail: eBay, Amazon, UPS, USPS, FedEx and most other stores. Click it to open the email. Failed or attempted deliveries show as **Delivery problem**. See [Delivery alerts](#delivery-alerts).
 - **YouTube** — press **⌘Y** (or **⌃⌥Y**) and YouTube appears flush in the screen's top-right corner. If you have Microsoft Edge, it opens there as an Edge app window, so you're signed in and your extensions work; press the shortcut again to tuck it away. Or use Hammer's own glass player, with a mini player that floats above everything. See [YouTube](#youtube).
-- **Sleep timer** (in All Lights) — pick 5 minutes to 8 hours on a slider and all your lights turn off then. The Mac stays awake until the timer runs out (closing the lid still puts it to sleep), and the timer survives Hammer restarting.
+- **Sleep timer** (in All Lights, or in your light's own menu if you have just one) — pick 5 minutes to 8 hours on a slider and all your lights turn off then. The Mac stays awake until the timer runs out (closing the lid still puts it to sleep), and the timer survives Hammer restarting. If the Mac slept through both the timer and a Turn On At, only the one set for later happens. A bulb that's busy (with your phone, or Bluetooth just woke up) gets 5 minutes to take a scheduled command, and the Mac stays awake until every light has it (or for those 5 minutes); if a light still doesn't take it, the menu says so. A tap in Hammer meanwhile replaces it.
 
 Open the menu from the hammer icon in the menu bar, by pressing **Control-Option-H**, or by opening Hammer from Apps or Spotlight.
 
@@ -67,7 +67,7 @@ YouTube opens in your own Edge as an *app window*: no tabs, no address bar. It's
 
 A bulb talks to one device at a time over Bluetooth, and the Govee app on a phone keeps trying to connect in the background. So Hammer keeps a standing connection to your bulbs (only yours, never Other Lights), reconnects by itself whenever the link drops, and finds them again after a restart even while they're busy. Your phone's Govee app keeps working over Wi-Fi.
 
-If a bulb shows **can't reach**, something else has it: usually the Govee app on your phone. Force-quit the app and Hammer connects within seconds. To stop it happening at all, turn off Bluetooth for Govee Home on the phone (iPhone: Settings → Privacy & Security → Bluetooth → Govee Home); the app still controls your Wi-Fi bulbs. A tap made while a bulb can't be reached is sent as soon as it's free, if that's within 15 seconds; older taps are dropped rather than firing later.
+If a bulb shows **can't reach**, something else has it: usually the Govee app on your phone. Force-quit the app and Hammer connects within seconds. To stop it happening at all, turn off Bluetooth for Govee Home on the phone (iPhone: Settings → Privacy & Security → Bluetooth → Govee Home); the app still controls your Wi-Fi bulbs. If macOS itself refuses the connection (for example, too many Bluetooth devices are connected), the bulb's menu says that instead. A tap made while a bulb can't be reached is sent as soon as it's free, if that's within 15 seconds; older taps are dropped rather than firing later, and the menu says "Couldn't reach" for a while. The color checkmark moves only once the light has taken the change.
 
 If a bulb keeps refusing, Hammer retries more slowly each time (up to once a minute) instead of flooding it; using the light makes it try again within 2 seconds. A bulb that connects but doesn't accept Hammer's commands (for example after a firmware update) is let go, so it doesn't block your phone, and is checked again every 5 minutes.
 
@@ -130,18 +130,18 @@ The log is at `~/Hammer/update.log`.
 ~/Hammer/Hammer set brightness 40       change it (brightness, contrast, volume, or a hex VCP code)
 ~/Hammer/Hammer monitor check           if the monitor doesn't respond: tests each step and says why
 ~/Hammer/Hammer govee list              find Wi-Fi and cloud lights
-~/Hammer/Hammer govee on | off          all Wi-Fi and cloud lights
+~/Hammer/Hammer govee on | off          all your Wi-Fi and cloud lights (not Bluetooth bulbs)
 ~/Hammer/Hammer govee key <API key>     save a Govee cloud API key
 ```
 
-Bluetooth bulbs are controlled from the menu bar app only.
+Bluetooth bulbs are controlled from the menu bar app only: `govee on` from Terminal doesn't reach them. It skips lights you've removed, and lights found only on the network that you haven't added.
 
 ## Files
 
 | File | What it does |
 |---|---|
 | `Hammer.swift` | The app: menu, monitor, Govee Wi-Fi/cloud/Bluetooth |
-| `HammerCore.swift` | Logic that needs only Foundation: packets, the Bluetooth command queue, name parsing |
+| `HammerCore.swift` | Logic that needs only Foundation: packets, the Bluetooth command queue, name parsing, which lights are yours, the sleep timer and Turn On At rules, the Mac's wake schedule |
 | `Monitor.swift` | Monitor control logic (Foundation only): DDC/CI messages, finding the monitor's connection, the monitor check |
 | `MonitorMac.swift` | Monitor control on the Mac: reads IOKit's display registry and sends the bytes |
 | `Player.swift` | YouTube logic (Foundation only): YouTube links, which pages stay in the player, where the windows go, and the scripts and steps for YouTube in Edge |
@@ -185,7 +185,7 @@ node Tests/Player/script_test.js
 Tests/Update/run.sh                 # updates and installs, in a sandbox (about a minute)
 ```
 
-The Bluetooth scenarios play out 27 situations in real time, such as your phone taking a bulb and letting it go, connections that fail or hang, Bluetooth resetting, and a neighbor's bulb nearby. They check what Hammer does in each one. They need Linux with Swift 5.9+, because the real CoreBluetooth on a Mac gets in the way of the stand-in:
+The Bluetooth scenarios play out 37 situations in real time, such as your phone taking a bulb and letting it go, connections that fail or hang, Bluetooth resetting, a neighbor's bulb nearby, and a scheduled command waiting for a busy bulb. They check what Hammer does in each one. They need Linux with Swift 5.9+, because the real CoreBluetooth on a Mac gets in the way of the stand-in:
 
 ```
 Tests/Bluetooth/run.sh              # about 2 minutes

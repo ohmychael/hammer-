@@ -24,8 +24,8 @@
 //
 // Govee from Terminal:
 //         ./Hammer govee list             find your lights
-//         ./Hammer govee on | off         all lights
-//         ./Hammer govee brightness 40    all lights, 1–100
+//         ./Hammer govee on | off         all your Wi-Fi and cloud lights (not Bluetooth bulbs)
+//         ./Hammer govee brightness 40    the same, 1–100
 //         ./Hammer govee key <API key>    save a Govee cloud API key (optional)
 //
 // Govee lights are reached one of three ways:
@@ -42,28 +42,18 @@ import Carbon.HIToolbox     // global keyboard shortcut
 import CoreBluetooth
 import IOKit
 
-// MARK: - Govee lights
-
-struct GoveeLight {
-    let id: String          // Govee device ID (looks like a MAC address)
-    let sku: String         // model number, e.g. H6159
-    var name: String
-    var lanIP: String?      // set when the light answered on the local network
-    var bluetoothID: UUID? = nil   // set when the light was found over Bluetooth
-
-    /// Route order: local network, then Bluetooth, then the Govee cloud.
-    var routeLabel: String { lanIP != nil ? "" : bluetoothID != nil ? "Bluetooth" : "cloud" }
-}
+// MARK: - Govee lights (GoveeLight itself is in HammerCore.swift)
 
 /// A color for a light: a mix of its color LEDs, or white from its white LEDs.
 enum LightLook {
     case color(Int, Int, Int)
     case white(Int)                 // color temperature in kelvin
 
-    func apply(to light: GoveeLight) {
+    @discardableResult
+    func apply(to light: GoveeLight) -> Bool? {
         switch self {
-        case .color(let r, let g, let b): Govee.setColor(light, red: r, green: g, blue: b)
-        case .white(let kelvin): Govee.setWhite(light, kelvin: kelvin)
+        case .color(let r, let g, let b): return Govee.setColor(light, red: r, green: g, blue: b)
+        case .white(let kelvin): return Govee.setWhite(light, kelvin: kelvin)
         }
     }
 }
@@ -106,37 +96,39 @@ enum Govee {
 
     // MARK: Finding lights (blocks for a couple of seconds — call off the main thread)
 
-    static func discover() -> [GoveeLight] {
+    /// Every light on the local network and in your Govee account. `savedAccount` is
+    /// what the cloud said last time, used if it doesn't answer now; `account` is what
+    /// it said this time (nil: no answer), to save for next time; `reachedNetwork`, that
+    /// the scan went out on the local network (not when Wi-Fi is off).
+    static func discover(savedAccount: [GoveeLight] = [])
+        -> (lights: [GoveeLight], account: [GoveeLight]?, reachedNetwork: Bool) {
         // Ask the cloud in the background while we scan the local network.
-        let cloud = Box<[GoveeLight]>([])
+        let cloud = Box<[GoveeLight]?>(nil)
         let cloudDone = DispatchSemaphore(value: 0)
         if let key = apiKey {
             fetchCloudLights(apiKey: key, into: cloud, done: cloudDone)
         } else {
+            cloud.value = []                          // no key: no account
             cloudDone.signal()
         }
 
         let local = scanLocalNetwork()
         _ = cloudDone.wait(timeout: .now() + 10)
-
-        // Merge: prefer the fast local route, but keep the name from the Govee app.
-        var byID: [String: GoveeLight] = [:]
-        for light in local { byID[light.id.uppercased()] = light }
-        for light in cloud.value {
-            let id = light.id.uppercased()
-            if var known = byID[id] {
-                known.name = light.name
-                byID[id] = known
-            } else {
-                byID[id] = light
-            }
-        }
-        return byID.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        let fetched = cloud.value
+        let account = LightList.account(fetched: fetched, saved: savedAccount)
+        return (LightList.combine(local: local.lights, account: account), fetched, local.reached)   // see HammerCore.swift
     }
 
-    static func scanLocalNetwork(seconds: TimeInterval = 2) -> [GoveeLight] {
+    /// Lights answer the scan and status questions on one port (4002). Two listeners
+    /// there at once could each miss replies, so they take turns.
+    static let replyPortLock = NSLock()
+
+    /// The lights that answer, and whether the scan went out at all.
+    static func scanLocalNetwork(seconds: TimeInterval = 2) -> (lights: [GoveeLight], reached: Bool) {
+        replyPortLock.lock()
+        defer { replyPortLock.unlock() }
         let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard sock >= 0 else { return [] }
+        guard sock >= 0 else { return ([], false) }
         defer { close(sock) }
 
         var yes: Int32 = 1
@@ -154,7 +146,7 @@ enum Govee {
                 bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        guard bound == 0 else { return [] }          // port busy, e.g. another Govee tool is running
+        guard bound == 0 else { return ([], false) }   // port busy, e.g. another Govee tool is running
 
         // Also listen on the multicast group, in case replies are sent there.
         var group = ip_mreq()
@@ -165,95 +157,164 @@ enum Govee {
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 
         let scan = message("scan", ["account_topic": "reserve"])
-        for _ in 0..<2 { sendPacket(scan, from: sock, to: scanGroup, port: scanPort) }   // UDP can drop packets
+        var reached = false                          // no network (Wi-Fi off): sending fails
+        for _ in 0..<2 { reached = sendPacket(scan, from: sock, to: scanGroup, port: scanPort) || reached }   // UDP can drop packets
 
         var found: [String: GoveeLight] = [:]
         var buffer = [UInt8](repeating: 0, count: 2048)
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
-            let count = recv(sock, &buffer, buffer.count, 0)
-            guard count > 0,
-                  let json = try? JSONSerialization.jsonObject(with: Data(buffer[0..<count])) as? [String: Any],
-                  let msg = json["msg"] as? [String: Any], msg["cmd"] as? String == "scan",
-                  let data = msg["data"] as? [String: Any],
-                  let ip = data["ip"] as? String, let id = data["device"] as? String
-            else { continue }                        // timeouts, our own echoed request, junk
-            let sku = data["sku"] as? String ?? "Govee"
-            found[id] = GoveeLight(id: id, sku: sku, name: "\(sku) (\(ip))", lanIP: ip)
+            var sender = sockaddr_in()
+            var senderSize = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let count = withUnsafeMutablePointer(to: &sender) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    recvfrom(sock, &buffer, buffer.count, 0, $0, &senderSize)
+                }
+            }
+            guard count > 0 else { continue }      // timeouts
+            var address = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            guard inet_ntop(AF_INET, &sender.sin_addr, &address, socklen_t(INET_ADDRSTRLEN)) != nil,
+                  let light = GoveeReplies.scanReply(Data(buffer[0..<count]), from: String(cString: address))
+            else { continue }                        // our own echoed request, junk
+            found[light.id] = light
         }
-        return Array(found.values)
+        return (Array(found.values), reached)
     }
 
-    static func fetchCloudLights(apiKey: String, into result: Box<[GoveeLight]>, done: DispatchSemaphore) {
+    static func fetchCloudLights(apiKey: String, into result: Box<[GoveeLight]?>, done: DispatchSemaphore) {
         var request = URLRequest(url: URL(string: cloudBase + "user/devices")!)
         request.setValue(apiKey, forHTTPHeaderField: "Govee-API-Key")
         request.timeoutInterval = 10
         URLSession.shared.dataTask(with: request) { data, _, _ in
             defer { done.signal() }
-            guard let data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let devices = json["data"] as? [[String: Any]] else { return }
-            result.value = devices.compactMap { (device) -> GoveeLight? in
-                guard let id = device["device"] as? String, let sku = device["sku"] as? String,
-                      let capabilities = device["capabilities"] as? [[String: Any]],
-                      capabilities.contains(where: { $0["instance"] as? String == "brightness" })
-                else { return nil }                  // skip plugs, heaters and other non-lights
-                return GoveeLight(id: id, sku: sku, name: device["deviceName"] as? String ?? sku, lanIP: nil)
-            }
+            if let data { result.value = GoveeReplies.cloudLights(in: data) }   // in your account; nil: no answer
         }.resume()
     }
 
     // MARK: Commands
+    //
+    // Each returns whether the light took it: true or false for the cloud (from
+    // Govee's answer) and the local network (sent; it never answers), nil for
+    // Bluetooth, whose answer comes later through GoveeBluetooth.onCommandResult.
+    // `keepFor` is how long a Bluetooth command may wait for a busy bulb (nil: 15 s).
 
-    static func setPower(_ light: GoveeLight, on: Bool) {
+    @discardableResult
+    static func setPower(_ light: GoveeLight, on: Bool, keepFor: TimeInterval? = nil) -> Bool? {
         if light.lanIP != nil {
-            sendLocal(light, "turn", ["value": on ? 1 : 0])
+            return sendLocal(light, "turn", ["value": on ? 1 : 0])
         } else if let ble = light.bluetoothID {
-            sendBluetooth(ble, [0x33, 0x01, on ? 0x01 : 0x00])
+            sendBluetooth(ble, [0x33, 0x01, on ? 0x01 : 0x00], keepFor: keepFor)
+            return nil
         } else {
-            sendCloud(light, type: "devices.capabilities.on_off", instance: "powerSwitch", value: on ? 1 : 0)
+            return sendCloud(light, type: "devices.capabilities.on_off", instance: "powerSwitch", value: on ? 1 : 0)
         }
     }
 
-    static func setBrightness(_ light: GoveeLight, _ percent: Int) {
+    @discardableResult
+    static func setBrightness(_ light: GoveeLight, _ percent: Int) -> Bool? {
         let value = min(max(percent, 1), 100)
         if light.lanIP != nil {
-            sendLocal(light, "brightness", ["value": value])
+            return sendLocal(light, "brightness", ["value": value])
         } else if let ble = light.bluetoothID {
             sendBluetooth(ble, [0x33, 0x04, UInt8(value)])          // these bulbs take 1–100 directly
+            return nil
         } else {
-            sendCloud(light, type: "devices.capabilities.range", instance: "brightness", value: value)
+            return sendCloud(light, type: "devices.capabilities.range", instance: "brightness", value: value)
         }
     }
 
-    static func setColor(_ light: GoveeLight, red: Int, green: Int, blue: Int) {
+    @discardableResult
+    static func setColor(_ light: GoveeLight, red: Int, green: Int, blue: Int) -> Bool? {
+        let (red, green, blue) = (min(max(red, 0), 255), min(max(green, 0), 255), min(max(blue, 0), 255))
         if light.lanIP != nil {
-            sendLocal(light, "colorwc", ["color": ["r": red, "g": green, "b": blue], "colorTemInKelvin": 0])
+            return sendLocal(light, "colorwc", ["color": ["r": red, "g": green, "b": blue], "colorTemInKelvin": 0])
         } else if let ble = light.bluetoothID {
             sendBluetooth(ble, [0x33, 0x05, 0x0D, UInt8(red), UInt8(green), UInt8(blue)])
+            return nil
         } else {
-            sendCloud(light, type: "devices.capabilities.color_setting", instance: "colorRgb",
-                      value: red << 16 | green << 8 | blue)
+            return sendCloud(light, type: "devices.capabilities.color_setting", instance: "colorRgb",
+                             value: red << 16 | green << 8 | blue)
         }
     }
 
     /// White light at a color temperature, 2000–9000 K.
-    static func setWhite(_ light: GoveeLight, kelvin: Int) {
+    @discardableResult
+    static func setWhite(_ light: GoveeLight, kelvin: Int) -> Bool? {
         if light.lanIP != nil {
-            sendLocal(light, "colorwc", ["color": ["r": 0, "g": 0, "b": 0], "colorTemInKelvin": kelvin])
+            return sendLocal(light, "colorwc", ["color": ["r": 0, "g": 0, "b": 0], "colorTemInKelvin": kelvin])
         } else if let ble = light.bluetoothID {
             // Bluetooth bulbs only accept exact table values; these two are the published ones.
             let warm: [UInt8] = [0x33, 0x05, 0x0D, 0xFF, 0xFF, 0xFF, 0x0A, 0x8C, 0xFF, 0xAE, 0x54]   // 2700 K
             let cool: [UInt8] = [0x33, 0x05, 0x0D, 0xFF, 0xFF, 0xFF, 0x19, 0x64, 0xFF, 0xF9, 0xFB]   // 6500 K
             sendBluetooth(ble, kelvin < 4600 ? warm : cool)
+            return nil
         } else {
-            sendCloud(light, type: "devices.capabilities.color_setting", instance: "colorTemperatureK", value: kelvin)
+            return sendCloud(light, type: "devices.capabilities.color_setting", instance: "colorTemperatureK",
+                             value: kelvin)
         }
     }
 
     /// Bluetooth runs on the main thread, so hop there.
-    static func sendBluetooth(_ id: UUID, _ payload: [UInt8]) {
-        DispatchQueue.main.async { GoveeBluetooth.shared.send(payload, to: id) }
+    static func sendBluetooth(_ id: UUID, _ payload: [UInt8], keepFor: TimeInterval? = nil) {
+        DispatchQueue.main.async { GoveeBluetooth.shared.send(payload, to: id, keepFor: keepFor) }
+    }
+
+    /// Whether the light is on, asked of the light itself (for Blink to Identify).
+    /// Blocks for up to a few seconds: call off the main thread. Nil if it didn't say.
+    static func readPower(_ light: GoveeLight) -> Bool? {
+        if let ip = light.lanIP { return lanPower(ip: ip) }
+        if let ble = light.bluetoothID { return GoveeBluetooth.shared.readPower(ble) }
+        return cloudPower(light)
+    }
+
+    /// Asks a light on the local network ("devStatus"); it answers on the scan reply port.
+    static func lanPower(ip: String) -> Bool? {
+        replyPortLock.lock()
+        defer { replyPortLock.unlock() }
+        let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard sock >= 0 else { return nil }
+        defer { close(sock) }
+        var yes: Int32 = 1
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var local = sockaddr_in()
+        local.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        local.sin_family = sa_family_t(AF_INET)
+        local.sin_port = replyPort.bigEndian
+        let bound = withUnsafePointer(to: &local) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        guard bound == 0 else { return nil }
+        var timeout = timeval(tv_sec: 0, tv_usec: 250_000)
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        sendPacket(message("devStatus", [:]), from: sock, to: ip, port: commandPort)
+        var buffer = [UInt8](repeating: 0, count: 2048)
+        let deadline = Date().addingTimeInterval(1.5)
+        while Date() < deadline {
+            let count = recv(sock, &buffer, buffer.count, 0)
+            if count > 0, let on = GoveeReplies.lanPower(in: Data(buffer[0..<count])) { return on }
+        }
+        return nil
+    }
+
+    /// Asks the Govee cloud for a light's state.
+    static func cloudPower(_ light: GoveeLight) -> Bool? {
+        guard let key = apiKey else { return nil }
+        var request = URLRequest(url: URL(string: cloudBase + "device/state")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 5
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(key, forHTTPHeaderField: "Govee-API-Key")
+        let body: [String: Any] = ["requestId": UUID().uuidString, "payload": ["sku": light.sku, "device": light.id]]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        let answer = Box<Bool?>(nil)
+        let done = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            if let data { answer.value = GoveeReplies.cloudPower(in: data) }
+            done.signal()
+        }.resume()
+        _ = done.wait(timeout: .now() + 5)
+        return answer.value
     }
 
     // MARK: Transport
@@ -264,34 +325,37 @@ enum Govee {
         return (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
     }
 
-    static func sendPacket(_ payload: Data, from sock: Int32, to ip: String, port: UInt16) {
+    @discardableResult
+    static func sendPacket(_ payload: Data, from sock: Int32, to ip: String, port: UInt16) -> Bool {
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
         address.sin_port = port.bigEndian
         inet_pton(AF_INET, ip, &address.sin_addr)
-        payload.withUnsafeBytes { bytes in
+        return payload.withUnsafeBytes { bytes in
             withUnsafePointer(to: &address) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockAddress in
-                    _ = sendto(sock, bytes.baseAddress, bytes.count, 0, sockAddress,
-                               socklen_t(MemoryLayout<sockaddr_in>.size))
+                    sendto(sock, bytes.baseAddress, bytes.count, 0, sockAddress,
+                           socklen_t(MemoryLayout<sockaddr_in>.size)) >= 0
                 }
             }
         }
     }
 
-    static func sendLocal(_ light: GoveeLight, _ cmd: String, _ data: [String: Any]) {
-        guard let ip = light.lanIP else { return }
+    /// True once it's sent (lights on the local network don't answer commands).
+    static func sendLocal(_ light: GoveeLight, _ cmd: String, _ data: [String: Any]) -> Bool {
+        guard let ip = light.lanIP else { return false }
         let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard sock >= 0 else { return }
+        guard sock >= 0 else { return false }
         defer { close(sock) }
-        sendPacket(message(cmd, data), from: sock, to: ip, port: commandPort)
+        return sendPacket(message(cmd, data), from: sock, to: ip, port: commandPort)
     }
 
     /// Waits for Govee's reply, so commands go out one at a time and stay
     /// under the cloud's limit of about 2 commands a second per light.
-    static func sendCloud(_ light: GoveeLight, type: String, instance: String, value: Int) {
-        guard let key = apiKey else { return }
+    /// True if Govee took it.
+    static func sendCloud(_ light: GoveeLight, type: String, instance: String, value: Int) -> Bool {
+        guard let key = apiKey else { return false }
         var request = URLRequest(url: URL(string: cloudBase + "device/control")!)
         request.httpMethod = "POST"
         request.timeoutInterval = 10
@@ -302,9 +366,14 @@ enum Govee {
         let body: [String: Any] = ["requestId": UUID().uuidString, "payload": payload]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
+        let took = Box(false)
         let done = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: request) { _, _, _ in done.signal() }.resume()
-        _ = done.wait(timeout: .now() + 10)
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            took.value = GoveeReplies.cloudSucceeded(status: (response as? HTTPURLResponse)?.statusCode ?? 0, body: data)
+            done.signal()
+        }.resume()
+        guard done.wait(timeout: .now() + 10) == .success else { return false }
+        return took.value
     }
 }
 
@@ -352,6 +421,10 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
 
     /// Called on the main thread whenever the bulbs, their connections or their state change.
     var onChange: (() -> Void)?
+    /// Called on the main thread when a command went out to a bulb (true), or was given
+    /// up on without going out (false): it waited too long, or Hammer let go of the bulb.
+    /// With the bulb's ID and the command's kind (its header and command byte, e.g. 0x3301).
+    var onCommandResult: ((UUID, UInt16, Bool) -> Void)?
 
     private var central: CBCentralManager?
     private var peripherals: [UUID: CBPeripheral] = [:]
@@ -377,6 +450,10 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     private var powerState: [UUID: Bool] = [:]               // from the bulb's own replies
     private var lastHeard: [UUID: Date] = [:]
     private var seenThisRun: Set<UUID> = []                  // advertised since Hammer started
+    private var markedSeen: Set<UUID> = []                   // "last seen" saved this run
+    private var linkErrors = LinkErrors()                    // why the last connection attempt failed (HammerCore)
+    private var scanGeneration = 0                           // so an older scan's stop doesn't end a newer scan
+    private var forgotOldBulbs = false
     private var keepAlive: Timer?
     private var ticks = 0
 
@@ -388,7 +465,8 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
 
     var lights: [GoveeLight] {
         found.map { id, info in
-            GoveeLight(id: id.uuidString, sku: info.model, name: info.name, lanIP: nil, bluetoothID: id)
+            GoveeLight(id: id.uuidString, sku: info.model, name: info.name, lanIP: nil, bluetoothID: id,
+                       bluetoothCode: GoveeName.code(inDisplayName: info.name, model: info.model))
         }.sorted { $0.name < $1.name }
     }
 
@@ -426,6 +504,13 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     /// The bulb connected but doesn't offer the control channel Hammer uses.
     func isIncompatible(_ id: UUID) -> Bool { incompatible.contains(id) }
 
+    /// The error code (CBError) from the last failed connection attempt, if the last
+    /// attempt failed outright. A bulb your phone holds doesn't fail: it just never answers.
+    func connectError(_ id: UUID) -> Int? { linkErrors.code(id) }
+
+    /// Why a bulb can't be reached, for the menu's hint.
+    func unreachableReason(_ id: UUID) -> LinkErrors.Reason { linkErrors.reason(id) }
+
     /// On or off, as the bulb itself reported over the current link; nil if it hasn't said.
     func isOn(_ id: UUID) -> Bool? { powerState[id] }
 
@@ -452,13 +537,17 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
 
     /// Looks for nearby bulbs for 15 seconds. Duplicates are allowed so a bulb whose
     /// name arrives in a later advertisement still gets picked up.
+    /// Asking again (opening the menu twice) runs the full 15 seconds from then.
     func rescan() {
         guard let central, central.state == .poweredOn else { return }
         central.stopScan()
         central.scanForPeripherals(withServices: nil,
                                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        scanGeneration += 1
+        let generation = scanGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
-            guard let central = self?.central, central.state == .poweredOn else { return }
+            guard let self, self.scanGeneration == generation,
+                  let central = self.central, central.state == .poweredOn else { return }
             central.stopScan()
         }
     }
@@ -468,7 +557,10 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         guard ids != held else { return }
         let letGo = held.subtracting(ids)
         held = ids
-        for id in letGo { if let peripheral = peripherals[id] { releaseSoon(peripheral) } }
+        for id in letGo {
+            linkErrors.cleared(id)
+            if let peripheral = peripherals[id] { releaseSoon(peripheral) }
+        }
         connectHeld()
     }
 
@@ -476,6 +568,10 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     /// from earlier runs that haven't been seen yet (a busy bulb doesn't broadcast,
     /// but macOS can still hand it over by its ID).
     func connectHeld() {
+        if !forgotOldBulbs {
+            forgotOldBulbs = true
+            forgetOldBulbs()
+        }
         for id in held where found[id] == nil {
             if let saved = knownBulbs[id.uuidString] {
                 found[id] = saved
@@ -496,6 +592,7 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
 
     private func tick() {
         ticks += 1
+        for id in Array(outbox.keys) { expire(id) }   // says which commands never went out
         for id in held where isConnected(id) {
             send([0xAA, 0x01], to: id)            // "are you on?" (replaces any unsent one)
         }
@@ -518,6 +615,25 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         var saved = UserDefaults.standard.dictionary(forKey: "bluetoothBulbs") as? [String: String] ?? [:]
         saved[id.uuidString] = "\(model)|\(name)"
         UserDefaults.standard.set(saved, forKey: "bluetoothBulbs")
+        markSeen(id)
+    }
+
+    /// Notes when a bulb was last seen (once a run), so bulbs that aren't yours can be forgotten.
+    private func markSeen(_ id: UUID) {
+        guard !markedSeen.contains(id) else { return }
+        markedSeen.insert(id)
+        var seen = UserDefaults.standard.dictionary(forKey: "bluetoothBulbsSeen") as? [String: Date] ?? [:]
+        seen[id.uuidString] = Date()
+        UserDefaults.standard.set(seen, forKey: "bluetoothBulbsSeen")
+    }
+
+    /// Forgets bulbs that aren't yours and haven't been seen for 30 days (see BulbMemory).
+    private func forgetOldBulbs() {
+        let saved = UserDefaults.standard.dictionary(forKey: "bluetoothBulbs") as? [String: String] ?? [:]
+        let seen = UserDefaults.standard.dictionary(forKey: "bluetoothBulbsSeen") as? [String: Date] ?? [:]
+        let kept = BulbMemory.prune(saved: saved, seen: seen, keep: Set(held.map { $0.uuidString }), now: Date())
+        UserDefaults.standard.set(kept.saved, forKey: "bluetoothBulbs")
+        UserDefaults.standard.set(kept.seen, forKey: "bluetoothBulbsSeen")
     }
 
     /// Takes a bulb's model and name from what it calls itself, if Hammer didn't know
@@ -544,14 +660,26 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
 
     // MARK: Sending
 
-    func send(_ payload: [UInt8], to id: UUID) {
+    /// Sends a packet to a bulb, connecting first if needed. `keepFor` is how long it
+    /// may wait for a busy bulb (nil: 15 seconds); the sleep timer and Turn On At wait longer.
+    func send(_ payload: [UInt8], to id: UUID, keepFor: TimeInterval? = nil) {
         if peripherals[id] == nil, let central, central.state == .poweredOn {
             for peripheral in central.retrievePeripherals(withIdentifiers: [id]) { adopt(peripheral) }
         }
-        guard let peripheral = peripherals[id] else { return }
-
         let packet = GoveePacket.make(payload)
-        enqueue(packet, for: id)
+        guard let peripheral = peripherals[id] else {
+            // Bluetooth isn't on yet (Hammer just started, or it's resetting, as after a
+            // wake). Your bulbs' commands wait for it; they go once it's back.
+            if held.contains(id) {
+                enqueue(packet, for: id, keepFor: keepFor)
+                if GoveePacket.isCommand(packet) { enqueue(GoveePacket.statusRead, for: id) }
+            } else if GoveePacket.isCommand(packet) {
+                onCommandResult?(id, UInt16(packet[0]) << 8 | UInt16(packet[1]), false)
+            }
+            return
+        }
+
+        enqueue(packet, for: id, keepFor: keepFor)
         if GoveePacket.isCommand(packet) { enqueue(GoveePacket.statusRead, for: id) }   // then ask, so the menu learns on/off
 
         if !held.contains(id) { releaseSoon(peripheral) }            // someone else's bulb: brief visit only
@@ -565,17 +693,45 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
 
     /// Queues a packet, replacing any older one of the same kind: if you change the
     /// brightness five times while the bulb is busy, only the last one matters.
-    private func enqueue(_ packet: [UInt8], for id: UUID) {
+    private func enqueue(_ packet: [UInt8], for id: UUID, keepFor: TimeInterval? = nil) {
         var queue = outbox[id] ?? CommandQueue(freshFor: Self.freshFor)
-        queue.add(packet)
+        queue.add(packet, keepFor: keepFor)
         outbox[id] = queue
     }
 
-    private func hasWork(_ id: UUID) -> Bool {
-        guard var queue = outbox[id] else { return false }
-        queue.dropStale()
+    /// Drops what has waited too long, and says which commands were among it.
+    private func expire(_ id: UUID) {
+        guard var queue = outbox[id] else { return }
+        let stale = queue.dropStale()
         outbox[id] = queue
-        return !queue.isEmpty
+        reportUnsent(stale, to: id)
+    }
+
+    /// Empties a bulb's queue without sending it (Hammer let go of the bulb).
+    private func giveUp(_ id: UUID) {
+        reportUnsent(outbox.removeValue(forKey: id)?.items ?? [], to: id)
+    }
+
+    private func reportUnsent(_ items: [CommandQueue.Item], to id: UUID) {
+        for item in items where GoveePacket.isCommand(item.packet) { onCommandResult?(id, item.key, false) }
+    }
+
+    /// Whether the bulb is on, asking it if Hammer doesn't know yet (connecting first if
+    /// needed): for Blink to Identify. Blocks for up to 4 seconds, so call it off the
+    /// main thread. Nil if the bulb didn't say.
+    func readPower(_ id: UUID) -> Bool? {
+        if let known = DispatchQueue.main.sync(execute: { isOn(id) }) { return known }
+        DispatchQueue.main.async { self.send([0xAA, 0x01], to: id) }        // "are you on?"
+        for _ in 0..<40 {
+            usleep(100_000)
+            if let known = DispatchQueue.main.sync(execute: { isOn(id) }) { return known }
+        }
+        return nil
+    }
+
+    private func hasWork(_ id: UUID) -> Bool {
+        expire(id)
+        return !(outbox[id]?.isEmpty ?? true)
     }
 
     /// Hammer always wants a link to your bulbs, and to anyone else's only while it
@@ -593,8 +749,8 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
             writeInFlight[id] = nil
         }
 
+        expire(id)
         var queue = outbox[id] ?? CommandQueue(freshFor: Self.freshFor)
-        queue.dropStale()
         while let item = queue.items.first {
             let next = item.packet
             if control.properties.contains(.writeWithoutResponse) {
@@ -630,6 +786,20 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         var recent = (recentlyWritten[id] ?? []).filter { now.timeIntervalSince($0.at) < Self.lostWindow }
         recent.append((item: item, at: now))
         recentlyWritten[id] = recent
+        onCommandResult?(id, item.key, true)
+    }
+
+    /// Commands written since the bulb last answered may have gone nowhere when a link
+    /// dies: they go back in the queue, to be sent again after reconnecting.
+    private func restoreLost(_ id: UUID) {
+        let heard = lastHeard[id] ?? .distantPast
+        let lost = (recentlyWritten.removeValue(forKey: id) ?? [])
+            .filter { $0.at > heard && Date().timeIntervalSince($0.at) < Self.lostWindow }
+            .map { $0.item }
+        guard !lost.isEmpty else { return }
+        var queue = outbox[id] ?? CommandQueue(freshFor: Self.freshFor)
+        queue.restore(lost)
+        outbox[id] = queue
     }
 
     /// One pending re-check per bulb.
@@ -693,7 +863,7 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
             guard let self else { return }
             self.releaseTimers[id] = nil
             guard !self.held.contains(id) else { return }
-            self.outbox[id] = nil
+            self.giveUp(id)
             self.recentlyWritten[id] = nil
             self.connectingSince[id] = nil
             self.connectedAt[id] = nil                        // letting go on purpose isn't a failure
@@ -716,7 +886,10 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         } else {
             // Bluetooth went off, is resetting, or isn't allowed: every link is gone,
             // and after a reset macOS's bulb objects are no good either, so they're
-            // fetched again when it's back.
+            // fetched again when it's back. Commands for your bulbs (and any the dying
+            // links may have lost) keep waiting for that, as long as they're fresh.
+            for id in Array(recentlyWritten.keys) where held.contains(id) { restoreLost(id) }
+            for id in Array(outbox.keys) where !held.contains(id) { giveUp(id) }
             peripherals.removeAll()
             controls.removeAll()
             writeInFlight.removeAll()
@@ -724,7 +897,7 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
             connectingSince.removeAll()
             connectedAt.removeAll()
             readyAt.removeAll()
-            outbox.removeAll()
+            linkErrors.clearAll()
             powerState.removeAll()
             lastHeard.removeAll()
             recentlyWritten.removeAll()
@@ -760,10 +933,12 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         let id = peripheral.identifier
         connectingSince[id] = nil
+        linkErrors.cleared(id)
         let session = Date()
         connectedAt[id] = session
         setupRetries[id] = 0
         learnName(id, from: peripheral.name)
+        if found[id] != nil { markSeen(id) }
         peripheral.delegate = self
         peripheral.discoverServices([Self.serviceUUID])
         // If getting the link ready stalls, start over (after a pause) rather than sit on it.
@@ -778,11 +953,12 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         let id = peripheral.identifier
         connectingSince[id] = nil
+        linkErrors.failed(id, code: (error as NSError?)?.code ?? -1)   // e.g. CBError.connectionLimitReached (11)
         backoff.failed(id)
         if held.contains(id) {
             scheduleRetry(id)                             // keep trying, a little slower each time
         } else {
-            outbox[id] = nil
+            giveUp(id)
         }
         onChange?()
     }
@@ -794,17 +970,8 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         writeInFlight[id] = nil
         waitingToWrite[id] = nil
         connectingSince[id] = nil
-        // Commands written since the bulb last answered may have gone nowhere: send them again.
-        let heard = lastHeard[id] ?? .distantPast
-        let lost = (recentlyWritten.removeValue(forKey: id) ?? [])
-            .filter { $0.at > heard && Date().timeIntervalSince($0.at) < Self.lostWindow }
-            .map { $0.item }
-        if !lost.isEmpty {
-            var queue = outbox[id] ?? CommandQueue(freshFor: Self.freshFor)
-            queue.restore(lost)
-            outbox[id] = queue
-        }
-        powerState[id] = nil                              // it may change while someone else has it
+        restoreLost(id)                                   // commands that may have gone nowhere: send them again
+        powerState[id] = nil                             // it may change while someone else has it
         lastHeard[id] = nil
         // Hammer's own disconnects (dropLink, releaseSoon) were already accounted for.
         let ready = readyAt.removeValue(forKey: id)
@@ -841,6 +1008,7 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         controls[id] = control
         readyAt[id] = Date()
         setupRetries[id] = 0
+        linkErrors.cleared(id)
         // Listen for the bulb's replies (on/off state, and proof it's answering). Not on
         // the control channel itself: an echo of "are you on?" would read as "off".
         for characteristic in characteristics
@@ -898,7 +1066,8 @@ final class GoveeBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard error == nil, characteristic.uuid != Self.controlUUID, let value = characteristic.value else { return }
         let id = peripheral.identifier
-        var changed = !isAnswering(id)
+        var changed = linkErrors.cleared(id)              // it's talking to Hammer: whatever failed before is over
+        changed = !isAnswering(id) || changed
         lastHeard[id] = Date()
         if let on = GoveePacket.powerState(in: [UInt8](value)), powerState[id] != on {
             powerState[id] = on
@@ -948,43 +1117,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var searchingForLights = false
 
     /// Every light, each listed once. The same bulb can be found both in the Govee
-    /// cloud and over Bluetooth, and the two don't share an ID, so match by model:
-    /// - one of a model each way: same bulb — keep its app name, use Bluetooth.
-    /// - several of a model, same count each way: same bulbs, but we can't tell
-    ///   which is which, so list the Bluetooth ones (always the right bulb).
-    private var foundLights: [GoveeLight] {
-        var result = networkLights
-        for (sku, nearby) in Dictionary(grouping: bluetoothLights, by: { $0.sku }) {
-            let cloudOnly = result.indices.filter {
-                result[$0].sku == sku && result[$0].lanIP == nil && result[$0].bluetoothID == nil
-            }
-            if cloudOnly.count == 1 && nearby.count == 1 {
-                result[cloudOnly[0]].bluetoothID = nearby[0].bluetoothID
-                continue
-            }
-            if cloudOnly.count == nearby.count {
-                result = result.enumerated().filter { !cloudOnly.contains($0.offset) }.map { $0.element }
-            }
-            result.append(contentsOf: nearby)
-        }
-        return result
-    }
+    /// cloud and over Bluetooth; they're put together only when the bulb's own code
+    /// says so (see LightList.merge in HammerCore.swift).
+    private var foundLights: [GoveeLight] { LightList.merge(network: networkLights, nearby: bluetoothLights) }
 
     /// Your lights: the only ones Hammer controls, including All Lights.
     private var lights: [GoveeLight] { named(foundLights.filter { isMine($0) }) }
 
-    /// Everything else in range: listed under Other Lights, never controlled.
+    /// Everything else in range: listed under Other Lights until you add them.
     private var otherLights: [GoveeLight] { named(foundLights.filter { !isMine($0) }) }
 
-    /// A light found only over Bluetooth could be anyone's (Bluetooth reaches
-    /// through walls), so it's yours only once you add it. Lights on your Wi-Fi
-    /// or in your Govee account are yours unless you remove them.
+    /// Lights in your Govee account are yours unless you remove them. One found only
+    /// nearby, over Bluetooth or on the local network, could be anyone's (Bluetooth
+    /// reaches through walls; dorms and offices share Wi-Fi): it's yours once you add it.
     private func isMine(_ light: GoveeLight) -> Bool {
-        isBluetoothOnly(light) ? myBluetoothIDs.contains(light.id) : !hiddenIDs.contains(light.id)
-    }
-
-    private func isBluetoothOnly(_ light: GoveeLight) -> Bool {
-        light.lanIP == nil && light.bluetoothID?.uuidString == light.id
+        LightList.isMine(light, added: myBluetoothIDs, hidden: hiddenIDs)
     }
 
     private func named(_ list: [GoveeLight]) -> [GoveeLight] {
@@ -998,12 +1145,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    /// Bluetooth bulbs you've added. Until the first add, any bulb you'd
-    /// already renamed counts as yours.
+    /// Lights you've added (Bluetooth bulbs, and lights only on the local network).
+    /// Until the first add, any light you'd already renamed counts as yours. (The
+    /// setting kept its first name, from when only Bluetooth bulbs were added.)
     private var myBluetoothIDs: Set<String> {
         get {
-            if let saved = UserDefaults.standard.stringArray(forKey: "myBluetoothLights") { return Set(saved) }
-            return Set(customNames.keys)
+            LightList.added(saved: UserDefaults.standard.stringArray(forKey: "myBluetoothLights"), renamed: customNames)
         }
         set { UserDefaults.standard.set(Array(newValue), forKey: "myBluetoothLights") }
     }
@@ -1017,6 +1164,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hiddenIDs: Set<String> {
         get { Set(UserDefaults.standard.stringArray(forKey: "hiddenLights") ?? []) }
         set { UserDefaults.standard.set(Array(newValue), forKey: "hiddenLights") }
+    }
+
+    /// Your Govee account's lights as the cloud last listed them, used when it doesn't answer.
+    private var savedAccount: [GoveeLight] {
+        get { LightList.account(from: UserDefaults.standard.array(forKey: "accountLights") as? [[String: String]] ?? []) }
+        set { UserDefaults.standard.set(LightList.saved(newValue), forKey: "accountLights") }
     }
 
     /// The installed version (a commit from the GitHub repo), written in by build.sh.
@@ -1056,7 +1209,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var edgeYouTube: EdgePlayer?
 
     private let ddcQueue = DispatchQueue(label: "Hammer.ddc")       // I²C is slow; keep it off the main thread
-    private let goveeQueue = DispatchQueue(label: "Hammer.govee")   // one light command at a time
+    // Light commands go one at a time per route, so a slow cloud command or a rescan
+    // never holds up a Bluetooth or Wi-Fi light (see queue(for:)).
+    private let lanQueue = DispatchQueue(label: "Hammer.lights.lan")
+    private let bluetoothQueue = DispatchQueue(label: "Hammer.lights.bluetooth")
+    private let cloudQueue = DispatchQueue(label: "Hammer.lights.cloud")      // waits up to 10 s per command
+    private let scanQueue = DispatchQueue(label: "Hammer.lights.scan")        // Rescan Lights: up to ~12 s
+    private let blinkQueue = DispatchQueue(label: "Hammer.lights.blink")      // Blink to Identify: ~5 s
+    private let wakeQueue = DispatchQueue(label: "Hammer.lights.wake")        // pmset and its password prompt
     private var pending: [String: DispatchWorkItem] = [:]            // latest value per slider
 
     /// `Hammer tour <folder> [--demo]`: screenshots of every menu and window (TourMac below).
@@ -1075,6 +1235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let delegate = self else { return }
             Task { @MainActor in delegate.bluetoothChanged() }
         }
+        GoveeBluetooth.shared.onCommandResult = { [weak self] id, kind, ok in Task { @MainActor in self?.bluetoothResult(id, kind, ok) } }
         GoveeBluetooth.shared.start()        // first time: macOS asks to allow Bluetooth
         GoveeBluetooth.shared.hold(heldBluetoothIDs)
         DeliveryWatcher.shared.onChange = { [weak self] in
@@ -1416,6 +1577,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !tourDemo else { return }                  // the tour's stand-in lights stay
         bluetoothLights = GoveeBluetooth.shared.lights
         GoveeBluetooth.shared.hold(heldBluetoothIDs)
+        if scheduleWaiting { checkSchedules() }          // a sleep timer or Turn On At waiting for your lights
+        for light in foundLights {                       // a bulb that's back: its "Couldn't reach" goes
+            if let ble = light.bluetoothID, GoveeBluetooth.shared.isConnected(ble) { notes.reached(light.id) }
+        }
         rebuildMenuSoon()
     }
 
@@ -1581,21 +1746,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let problem = GoveeBluetooth.shared.problem {
             menu.addItem(hint(problem))
         }
+        for note in notes.lines(now: Date()) { menu.addItem(hint(note)) }   // e.g. "Couldn't reach Bedroom Bulb"
         let others = otherLights
         if lights.isEmpty && others.isEmpty && searchingForLights {
             menu.addItem(hint("Searching…"))
         } else if lights.isEmpty && !others.isEmpty {
             menu.addItem(label("No lights added yet"))
-            menu.addItem(hint("Bulbs found over Bluetooth could be anyone's, so"))
-            menu.addItem(hint("Hammer won't touch them until you add yours from"))
-            menu.addItem(hint("Other Lights below."))
+            menu.addItem(hint("Add yours from Other Lights."))
         } else if lights.isEmpty {
             menu.addItem(label("No lights found"))
-            menu.addItem(hint("Bluetooth bulbs (like the H6006) appear by themselves"))
-            menu.addItem(hint("when nearby. Close the Govee app on your phone first,"))
-            menu.addItem(hint("since a bulb talks to one device at a time."))
-            menu.addItem(hint("Wi-Fi lights: turn on LAN Control in the Govee app,"))
-            menu.addItem(hint("then choose Rescan Lights."))
+            menu.addItem(hint("Close the Govee phone app or turn on LAN Control."))
         } else {
             if lights.count > 1 { menu.addItem(lightItem(nil)) }    // "All Lights"
             for light in lights { menu.addItem(lightItem(light)) }
@@ -2295,14 +2455,128 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         searchingForLights = true
         GoveeBluetooth.shared.rescan()
         GoveeBluetooth.shared.connectHeld()
+        startLANMigration()
         rebuildMenu()
-        goveeQueue.async {
-            let found = Govee.discover()
+        let saved = savedAccount
+        scanQueue.async {
+            let found = Govee.discover(savedAccount: saved)
             Task { @MainActor in
-                if !self.tourDemo { self.networkLights = found }
+                if let account = found.account { self.savedAccount = account }      // the cloud answered
+                if !self.tourDemo {
+                    self.networkLights = found.lights
+                    self.migrateLANLights(found.lights, reachedNetwork: found.reachedNetwork)
+                }
                 self.searchingForLights = false
+                self.lightsScanned = true
                 self.rebuildMenu()
+                self.checkSchedules()          // one that came due while Hammer was starting
             }
+        }
+    }
+
+    /// Whether this Hammer was used before lights found only on the local network had
+    /// to be added: decided once, at the first rescan, before this run saves anything.
+    private func startLANMigration() {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: "lanLightsMigrated") == nil,
+              defaults.object(forKey: "lanMigrationStarted") == nil else { return }
+        if LANMigration.updating(settings: Set(defaults.dictionaryRepresentation().keys)) {
+            defaults.set(Date(), forKey: "lanMigrationStarted")
+        } else {
+            defaults.set(true, forKey: "lanLightsMigrated")              // a new install: nothing to carry over
+        }
+    }
+
+    /// Adds the lights found only on the local network that an older Hammer counted as
+    /// yours and you'd set up (see LANMigration), at the first scan that reaches the network.
+    private func migrateLANLights(_ found: [GoveeLight], reachedNetwork: Bool) {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: "lanLightsMigrated"),
+              let started = defaults.object(forKey: "lanMigrationStarted") as? Date else { return }
+        var migration = LANMigration(startedAt: started)
+        let setUp = Set(customNames.keys).union(modes.keys)
+        let add = migration.scanned(found: found, reachedNetwork: reachedNetwork, hidden: hiddenIDs, setUp: setUp,
+                                    now: Date())
+        if !add.isEmpty { myBluetoothIDs = myBluetoothIDs.union(add) }
+        if migration.done { defaults.set(true, forKey: "lanLightsMigrated") }
+    }
+
+    /// Each route has its own queue, so Bluetooth never waits behind the cloud or a scan.
+    private func queue(for light: GoveeLight) -> DispatchQueue {
+        switch light.route {
+        case .lan: return lanQueue
+        case .bluetooth: return bluetoothQueue
+        case .cloud: return cloudQueue
+        }
+    }
+
+    /// Runs `command` for each light on its route's queue, and notes whether it landed.
+    private func send(to targets: [GoveeLight], _ kind: LightResults.Kind, scheduled: Bool = false,
+                      _ command: @escaping (GoveeLight) -> Bool?) {
+        for light in targets {
+            activity.touched(light.id)
+            queue(for: light).async { [weak self] in self?.landed(light, kind, command(light), scheduled: scheduled) }
+        }
+    }
+
+    // MARK: When a command doesn't land (LightResults, LightNotes in HammerCore.swift)
+
+    private var results = LightResults()          // what Hammer waits to hear, per light and kind of command
+    private var notes = LightNotes()              // "Couldn't reach …" lines in the menu
+    private let activity = LightActivity()        // when each light was last sent something (for Blink)
+    private var delivery = ScheduledDelivery()    // a scheduled on/off on its way: the Mac stays awake
+    private var deliveryHold: NSObjectProtocol?
+
+    /// From a light's queue: what the light said (nil: Bluetooth, which says so later).
+    /// `scheduled`: the sleep timer's or Turn On At's (not a tap's).
+    nonisolated private func landed(_ light: GoveeLight, _ kind: LightResults.Kind, _ result: Bool?,
+                                    scheduled: Bool = false) {
+        guard let ok = result else { return }
+        Task { @MainActor in self.commandResult(light.id, kind, ok, scheduled: scheduled) }
+    }
+
+    private func bluetoothResult(_ id: UUID, _ key: UInt16, _ ok: Bool) {
+        guard let kind = LightResults.Kind(packetKey: key) else { return }
+        // Over Bluetooth a tap replaces a waiting scheduled command, so whose it is can't be told.
+        for light in foundLights where light.bluetoothID == id { commandResult(light.id, kind, ok, scheduled: nil) }
+    }
+
+    private func commandResult(_ lightID: String, _ kind: LightResults.Kind, _ ok: Bool, scheduled: Bool?) {
+        let waited = results.result(lightID, kind, scheduled: scheduled)
+        if kind == .power && scheduled != false {           // a tap's result doesn't end the scheduled one's wait
+            delivery.finished(lightID)
+            updateDeliveryHold()
+        }
+        if ok {
+            if let mode = waited?.mode.flatMap(LightMode.init(rawValue:)) {
+                setMode(mode, for: foundLights.filter { $0.id == lightID })
+            }
+            if notes.reached(lightID) { rebuildMenuSoon() }
+            return
+        }
+        let name = named(foundLights).first { $0.id == lightID }?.name ?? "a light"
+        let scheduled = waited?.scheduled == true
+        notes.failed(lightID, waited?.failNote ?? "Couldn't reach \(name)", scheduled: scheduled, now: Date())
+        let seconds = scheduled ? LightNotes.scheduledFor : LightNotes.reachFor
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds + 1) { [weak self] in
+            Task { @MainActor in self?.rebuildMenuSoon() }          // the line goes
+        }
+        rebuildMenuSoon()
+    }
+
+    /// Keeps the Mac from idle sleep while a scheduled on/off is on its way to your
+    /// lights (up to 5 minutes), and in the 2 minutes before a Turn On (the Mac may have
+    /// just woken for it); lets it sleep again after.
+    private func updateDeliveryHold() {
+        let now = Date()
+        delivery.expire(now: now)
+        let hold = delivery.holding(now: now) || LightSchedule.turnOnSoon(turnOnNext, now: now)
+        if hold, deliveryHold == nil {
+            deliveryHold = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled],
+                                                                 reason: "Hammer is turning your lights on or off")
+        } else if !hold, let held = deliveryHold {
+            ProcessInfo.processInfo.endActivity(held)
+            deliveryHold = nil
         }
     }
 
@@ -2332,10 +2606,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard let ble = light.bluetoothID else { return }
+        let reason = bluetooth.unreachableReason(ble)      // see LinkErrors in HammerCore.swift
         if bluetooth.isIncompatible(ble) {
-            submenu.addItem(hint("This bulb answered but doesn't accept Hammer's"))
-            submenu.addItem(hint("commands, so Hammer let it go. Was its firmware just"))
-            submenu.addItem(hint("updated in the Govee app? Tell Claude the new version."))
+            submenu.addItem(hint("This bulb doesn't accept Hammer's commands"))
+            submenu.addItem(hint("(after a firmware update?), so Hammer let it go."))
+            submenu.addItem(hint("It checks again every 5 minutes."))
+        } else if bluetooth.cantReach(ble), reason == .tooManyDevices {
+            // The connection failed outright: that's macOS or the bulb, not your phone.
+            submenu.addItem(hint("This Mac has too many Bluetooth devices connected."))
+            submenu.addItem(hint("Turn one off; Hammer keeps trying."))
+        } else if bluetooth.cantReach(ble), reason == .refused {
+            submenu.addItem(hint("macOS couldn't connect to this bulb. Hammer keeps"))
+            submenu.addItem(hint("trying; switching the bulb off and on can help."))
         } else if bluetooth.cantReach(ble) {
             submenu.addItem(hint("Can't reach this bulb right now. If the Govee app on"))
             submenu.addItem(hint("your phone has it, force-quit the app; Hammer connects"))
@@ -2384,12 +2666,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         var title: String
         if let light {
-            var route = light.routeLabel
+            // The route only when something's wrong with it.
+            title = light.name
             if let ble = light.bluetoothID,
                GoveeBluetooth.shared.cantReach(ble) || GoveeBluetooth.shared.isIncompatible(ble) {
-                route = "can't reach"
+                title += " · can't reach"
             }
-            title = route.isEmpty ? light.name : "\(light.name) · \(route)"
         } else {
             title = "All Lights (\(lights.count))"
         }
@@ -2410,16 +2692,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Cloud lights accept about 2 commands a second, so wait longer before sending to them.
-    private func delay(for light: GoveeLight) -> Double { light.routeLabel == "cloud" ? 0.5 : 0.08 }
+    private func delay(for light: GoveeLight) -> Double { light.route == .cloud ? 0.5 : 0.08 }
 
     @objc private func turnOn(_ sender: NSMenuItem) {
-        let targets = targetLights(sender)
-        goveeQueue.async { targets.forEach { Govee.setPower($0, on: true) } }
+        send(to: targetLights(sender), .power) { Govee.setPower($0, on: true) }
     }
 
     @objc private func turnOff(_ sender: NSMenuItem) {
-        let targets = targetLights(sender)
-        goveeQueue.async { targets.forEach { Govee.setPower($0, on: false) } }
+        send(to: targetLights(sender), .power) { Govee.setPower($0, on: false) }
     }
 
     // MARK: Brightness and color
@@ -2428,7 +2708,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // else: it never sends a color. (Faking "dimmer than 1%" by darkening the
     // color shifts it toward red, because the green and blue LEDs cut out first.)
 
-    private var levels: [String: Double] = [:]      // slider position per light (and for All Lights)
+    /// Slider position per light (and for All Lights), kept between launches.
+    private var levels: [String: Double] {
+        get { UserDefaults.standard.dictionary(forKey: "lightLevels") as? [String: Double] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "lightLevels") }
+    }
 
     @objc private func lightSliderMoved(_ slider: NSSlider) {
         guard let id = slider.identifier?.rawValue else { return }
@@ -2446,39 +2730,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func applyLevel(_ level: Double, to light: GoveeLight) {
         levels[light.id] = level
         let percent = max(1, Int(level.rounded()))
-        schedule("level-\(light.id)", on: goveeQueue, after: delay(for: light)) {
-            Govee.setPower(light, on: true)        // adjusting a light that's off turns it on
-            Govee.setBrightness(light, percent)
+        activity.touched(light.id)
+        schedule("level-\(light.id)", on: queue(for: light), after: delay(for: light)) { [weak self] in
+            self?.landed(light, .power, Govee.setPower(light, on: true))   // adjusting a light that's off turns it on
+            self?.landed(light, .brightness, Govee.setBrightness(light, percent))
         }
     }
 
-    /// Changes the lights' color; brightness stays where it is.
-    private func setLook(_ look: LightLook, for targets: [GoveeLight]) {
+    /// Changes the lights' color; brightness stays where it is. The checkmark moves
+    /// to `mode` for each light once it has taken it.
+    private func setLook(_ look: LightLook, for targets: [GoveeLight], mode: LightMode) {
         for light in targets {
-            schedule("look-\(light.id)", on: goveeQueue, after: delay(for: light)) {
-                Govee.setPower(light, on: true)
-                look.apply(to: light)
+            results.expect(light.id, .look, LightResults.Waiting(mode: mode.rawValue))
+            activity.touched(light.id)
+            schedule("look-\(light.id)", on: queue(for: light), after: delay(for: light)) { [weak self] in
+                self?.landed(light, .power, Govee.setPower(light, on: true))
+                self?.landed(light, .look, look.apply(to: light))
             }
         }
     }
 
     @objc private func warmWhite(_ sender: NSMenuItem) {
-        setLook(.white(2700), for: targetLights(sender))
-        setMode(.warmWhite, for: targetLights(sender))
+        setLook(.white(2700), for: targetLights(sender), mode: .warmWhite)
     }
 
     @objc private func daylight(_ sender: NSMenuItem) {
-        setLook(.white(6500), for: targetLights(sender))
-        setMode(.daylight, for: targetLights(sender))
+        setLook(.white(6500), for: targetLights(sender), mode: .daylight)
     }
 
     /// The dimmest the bulb goes without changing color: warm white at 1%.
     @objc private func nightLight(_ sender: NSMenuItem) {
         let targets = targetLights(sender)
         if let id = sender.representedObject as? String { levels[id] = 0 }
-        setLook(.white(2700), for: targets)
+        setLook(.white(2700), for: targets, mode: .nightLight)
         for light in targets { applyLevel(0, to: light) }
-        setMode(.nightLight, for: targets)
         rebuildMenu()                                  // move the sliders to the far left
     }
 
@@ -2495,24 +2780,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// The picker chooses the color only (hue and saturation, at full strength);
-    /// brightness stays on the Brightness slider, so the two never fight.
+    /// brightness stays on the Brightness slider, so the two never fight. Black, or the
+    /// panel's own brightness turned right down, has no color in it and changes nothing
+    /// (see ColorPick in HammerCore.swift).
     @objc private func colorChanged(_ panel: NSColorPanel) {
-        guard let id = colorTargetID, let color = panel.color.usingColorSpace(.sRGB) else { return }
-        var hue: CGFloat = 0, saturation: CGFloat = 0, value: CGFloat = 0, alpha: CGFloat = 0
-        color.getHue(&hue, saturation: &saturation, brightness: &value, alpha: &alpha)
-        let vivid = NSColor(colorSpace: .sRGB, hue: hue, saturation: saturation, brightness: 1, alpha: 1)
-
-        func byte(_ component: CGFloat) -> Int { min(max(Int((component * 255).rounded()), 0), 255) }
-        setLook(.color(byte(vivid.redComponent), byte(vivid.greenComponent), byte(vivid.blueComponent)),
-                for: lightsMatching(id))
-        setMode(.color, for: lightsMatching(id))
+        guard let id = colorTargetID, let color = panel.color.usingColorSpace(.sRGB),
+              let rgb = ColorPick.vivid(red: Double(color.redComponent), green: Double(color.greenComponent),
+                                        blue: Double(color.blueComponent)) else { return }
+        setLook(.color(rgb.0, rgb.1, rgb.2), for: lightsMatching(id), mode: .color)
     }
 
     // MARK: Sleep timer
 
     /// Times on the timer slider, in minutes.
     private static let timerSteps = [5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 360, 480]
-    private var timerChoice = 30                      // what the slider is set to
+    /// What the slider is set to, kept between launches.
+    private var timerChoice: Int {
+        get {
+            let saved = UserDefaults.standard.integer(forKey: "timerChoice")
+            return Self.timerSteps.contains(saved) ? saved : 30
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "timerChoice") }
+    }
     private var timerChoiceLabel: NSTextField?
     private var timerCheck: Timer?
     private var stayAwake: NSObjectProtocol?
@@ -2603,20 +2892,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                            reason: "Hammer sleep timer")
         let check = Timer(timeInterval: 20, repeats: true) { [weak self] _ in
             guard let delegate = self else { return }
-            Task { @MainActor in delegate.checkTimer() }
+            Task { @MainActor in delegate.checkSchedules() }
         }
         RunLoop.main.add(check, forMode: .common)     // keeps ticking while the menu is open
         timerCheck = check
-        checkTimer()
+        checkSchedules()
     }
 
-    func checkTimer() {
-        guard let end = timerEnd, Date() >= end else { return }
-        let targets = lights
-        goveeQueue.async { targets.forEach { Govee.setPower($0, on: false) } }
-        timerEnd = nil
-        armTimer()
-        rebuildMenu()
+    /// Whether the first scan for lights has finished (at launch they fill in over a few seconds).
+    private var lightsScanned = false
+    /// Since when a sleep timer or Turn On At that came due has been waiting for your lights.
+    private var dueSince: Date?
+    private var scheduleRetryPending = false
+    private var scheduleWaiting: Bool { dueSince != nil }
+
+    /// Carries out the sleep timer and Turn On At once they're due; see LightSchedule in
+    /// HammerCore.swift for which one wins when both are (e.g. after a night asleep).
+    /// Right after Hammer starts the lights aren't known yet, so it waits for the first
+    /// scan, and up to 2 minutes for your lights to show up, before giving up.
+    func checkSchedules() {
+        let now = Date()
+        updateDeliveryHold()                          // awake in the 2 minutes before a Turn On
+        let decision = LightSchedule.decide(timerEnd: timerEnd, turnOnAt: turnOnNext, now: now)
+        guard decision.timerDone || decision.turnOnDone else { dueSince = nil; return }
+        if let action = decision.send, let at = decision.scheduledFor {
+            if !tourDemo { bluetoothLights = GoveeBluetooth.shared.lights }
+            let targets = lights
+            if dueSince == nil { dueSince = now }
+            if LightSchedule.shouldWait(scanned: lightsScanned, haveLights: !targets.isEmpty, dueSince: dueSince ?? now,
+                                        now: now) {
+                if !scheduleRetryPending {
+                    scheduleRetryPending = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+                        Task { @MainActor in
+                            self?.scheduleRetryPending = false
+                            self?.checkSchedules()
+                        }
+                    }
+                }
+                return
+            }
+            let what = action == .on ? "turn on" : "turn off"
+            for light in targets {
+                results.expect(light.id, .power, LightResults.Waiting(
+                    failNote: "Couldn't \(what) \(light.name) at \(clockTime(at))", scheduled: true))
+            }
+            if targets.isEmpty {
+                notes.failed("lights", "Couldn't \(what) your lights at \(clockTime(at))", scheduled: true, now: now)
+            }
+            // Bluetooth bulbs get 5 minutes to free up (your phone may have one, or Bluetooth
+            // is just back), and the Mac stays awake until each light has it or gives up.
+            delivery.start(targets.map { $0.id }, now: now)
+            send(to: targets, .power, scheduled: true) { Govee.setPower($0, on: action == .on, keepFor: LightSchedule.keepFor) }
+            updateDeliveryHold()
+            DispatchQueue.main.asyncAfter(deadline: .now() + LightSchedule.keepFor + 15) { [weak self] in
+                Task { @MainActor in self?.updateDeliveryHold() }    // at most 5 minutes
+            }
+        }
+        dueSince = nil
+        if decision.timerDone {
+            timerEnd = nil
+            armTimer()
+        }
+        if decision.turnOnDone { moveTurnOnAlong() }
+        updateDeliveryHold()
+        rebuildMenuSoon()
     }
 
     // MARK: Turn on at a set time
@@ -2633,7 +2973,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var turnOnHour: Int { defaults.integer(forKey: "turnOnHour") }
     private var turnOnMinute: Int { defaults.integer(forKey: "turnOnMinute") }
     private var turnOnRepeats: Bool { defaults.bool(forKey: "turnOnRepeats") }
-    private var turnOnWakesMac: Bool { defaults.bool(forKey: "turnOnWakesMac") }
+
+    /// The wake Hammer asked macOS for (pmset), saved so it can cancel exactly that one.
+    /// Only changed on wakeQueue (updateMacWake), one change at a time.
+    private var hammerWake: MacWake.Event? {
+        if let saved = defaults.string(forKey: "macWake") { return MacWake.Event(saved: saved) }
+        // Set by an older Hammer, which didn't save it: work it out from its settings.
+        guard defaults.bool(forKey: "turnOnWakesMac"), let next = turnOnNext else { return nil }
+        return MacWake.event(before: next, everyDay: turnOnRepeats)
+    }
+
+    nonisolated private static func storeWake(_ wake: MacWake.Event?) {
+        UserDefaults.standard.set(wake?.saved ?? "", forKey: "macWake")
+        UserDefaults.standard.removeObject(forKey: "turnOnWakesMac")
+    }
+    private var wakeBlocked = false                    // the Mac already has a repeating wake or sleep time
+
+    /// The Mac wakes for the Turn On that's set (not just for an earlier one).
+    private var turnOnWakesMac: Bool {
+        guard let next = turnOnNext, let wake = hammerWake else { return false }
+        return wake == MacWake.event(before: next, everyDay: turnOnRepeats)
+    }
 
     private func addTurnOnTime(to submenu: NSMenu) {
         submenu.addItem(.separator())
@@ -2641,9 +3001,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let next = turnOnNext {
             let when = turnOnRepeats ? "every day at \(clockTime(next))" : "at \(clockTime(next))"
             submenu.addItem(hint("Your lights turn on \(when)."))
-            if turnOnWakesMac { submenu.addItem(hint("Your Mac wakes a minute before.")) }
+            if turnOnWakesMac {
+                submenu.addItem(hint("Your Mac wakes a minute before."))
+            } else if wakeBlocked {
+                submenu.addItem(hint("Your Mac already has a repeating wake or sleep"))
+                submenu.addItem(hint("time set, so Hammer left it alone."))
+            }
             submenu.addItem(action("Change Time…", #selector(setTurnOnTime)))
-            submenu.addItem(action("Remove", #selector(removeTurnOnTime)))
+            submenu.addItem(action("Cancel Turn On", #selector(removeTurnOnTime)))
         } else {
             submenu.addItem(action("Set a Time…", #selector(setTurnOnTime)))
         }
@@ -2653,7 +3018,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startClock() {
         let tick = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
             guard let delegate = self else { return }
-            Task { @MainActor in delegate.checkTurnOn() }
+            Task { @MainActor in delegate.checkSchedules() }
         }
         RunLoop.main.add(tick, forMode: .common)
         clock = tick
@@ -2661,35 +3026,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                           name: NSWorkspace.didWakeNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(screensWoke),
                                                           name: NSWorkspace.screensDidWakeNotification, object: nil)
-        checkTurnOn()
+        checkSchedules()
     }
 
     @objc private func macWoke() {
-        // Give Bluetooth a few seconds to come back before sending anything.
+        // Give Bluetooth a few seconds to come back before sending anything (commands
+        // for your bulbs wait for it anyway). The timer and Turn On At are checked
+        // together, so the one scheduled later wins.
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
             guard let delegate = self else { return }
             Task { @MainActor in
-                delegate.checkTurnOn()
-                delegate.checkTimer()
+                delegate.checkSchedules()
                 delegate.reapplyIfDimming()                 // macOS resets screens' color curves on wake
             }
         }
     }
 
-    func checkTurnOn() {
-        guard let next = turnOnNext, Date() >= next else { return }
-        // Skip it if the Mac was asleep and it's now more than 30 minutes late.
-        if Date().timeIntervalSince(next) < 30 * 60 {
-            let targets = lights
-            goveeQueue.async { targets.forEach { Govee.setPower($0, on: true) } }
+    /// After Turn On At came due (sent, or skipped as too late): the same time on the
+    /// next day if it repeats, never twice on one day (as when the clocks go back).
+    private func moveTurnOnAlong() {
+        guard let due = turnOnNext else { return }
+        if turnOnRepeats {
+            turnOnNext = TurnOnClock.following(due, hour: turnOnHour, minute: turnOnMinute, now: Date(),
+                                               calendar: .current)
+        } else {
+            turnOnNext = nil
+            wakeQueue.async {                                     // macOS has used up a one-time wake
+                if case .once? = MacWake.Event(saved: UserDefaults.standard.string(forKey: "macWake") ?? "") {
+                    Self.storeWake(nil)
+                }
+            }
         }
-        turnOnNext = turnOnRepeats ? nextOccurrence(hour: turnOnHour, minute: turnOnMinute) : nil
-        rebuildMenuSoon()
     }
 
     private func nextOccurrence(hour: Int, minute: Int) -> Date? {
-        Calendar.current.nextDate(after: Date(), matching: DateComponents(hour: hour, minute: minute, second: 0),
-                                  matchingPolicy: .nextTime)
+        TurnOnClock.next(hour: hour, minute: minute, after: Date(), calendar: .current)
     }
 
     @objc private func setTurnOnTime() {
@@ -2724,6 +3095,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
+        let before = hammerWake                       // (an older Hammer's, worked out from the settings about to change)
         let parts = Calendar.current.dateComponents([.hour, .minute], from: picker.dateValue)
         let hour = parts.hour ?? 7, minute = parts.minute ?? 0
         let repeats = everyDay.state == .on
@@ -2731,46 +3103,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defaults.set(minute, forKey: "turnOnMinute")
         defaults.set(repeats, forKey: "turnOnRepeats")
         turnOnNext = nextOccurrence(hour: hour, minute: minute)
-
-        if wake.state == .on, let next = turnOnNext {
-            defaults.set(scheduleMacWake(before: next, everyDay: repeats), forKey: "turnOnWakesMac")
-        } else {
-            defaults.set(false, forKey: "turnOnWakesMac")
-        }
+        let wanted = wake.state == .on ? turnOnNext.map { MacWake.event(before: $0, everyDay: repeats) } : nil
+        updateMacWake(legacy: before, to: wanted)
         rebuildMenu()
     }
 
     @objc private func removeTurnOnTime() {
-        if turnOnWakesMac && turnOnRepeats {
-            runAsAdmin("/usr/bin/pmset repeat cancel")     // stop the daily wake too
-        }
+        let before = hammerWake
         turnOnNext = nil
-        defaults.set(false, forKey: "turnOnWakesMac")
+        updateMacWake(legacy: before, to: nil)        // stops the Mac waking for it too
         rebuildMenu()
     }
 
-    /// Asks macOS to wake the Mac a minute before `date` (needs your password once).
-    /// A daily wake replaces any other repeating wake schedule on this Mac.
-    private func scheduleMacWake(before date: Date, everyDay: Bool) -> Bool {
-        let wakeAt = date.addingTimeInterval(-60)
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        if everyDay {
-            formatter.dateFormat = "HH:mm:ss"
-            return runAsAdmin("/usr/bin/pmset repeat wake MTWRFSU \(formatter.string(from: wakeAt))")
-        } else {
-            formatter.dateFormat = "MM/dd/yy HH:mm:ss"
-            return runAsAdmin("/usr/bin/pmset schedule wake '\(formatter.string(from: wakeAt))'")
+    /// Changes the Mac's wake from the one Hammer set before to `wanted` (see MacWake.plan
+    /// in HammerCore.swift: it cancels exactly Hammer's own, and never touches a repeating
+    /// schedule of yours). In the background: pmset, and macOS's password prompt when
+    /// anything changes, would otherwise hold up Bluetooth, which runs on the main thread.
+    /// `legacy` is the wake an older Hammer set (it didn't save it), worked out before the
+    /// settings changed; it's only used if nothing is saved yet.
+    private func updateMacWake(legacy: MacWake.Event?, to wanted: MacWake.Event?) {
+        wakeBlocked = false
+        wakeQueue.async { [weak self] in
+            // Read and saved here, one change at a time, so two quick changes can't lose a wake.
+            let saved = UserDefaults.standard.string(forKey: "macWake")
+            let current = saved == nil ? legacy : MacWake.Event(saved: saved ?? "")
+            if saved == nil { Self.storeWake(current) }
+            guard current != nil || wanted != nil, let schedule = Self.pmsetSchedule() else { return }
+            let plan = MacWake.plan(current: current, wanted: wanted, schedule: schedule, now: Date())
+            var ok = true
+            if !plan.commands.isEmpty {
+                // Built only from Hammer's fixed commands and checked dates (MacWake.adminScript).
+                ok = MacWake.adminScript(plan.commands, wakes: wanted != nil).map { Self.runAsAdmin(script: $0) } ?? false
+            }
+            if ok { Self.storeWake(plan.result) }
+            Task { @MainActor in
+                self?.wakeBlocked = plan.blocked
+                self?.rebuildMenuSoon()
+            }
         }
     }
 
-    /// Runs a command with administrator rights, using macOS's standard password prompt.
-    @discardableResult
-    private func runAsAdmin(_ command: String) -> Bool {
-        let source = "do shell script \"\(command)\" with administrator privileges"
-        var error: NSDictionary?
-        NSAppleScript(source: source)?.executeAndReturnError(&error)
-        return error == nil
+    /// What's scheduled (`pmset -g sched`; no password needed). Nil if it can't be read.
+    nonisolated private static func pmsetSchedule() -> String? {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        task.arguments = ["-g", "sched"]
+        let output = Pipe()
+        task.standardOutput = output
+        task.standardError = FileHandle.nullDevice
+        guard (try? task.run()) != nil else { return nil }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        return task.terminationStatus == 0 ? String(decoding: data, as: UTF8.self) : nil
+    }
+
+    /// Runs MacWake.adminScript's AppleScript, which asks for your password with Hammer's
+    /// own explanation, and waits for it: call off the main thread. (osascript rather than
+    /// NSAppleScript, which is main-thread only.) False if it failed or you cancelled.
+    nonisolated private static func runAsAdmin(script: String) -> Bool {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        task.arguments = ["-e", script]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        guard (try? task.run()) != nil else { return false }
+        task.waitUntilExit()
+        return task.terminationStatus == 0
     }
 
     // MARK: Telling lights apart
@@ -2778,8 +3176,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Lights that aren't yours yet, each with how far away it seems and a way to add it.
     private func otherLightsItem(_ others: [GoveeLight]) -> NSMenuItem {
         let submenu = NSMenu()
-        submenu.addItem(hint("Hammer never controls these, not even with"))
-        submenu.addItem(hint("All Lights. Add the ones that are yours."))
+        submenu.addItem(hint("Hammer won't control these until you add them."))
+        submenu.addItem(hint("Blink just flashes one so you can find it."))
         submenu.addItem(.separator())
         for light in others {
             let options = NSMenu()
@@ -2798,18 +3196,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    /// Flashes the light off and on twice so you can see which one it is.
+    /// Flashes the light twice so you can see which one it is, and leaves it on or off
+    /// as it was (see Blink.steps in HammerCore.swift).
     @objc private func blink(_ sender: NSMenuItem) {
         // Works on your lights and on Other Lights (to check which bulb one is).
-        guard let id = sender.representedObject as? String else { return }
-        let targets = foundLights.filter { $0.id == id }
-        goveeQueue.async {
-            targets.forEach { Govee.setPower($0, on: true) }   // wakes a sleeping Bluetooth link first
-            usleep(1_500_000)
-            for on in [false, true, false, true] {
-                targets.forEach { Govee.setPower($0, on: on) }
-                usleep(700_000)
-            }
+        guard let id = sender.representedObject as? String,
+              let light = foundLights.first(where: { $0.id == id }) else { return }
+        let mine = isMine(light)
+        let activity = self.activity, started = Date()
+        blinkQueue.async { [weak self] in
+            Blink.run(mine: mine,
+                      readPower: { Govee.readPower(light) },          // over Bluetooth this connects first
+                      setPower: { on in self?.landed(light, .power, Govee.setPower(light, on: on)) },
+                      interrupted: { activity.touched(light.id, since: started) },   // you sent it something since
+                      pause: { usleep(700_000) })
         }
     }
 
@@ -2838,7 +3238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func addToMyLights(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String,
               let light = foundLights.first(where: { $0.id == id }) else { return }
-        if isBluetoothOnly(light) {
+        if !light.inAccount {                              // found nearby only (Bluetooth or Wi-Fi)
             var mine = myBluetoothIDs
             mine.insert(id)
             myBluetoothIDs = mine
@@ -2855,7 +3255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func removeFromMyLights(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String,
               let light = foundLights.first(where: { $0.id == id }) else { return }
-        if isBluetoothOnly(light) {
+        if !light.inAccount {
             var mine = myBluetoothIDs
             mine.remove(id)
             myBluetoothIDs = mine
@@ -3040,19 +3440,33 @@ enum Hammer {
             percent = value
         }
 
-        let lights = Govee.discover()
-        if lights.isEmpty {
+        // Only your lights, as in the menu: not ones you removed, and lights found only on
+        // the network once you've added them. (The bare ~/Hammer/Hammer has no bundle, so
+        // it reads the app's settings by name.)
+        let settings = Bundle.main.bundleIdentifier == nil ? (UserDefaults(suiteName: "local.hammer") ?? .standard)
+                                                           : .standard
+        let account = LightList.account(from: settings.array(forKey: "accountLights") as? [[String: String]] ?? [])
+        let found = Govee.discover(savedAccount: account).lights
+        if found.isEmpty {
             print("No lights found. Turn on LAN Control for each light in the Govee Home app,")
             print("or save a cloud API key with: Hammer govee key <API key>")
             return 1
         }
+        let names = settings.dictionary(forKey: "lightNames") as? [String: String] ?? [:]
+        let added = LightList.added(saved: settings.stringArray(forKey: "myBluetoothLights"), renamed: names)
+        let hidden = Set(settings.stringArray(forKey: "hiddenLights") ?? [])
+        let lights = found.filter { LightList.isMine($0, added: added, hidden: hidden) }
 
         switch command {
         case "list":
-            for light in lights {
+            for light in found {
                 let route = light.lanIP.map { "local \($0)" } ?? "cloud"
-                print("\(light.name)  [\(light.sku)]  \(route)")
+                let other = lights.contains { $0.id == light.id } ? "" : "  (not in My Lights)"
+                print("\(names[light.id] ?? light.name)  [\(light.sku)]  \(route)\(other)")
             }
+        case _ where lights.isEmpty:
+            print("None of these are in My Lights. Add yours from Other Lights in Hammer's menu.")
+            return 1
         case "on", "off":
             lights.forEach { Govee.setPower($0, on: command == "on") }
             print("Done.")
@@ -3096,9 +3510,9 @@ extension AppDelegate {
 
     private func applyTourDemo() {
         networkLights = [
-            GoveeLight(id: "D1:7A:A4:C1:38:42:11:90", sku: "H6159", name: "Desk Strip", lanIP: "192.168.1.40"),
-            GoveeLight(id: "C3:12:A4:C1:38:9B:20:4E", sku: "H6006", name: "Bedroom Bulb", lanIP: nil),
-            GoveeLight(id: "A8:55:A4:C1:38:61:7F:02", sku: "H6006", name: "Hallway Bulb", lanIP: nil),
+            GoveeLight(id: "D1:7A:A4:C1:38:42:11:90", sku: "H6159", name: "Desk Strip", lanIP: "192.168.1.40", inAccount: true),
+            GoveeLight(id: "C3:12:A4:C1:38:9B:20:4E", sku: "H6006", name: "Bedroom Bulb", lanIP: nil, inAccount: true),
+            GoveeLight(id: "A8:55:A4:C1:38:61:7F:02", sku: "H6006", name: "Hallway Bulb", lanIP: nil, inAccount: true),
         ]
         let nearby = UUID(uuidString: "6F1C2B9A-5D3E-4A7B-9C10-2E8F4D6A1B3C")!
         bluetoothLights = [GoveeLight(id: nearby.uuidString, sku: "H6006", name: "H6006", lanIP: nil, bluetoothID: nearby)]
