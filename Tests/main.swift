@@ -142,6 +142,8 @@ expect(queue.isEmpty && droppedItems.count == 1 && GoveePacket.isCommand(dropped
 queue.add(GoveePacket.make([0x33, 0x01, 0x01]), at: at(0), keepFor: 300)
 queue.add(GoveePacket.make([0x33, 0x01, 0x00]), at: at(1))
 expect(queue.items.count == 1 && queue.items[0].keepFor == nil, "a newer tap of the same kind replaces it, with its own time")
+queue.dropStale(now: at(16))
+expect(queue.isEmpty, "so a tap made instead of a waiting Turn On is dropped after 15 s, and the Turn On with it")
 queue = CommandQueue()
 queue.restore([CommandQueue.Item(key: 0x3301, packet: GoveePacket.make([0x33, 0x01, 0x01]), at: at(0), keepFor: 300)])
 queue.dropStale(now: at(100))
@@ -261,6 +263,35 @@ expect(LightList.added(saved: nil, renamed: ["a": "Desk"]) == ["a"] && LightList
 expect(GoveeLight(id: "x", sku: "H6006", name: "x", lanIP: nil).route == .cloud && lanOnly.route == .lan
        && neighbors.route == .bluetooth && mergedLights[0].route == .bluetooth, "routes")
 
+// Your account's lights are kept, so a cloud that doesn't answer doesn't make them Other Lights.
+let savedList = LightList.saved([cloudBulb, otherCloud])
+let restored = LightList.account(from: savedList + [["sku": "H6006"], ["id": "", "sku": "H6006"]])
+expect(restored.map { $0.id } == [cloudBulb.id, otherCloud.id] && restored.allSatisfy { $0.inAccount }
+       && restored[0].name == "Bedroom Bulb", "saved and read back, in your account; bad entries skipped")
+expect(LightList.account(fetched: nil, saved: restored).count == 2, "no answer: last time's list")
+expect(LightList.account(fetched: [], saved: restored).isEmpty, "an answer, even an empty one, replaces it")
+let lanBedroom = GoveeLight(id: "c3:12:a4:c1:38:9b:0f:c3", sku: "H6006", name: "H6006 (10.0.0.5)", lanIP: "10.0.0.5")
+let combined = LightList.combine(local: [lanBedroom, lanOnly], account: restored)
+expect(combined.count == 3, "one light each: \(combined.map { $0.name })")
+let bedroomNow = combined.first { $0.id == lanBedroom.id }
+expect(bedroomNow?.inAccount == true && bedroomNow?.lanIP == "10.0.0.5" && bedroomNow?.name == "Bedroom Bulb"
+       && LightList.isMine(bedroomNow!, added: [], hidden: []), "on Wi-Fi and in the saved account: yours, the fast route")
+expect(combined.first { $0.id == lanOnly.id }?.inAccount == false, "a light only on the network still isn't in it")
+
+// Once, after updating: lights only on the local network that an older Hammer counted as yours are added.
+let migrationStart = at(0)
+var migration = LANMigration.step(found: [cloudBulb], hidden: [], startedAt: migrationStart, now: at(60))
+expect(migration.add.isEmpty && !migration.done, "waits for a scan that reaches the local network")
+let hiddenLAN = GoveeLight(id: "99:88", sku: "H6159", name: "Hidden", lanIP: "10.0.0.8")
+migration = LANMigration.step(found: [lanOnly, hiddenLAN, bedroomNow!, cloudBulb], hidden: [hiddenLAN.id],
+                              startedAt: migrationStart, now: at(120))
+expect(migration.add == [lanOnly.id] && migration.done, "adds the ones on Wi-Fi only, not removed ones or account ones")
+migration = LANMigration.step(found: [lanOnly], hidden: [], startedAt: migrationStart, now: at(4 * 86_400))
+expect(migration.add.isEmpty && migration.done, "gives up after 3 days")
+expect(LANMigration.updating(settings: ["lightModes", "NSStatusItem Visible Hammer"])
+       && !LANMigration.updating(settings: ["bluetoothBulbs", "bluetoothBulbsSeen", "NSStatusItem Visible Hammer"]),
+       "only an older Hammer that was used is migrated, not a new install")
+
 // Remembering Bluetooth bulbs: neighbors' bulbs not seen for 30 days are forgotten; yours never.
 let lightsDay: TimeInterval = 86_400
 let bulbMemory = BulbMemory.prune(saved: ["old": "H6006|H6006 bulb 0001", "recent": "H6006|H6006 bulb 0002",
@@ -284,7 +315,11 @@ expect(GoveeReplies.lanPower(in: Data(#"{"msg":{"cmd":"devStatus","data":{"onOff
        && GoveeReplies.lanPower(in: Data(#"{"msg":{"cmd":"devStatus","data":{"onOff":1}}}"#.utf8)) == true
        && GoveeReplies.lanPower(in: Data(scanBody.utf8)) == nil, "local-network on/off")
 let cloudAccount = #"{"code":200,"data":[{"sku":"H6006","device":"C3:12","deviceName":"Bedroom Bulb","capabilities":[{"instance":"powerSwitch"},{"instance":"brightness"}]},{"sku":"H5080","device":"P1","deviceName":"Plug","capabilities":[{"instance":"powerSwitch"}]}]}"#
-let fromCloud = GoveeReplies.cloudLights(in: Data(cloudAccount.utf8))
+let fromCloud = GoveeReplies.cloudLights(in: Data(cloudAccount.utf8)) ?? []
+expect(GoveeReplies.cloudLights(in: Data(#"{"code":401,"message":"bad key"}"#.utf8)) == nil
+       && GoveeReplies.cloudLights(in: Data("<html>".utf8)) == nil
+       && GoveeReplies.cloudLights(in: Data(#"{"code":200,"data":[]}"#.utf8))?.isEmpty == true,
+       "no answer (nil) isn't the same as an account with no lights")
 expect(fromCloud.count == 1 && fromCloud[0].name == "Bedroom Bulb" && fromCloud[0].inAccount && fromCloud[0].lanIP == nil,
        "cloud lights are in your account; plugs are skipped")
 expect(GoveeReplies.cloudSucceeded(status: 200, body: Data(#"{"code":200,"msg":"success"}"#.utf8))
@@ -301,6 +336,66 @@ expect(Blink.steps(wasOn: false, mine: true) == [true, false, true, false], "a l
 expect(Blink.steps(wasOn: true, mine: false) == [false, true, false, true], "a light that was on ends on")
 expect(Blink.steps(wasOn: nil, mine: false).last == false, "unknown, and not yours: ends off")
 expect(Blink.steps(wasOn: nil, mine: true).last == true, "unknown, and yours: ends on")
+var blinkSent: [Bool] = []
+var blinkPauses = 0
+var blinkSteps = Blink.run(mine: false, readPower: { true }, setPower: { blinkSent.append($0) },
+                           interrupted: { false }, pause: { blinkPauses += 1 })
+expect(blinkSteps == [false, true, false, true] && blinkSent == blinkSteps && blinkPauses == 4, "a full blink of a light that was on")
+blinkSent = []
+blinkSteps = Blink.run(mine: false, readPower: { nil }, setPower: { blinkSent.append($0) },
+                       interrupted: { blinkSent.count >= 1 }, pause: {})
+expect(blinkSteps == [true] && blinkSent == [true], "a tap during the blink stops it: nothing undoes the tap")
+let blinkActivity = LightActivity()
+let blinkStarted = at(10)
+expect(!blinkActivity.touched("bulb", since: blinkStarted), "nothing sent yet")
+blinkActivity.touched("bulb", at: at(5))
+expect(!blinkActivity.touched("bulb", since: blinkStarted), "sent before the blink started: carries on")
+blinkActivity.touched("bulb", at: at(11))
+expect(blinkActivity.touched("bulb", since: blinkStarted) && !blinkActivity.touched("other", since: blinkStarted),
+       "sent since: that light stops, others don't")
+
+// The color panel: hue and saturation at full strength; black has no color and changes nothing.
+expect(ColorPick.vivid(red: 0, green: 0, blue: 0) == nil && ColorPick.vivid(red: 0.03, green: 0.01, blue: 0) == nil,
+       "black, or the panel's brightness right down: ignored (not white, not off)")
+expect(ColorPick.vivid(red: 1, green: 0, blue: 0).map { [$0.0, $0.1, $0.2] } == [255, 0, 0]
+       && ColorPick.vivid(red: 0.5, green: 0, blue: 0).map { [$0.0, $0.1, $0.2] } == [255, 0, 0]
+       && ColorPick.vivid(red: 0.5, green: 0.25, blue: 0).map { [$0.0, $0.1, $0.2] } == [255, 128, 0]
+       && ColorPick.vivid(red: 0.4, green: 0.4, blue: 0.4).map { [$0.0, $0.1, $0.2] } == [255, 255, 255],
+       "a darker pick is the same color at full strength")
+
+// MARK: Lights: what lights said back, and the lines in the menu
+
+expect(LightResults.Kind(packetKey: 0x3301) == .power && LightResults.Kind(packetKey: 0x3304) == .brightness
+       && LightResults.Kind(packetKey: 0x3305) == .look && LightResults.Kind(packetKey: 0xAA01) == nil, "kinds of packets")
+var waits = LightResults()
+waits.expect("bulb", .look, LightResults.Waiting(mode: "warmWhite"))
+waits.expect("bulb", .power, LightResults.Waiting(failNote: "Couldn't turn on Bulb at 7:00 AM", scheduled: true))
+expect(waits.result("bulb", .brightness) == nil, "a brightness result settles nothing else")
+expect(waits.result("bulb", .look)?.mode == "warmWhite", "the color landing moves the checkmark")
+expect(waits.result("bulb", .look) == nil, "only once")
+expect(waits.result("bulb", .power)?.scheduled == true && waits.waiting.isEmpty, "the scheduled on is still waited for")
+waits.expect("bulb", .look, LightResults.Waiting(mode: "daylight"))
+waits.expect("bulb", .look, LightResults.Waiting(mode: "color"))
+expect(waits.result("bulb", .look)?.mode == "color", "a newer pick of the same kind replaces the older")
+
+var menuNotes = LightNotes()
+menuNotes.failed("bedroom", "Couldn't turn on Bedroom at 7:00 AM", scheduled: true, now: at(0))
+menuNotes.failed("bedroom", "Couldn't reach Bedroom", scheduled: false, now: at(10))
+expect(menuNotes.lines(now: at(20)) == ["Couldn't turn on Bedroom at 7:00 AM"], "a tap's failure doesn't replace a missed schedule")
+expect(!menuNotes.reached("bedroom") && menuNotes.lines(now: at(20)).count == 1, "and reaching the bulb keeps it (it still happened)")
+menuNotes.failed("desk", "Couldn't reach Desk", scheduled: false, now: at(0))
+expect(menuNotes.reached("desk") && menuNotes.lines(now: at(20)) == ["Couldn't turn on Bedroom at 7:00 AM"],
+       "a bulb that connects or answers loses its line")
+for name in ["A", "B", "C"] { menuNotes.failed(name, "Couldn't reach \(name)", scheduled: false, now: at(0)) }
+menuNotes.failed("hall", "Couldn't turn off Hall at 11:00 PM", scheduled: true, now: at(0))
+expect(menuNotes.lines(now: at(30)) == ["Couldn't turn off Hall at 11:00 PM", "Couldn't turn on Bedroom at 7:00 AM",
+                                        "Couldn't reach 3 lights"], "at most three lines; the count is only lights not reached")
+expect(menuNotes.lines(now: at(LightNotes.reachFor + 1)).count == 2, "a missed reach goes after 10 minutes")
+var crowded = LightNotes()
+for name in ["P", "Q", "R", "S"] { crowded.failed(name, "Couldn't turn on \(name) at 7:00 AM", scheduled: true, now: at(0)) }
+for name in ["X", "Y"] { crowded.failed(name, "Couldn't reach \(name)", scheduled: false, now: at(0)) }
+expect(crowded.lines(now: at(1)).last == "Couldn't reach 2 lights", "counts only lights not reached: \(crowded.lines(now: at(1)))")
+expect(menuNotes.lines(now: at(LightNotes.scheduledFor + 1)).isEmpty, "a missed schedule after 12 hours")
 
 // MARK: Lights: sleep timer and Turn On At
 
@@ -319,6 +414,31 @@ lightsDue = LightSchedule.decide(timerEnd: nil, turnOnAt: at(-31 * 60), now: at(
 expect(lightsDue.send == nil && lightsDue.turnOnDone, "a Turn On more than 30 minutes late is skipped")
 lightsDue = LightSchedule.decide(timerEnd: at(-10), turnOnAt: at(-10), now: at(0))
 expect(lightsDue.send == .on, "a tie: on")
+// Timer at 7:00, Turn On at 7:15, the Mac wakes at 7:50: the Turn On is too late, and the timer doesn't go instead.
+lightsDue = LightSchedule.decide(timerEnd: at(7 * 3600), turnOnAt: at(7 * 3600 + 900), now: at(7 * 3600 + 3000))
+expect(lightsDue.send == nil && lightsDue.timerDone && lightsDue.turnOnDone, "a skipped later Turn On also stops the earlier timer")
+lightsDue = LightSchedule.decide(timerEnd: at(-90 * 60), turnOnAt: at(-100 * 60), now: at(0))
+expect(lightsDue.send == nil, "a later timer that's over an hour stale: nothing, not the earlier Turn On")
+
+// At launch: wait for the first scan and for your lights, at most 2 minutes.
+expect(LightSchedule.shouldWait(scanned: false, haveLights: true, dueSince: at(0), now: at(5)), "before the first scan")
+expect(LightSchedule.shouldWait(scanned: true, haveLights: false, dueSince: at(0), now: at(60)), "no lights yet")
+expect(!LightSchedule.shouldWait(scanned: true, haveLights: true, dueSince: at(0), now: at(5)), "scanned, lights there: send")
+expect(!LightSchedule.shouldWait(scanned: false, haveLights: false, dueSince: at(0), now: at(120)), "gives up after 2 minutes")
+// Awake until it's there: before a Turn On, and while a scheduled command is on its way.
+expect(LightSchedule.turnOnSoon(at(100), now: at(0)) && !LightSchedule.turnOnSoon(at(200), now: at(0))
+       && !LightSchedule.turnOnSoon(at(-1), now: at(0)) && !LightSchedule.turnOnSoon(nil, now: at(0)), "the 2 minutes before a Turn On")
+var onItsWay = ScheduledDelivery()
+expect(!onItsWay.holding(now: at(0)), "nothing on its way")
+onItsWay.start(["a", "b"], now: at(0))
+onItsWay.finished("a")
+expect(onItsWay.holding(now: at(100)), "one light still to take it: stays awake")
+onItsWay.finished("b")
+expect(!onItsWay.holding(now: at(100)), "every light took it or gave up: may sleep")
+onItsWay.start(["c"], now: at(0))
+expect(onItsWay.holding(now: at(300)) && !onItsWay.holding(now: at(LightSchedule.keepFor + 10)), "at most 5 minutes")
+onItsWay.expire(now: at(400))
+expect(onItsWay.waiting.isEmpty && onItsWay.until == nil, "and then forgotten")
 
 // Daily Turn On when the clocks go back: New York, Sunday 1 November 2026, 1:30 happens twice.
 var newYork = Calendar(identifier: .gregorian)
@@ -366,6 +486,9 @@ expect(MacWake.event(before: sevenAM, everyDay: true, timeZone: wakeZone) == .da
 expect(MacWake.Event(saved: MacWake.Event.daily("06:59:00").saved) == .daily("06:59:00")
        && MacWake.Event(saved: "once 11/01/26 06:59:00") == .once("11/01/26 06:59:00") && MacWake.Event(saved: "") == nil,
        "saved and read back")
+expect(["daily 24:00:00", "daily 6:59:00", "daily 06:59", "daily 06:59:00; rm -rf ~", "daily 06:59:00' || true",
+        "once 13/01/26 06:59:00", "once 11/01/2026 06:59:00", "once 11/01/26 06:59:00'; reboot", "weekly 06:59:00",
+        "daily \n06:59:00"].allSatisfy { MacWake.Event(saved: $0) == nil }, "a malformed saved wake is ignored")
 let hammersRepeat = "Repeating power events:\n  wakepoweron at 6:59AM every day\nScheduled power events:\n [0]  wake at 11/01/2026 06:59:00 by 'pmset'\n"
 let usersRepeat = "Repeating power events:\n  wakepoweron at 6:59AM every day\n  shutdown at 11:00PM weekdays only\n"
 expect(MacWake.repeating(in: hammersRepeat) == ["wakepoweron at 6:59AM every day"] && MacWake.repeating(in: "").isEmpty,
@@ -373,6 +496,13 @@ expect(MacWake.repeating(in: hammersRepeat) == ["wakepoweron at 6:59AM every day
 expect(MacWake.isWake("wakepoweron at 6:59AM every day", at: "06:59:00") && !MacWake.isWake("wakepoweron at 7:59AM every day", at: "06:59:00")
        && MacWake.isWake("wake at 18:30 every day", at: "18:30:00") && MacWake.isWake("wakepoweron at 12:05AM every day", at: "00:05:00")
        && !MacWake.isWake("shutdown at 6:59AM every day", at: "06:59:00"), "is it Hammer's wake")
+expect(MacWake.isWake("wakepoweron at 6:30PM every day", at: "18:30:00") && !MacWake.isWake("wakepoweron at 6:30PM every day", at: "06:30:00")
+       && !MacWake.isWake("wakepoweron at 6:30AM every day", at: "18:30:00") && MacWake.isWake("wakepoweron at 12:15PM every day", at: "12:15:00")
+       && !MacWake.isWake("wakepoweron at 12:15AM every day", at: "12:15:00") && MacWake.isWake("wake at 6:30 pm every day", at: "18:30:00")
+       && MacWake.isWake("wakepoweron at 11:59PM every day", at: "23:59:00"), "PM times")
+expect(!MacWake.isWake("wakepoweron at 6:59AM every day", at: "6:59") && !MacWake.isWake("wakepoweron at 6:59AM every day", at: "06:59:00x")
+       && !MacWake.isWake("wakepoweron every day", at: "06:59:00") && !MacWake.isWake("wakepoweron at 13:05PM every day", at: "13:05:00"),
+       "anything unreadable isn't Hammer's (so it's never cancelled)")
 let beforeIt = sevenAM.addingTimeInterval(-3600)
 var wakePlan = MacWake.plan(current: nil, wanted: .daily("06:59:00"), schedule: "", now: beforeIt, timeZone: wakeZone)
 expect(wakePlan.commands == ["/usr/bin/pmset repeat wake MTWRFSU 06:59:00"] && wakePlan.result == .daily("06:59:00"),
@@ -398,6 +528,29 @@ wakePlan = MacWake.plan(current: .daily("06:59:00"), wanted: .daily("06:59:00"),
 expect(wakePlan.commands.isEmpty && wakePlan.result == .daily("06:59:00"), "the same again: no password prompt")
 wakePlan = MacWake.plan(current: .daily("06:59:00"), wanted: .daily("06:59:00"), schedule: "", now: beforeIt, timeZone: wakeZone)
 expect(wakePlan.commands.count == 1, "the same again, but it was cleared since: set again")
+wakePlan = MacWake.plan(current: .daily("06:59:00'; rm -rf ~; '"), wanted: .once("11/01/26 06:59:00\"; reboot"),
+                        schedule: "", now: beforeIt, timeZone: wakeZone)
+expect(wakePlan.commands.isEmpty && wakePlan.result == nil, "malformed events never become commands")
+
+// The administrator command: only Hammer's own pmset commands, with Hammer's own reason for the password.
+let wakeScript = MacWake.adminScript(["/usr/bin/pmset repeat cancel", "/usr/bin/pmset schedule wake '11/01/26 06:59:00'"], wakes: true)
+expect(wakeScript == #"do shell script "/usr/bin/pmset repeat cancel && /usr/bin/pmset schedule wake '11/01/26 06:59:00'" with prompt "Hammer needs your password to wake your Mac for Turn On At." with administrator privileges"#,
+       "the AppleScript: \(wakeScript ?? "nil")")
+expect(MacWake.adminScript(["/usr/bin/pmset schedule cancel wake '11/01/26 06:59:00' || true"], wakes: false)?
+         .contains(#"with prompt "Hammer needs your password to stop waking your Mac for Turn On At.""#) == true,
+       "cancelling says so")
+expect(MacWake.adminScript(["/usr/bin/pmset repeat cancel; rm -rf ~"], wakes: true) == nil
+       && MacWake.adminScript(["/usr/bin/pmset repeat wake MTWRFSU 06:59:00\" & do shell script \"x"], wakes: true) == nil
+       && MacWake.adminScript(["/usr/bin/pmset schedule wake '11/01/26 06:59:00' || reboot"], wakes: true) == nil
+       && MacWake.adminScript(["/bin/rm -rf /"], wakes: true) == nil && MacWake.adminScript([], wakes: true) == nil,
+       "anything else is refused")
+let everyKindOfPlan = [
+    MacWake.plan(current: nil, wanted: .daily("06:59:00"), schedule: "", now: beforeIt, timeZone: wakeZone),
+    MacWake.plan(current: .daily("06:59:00"), wanted: .once("11/01/26 06:59:00"), schedule: hammersRepeat, now: beforeIt, timeZone: wakeZone),
+    MacWake.plan(current: .once("11/01/26 06:59:00"), wanted: nil, schedule: "", now: beforeIt, timeZone: wakeZone),
+]
+expect(everyKindOfPlan.allSatisfy { MacWake.adminScript($0.commands, wakes: true) != nil }, "every command a plan makes is allowed")
+expect(MacWake.quoted(#"a"b\c"#) == #""a\"b\\c""#, "AppleScript quoting escapes quotes and backslashes: \(MacWake.quoted(#"a"b\c"#))")
 
 // MARK: DDC/CI (monitor) packets
 

@@ -49,7 +49,8 @@ let gb = GoveeBluetooth()
 var heldSet: Set<UUID> = []
 var rebuilds = 0
 var results: [(id: UUID, ok: Bool)] = []          // what onCommandResult reported
-gb.onCommandResult = { id, ok in results.append((id, ok)) }
+var resultKinds: [UInt16] = []
+gb.onCommandResult = { id, kind, ok in results.append((id, ok)); resultKinds.append(kind) }
 gb.onChange = {                                   // what AppDelegate does on every change
     Task { @MainActor in
         rebuilds += 1
@@ -612,25 +613,71 @@ case "limit":   // macOS refuses another link (too many devices); the bulb is ot
     list[4].connectFails = true
     let busy = addBulb(name: "ihoment_H6006_BEEF")
     busy.phoneHasIt = true
+    let refused = addBulb(name: "ihoment_H6006_DEAD")
+    refused.connectFails = true
     startHammer(holding: list + [busy])
     run(10)
     check(gb.cantReach(list[4].id) && gb.connectError(list[4].id) != nil, "can't reach, and the menu knows the connection failed")
     check(gb.cantReach(busy.id) && gb.connectError(busy.id) == nil, "a bulb the phone holds just never answers (the phone hint)")
+    heldSet.remove(busy.id)
+    heldSet.insert(refused.id)
+    gb.hold(heldSet)
+    run(3)
+    check(gb.connectError(refused.id) != nil, "another that refuses")
+    heldSet.remove(refused.id)
+    gb.hold(heldSet)
+    check(gb.connectError(refused.id) == nil, "removed from your lights: no error left to show")
+    list[4].connectFails = false
+    run(65)                                                      // the next retry (backoff up to a minute)
+    check(gb.isConnected(list[4].id) && gb.connectError(list[4].id) == nil, "connected later: the hint goes")
 
-case "blink-restores":   // Blink to Identify a neighbor's bulb that was off: it ends off
+case "manual-replaces":   // a tap replaces a scheduled command still waiting for the bulb
+    let bulb = addBulb()
+    startHammer(holding: [bulb])
+    run(2)
+    phoneTakes(bulb)
+    run(0.5)
+    let tap = Date()
+    gb.send([0x33, 0x01, 0x01], to: bulb.id, keepFor: 300)       // Turn On At, waiting for the phone
+    run(1)
+    gb.send([0x33, 0x01, 0x00], to: bulb.id)                     // you turn it off in Hammer
+    run(3)
+    phoneLetsGo(bulb)
+    run(2)
+    check(commands(to: bulb, since: tap) == ["off"] && bulb.power == false, "only your tap goes out: \(commands(to: bulb, since: tap))")
+    check(resultKinds.allSatisfy { $0 == 0x3301 } && results.filter { $0.ok }.count == 1, "one power result, sent")
+
+case "blink-restores":   // Blink to Identify a neighbor's bulb that was off, as the app does it: it ends off
     let theirs = addBulb(name: "ihoment_H6006_ABCD")
     theirs.power = false
     startHammer(holding: [])
     run(1)
-    gb.send([0xAA, 0x01], to: theirs.id)                         // what Govee.readPower does first
-    var waited = 0.0
-    while gb.isOn(theirs.id) == nil && waited < 4 { run(0.1); waited += 0.1 }
-    check(gb.isOn(theirs.id) == false, "learns it's off before blinking")
-    for on in Blink.steps(wasOn: gb.isOn(theirs.id), mine: false) {
-        gb.send([0x33, 0x01, on ? 1 : 0], to: theirs.id)
-        run(0.7)
+    final class Outcome { var steps: [Bool]? }
+    let blinked = Outcome()
+    DispatchQueue.global().async {                               // off the main thread, like blinkQueue
+        let sent = Blink.run(mine: false, readPower: { gb.readPower(theirs.id) },
+                             setPower: { on in DispatchQueue.main.async { gb.send([0x33, 0x01, on ? 1 : 0], to: theirs.id) } },
+                             interrupted: { false }, pause: { usleep(700_000) })
+        DispatchQueue.main.async { blinked.steps = sent }
     }
+    var waited = 0.0
+    while blinked.steps == nil && waited < 12 { run(0.1); waited += 0.1 }
+    run(0.5)
+    check(blinked.steps == [true, false, true, false], "readPower learned it was off: \(blinked.steps ?? [])")
     check(commands(to: theirs) == ["on", "off", "on", "off"], "two flashes: \(commands(to: theirs))")
+    // Another neighbor's bulb that was on: without asking, Hammer would leave it off.
+    let lit = addBulb(name: "ihoment_H6006_BEEF")
+    let litBlink = Outcome()
+    DispatchQueue.global().async {
+        let sent = Blink.run(mine: false, readPower: { gb.readPower(lit.id) },
+                             setPower: { on in DispatchQueue.main.async { gb.send([0x33, 0x01, on ? 1 : 0], to: lit.id) } },
+                             interrupted: { false }, pause: { usleep(700_000) })
+        DispatchQueue.main.async { litBlink.steps = sent }
+    }
+    waited = 0
+    while litBlink.steps == nil && waited < 12 { run(0.1); waited += 0.1 }
+    run(0.5)
+    check(litBlink.steps == [false, true, false, true] && lit.power == true, "one that was on ends on: \(commands(to: lit))")
     run(12)
     check(theirs.power == false && theirs.peripheral._state == .disconnected, "left off, and let go")
 

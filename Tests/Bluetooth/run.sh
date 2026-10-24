@@ -41,7 +41,7 @@ ALL="phone phone-long restart-busy first-run storm short-links discovery-once di
      discovery-hangs incompatible no-service busy-link slider reset bluetooth-off remove
      remove-connected neighbor blink echo steady two-bulbs silent first-drop dying-link
      delivered-then-drop blink-thrice launch-send reset-keeps alarm-phone gave-up limit
-     blink-restores rescan-twice forget"
+     blink-restores rescan-twice forget manual-replaces"
 LIST="${*:-$ALL}"
 mkdir -p "$WORK/out"
 for s in $LIST; do
