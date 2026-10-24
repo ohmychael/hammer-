@@ -410,6 +410,13 @@ struct MonitorScreen: Equatable {
     var builtIn: Bool
     var framebuffer: UInt64?         // registry ID of the framebuffer it's on
     var direct: Bool?                // false: DisplayLink, AirPlay, Sidecar (no framebuffer); nil: unknown
+    var vendor: UInt32? = nil        // its maker's ID (CGDisplayVendorNumber); nil: unknown
+
+    static let appleVendor: UInt32 = 0x610
+
+    /// An Apple display (Studio Display, Pro Display XDR): macOS sets its brightness itself
+    /// (keys, Control Center), so Hammer leaves it alone: no DDC, never dimmed in software.
+    var brightnessByMacOS: Bool { vendor == Self.appleVendor }
 }
 
 /// One external DDC connection.
@@ -635,7 +642,12 @@ struct MonitorCheck {
         case cantSend                // macOS refused every message
         case hdmiAdapter             // no answer, and it's on HDMI through a USB-C adapter
         case noAnswer                // sent, but the monitor never answered
+        case macOSLacksCalls         // this macOS doesn't have the private calls Hammer talks through
     }
+
+    /// The private calls Hammer can't reach a monitor without (IOAVServiceCopyEDID only adds detail).
+    static let neededCalls: Set<String> = ["IOAVServiceCreate", "IOAVServiceCreateWithService",
+                                           "IOAVServiceReadI2C", "IOAVServiceWriteI2C"]
 
     var mac = Mac()
     var screens: [MonitorScreen] = []
@@ -751,6 +763,7 @@ struct MonitorCheck {
             if externalScreens.isEmpty { return .noMonitor }
             if externalScreens.allSatisfy({ $0.direct == false }) { return .notDirect }
         }
+        if missingCalls.contains(where: Self.neededCalls.contains) { return .macOSLacksCalls }
         // Nothing known to have a monitor: every connection is a candidate.
         let candidates = attached.isEmpty ? ports : attached
         if candidates.allSatisfy({ $0.port.isDefault }) { return .notFound }   // only macOS's guess was left
@@ -888,6 +901,7 @@ struct MonitorCheck {
         case .on?: return "Software dimming: on, at \(softwareDimLevel)%"
         case .paused?: return "Software dimming: paused (another app keeps changing the colors)"
         case .cantDim?: return "Software dimming: needed, but another app is changing the colors"
+        case .adjusted?: return "Software dimming: needed, but the screen's colors are already adjusted"
         case .unsupported?: return "Software dimming: needed, but this screen's colors can't be changed"
         }
     }
@@ -908,6 +922,7 @@ struct MonitorCheck {
         case .cantSend: return "macOS won't let Hammer reach \(name)"
         case .hdmiAdapter: return "\(Name) is on HDMI through a USB-C adapter"
         case .noAnswer: return "\(Name) doesn't answer Hammer"
+        case .macOSLacksCalls: return "This version of macOS doesn't have what Hammer uses to reach monitors"
         }
     }
 
@@ -976,6 +991,8 @@ struct MonitorCheck {
         case .noAnswer:
             return ["On the monitor: Menu → Others → DDC/CI → On. Then switch it off and on.",
                     "Still nothing? " + direct]
+        case .macOSLacksCalls:
+            return ["Send this report along, so Hammer can be updated for it."]
         }
     }
 
@@ -1006,7 +1023,8 @@ enum SoftwareDimState: Equatable {
     case off            // not needed: the monitor's own controls (or it hasn't been asked yet)
     case on             // the Brightness slider dims the picture
     case paused         // dimming, but stopped: another app keeps changing the screen's colors
-    case cantDim        // needed, but another app's colors are on the screen (f.lux?)
+    case cantDim        // needed, but another app has been changing the screen's colors (f.lux?)
+    case adjusted       // needed, but the screen's colors are already adjusted (another app, a calibration)
     case unsupported    // needed, but this screen's colors can't be changed
 }
 
@@ -1030,24 +1048,30 @@ struct MonitorMenu: Equatable {
             return MonitorMenu(title: "Dell not connected", hints: ["Plug it in with USB-C or DisplayPort."],
                                offerCheck: true)
         }
+        if !external.isEmpty && external.allSatisfy(\.brightnessByMacOS) {
+            return MonitorMenu(title: "Apple display connected", hints: ["macOS sets its brightness: keys or Control Center."])
+        }
         if connections == 0 && virtualOnly {
             return MonitorMenu(title: "Dell connected through DisplayLink or AirPlay",
                                hints: ["Brightness control needs a direct cable:",
                                        "USB-C or DisplayPort straight into the Mac."],
                                offerCheck: true)
         }
-        // Dimming in software: one Brightness slider and one line saying why, or just the line.
+        // Dimming in software: one Brightness slider and one line saying why (true at any level,
+        // 100 included), or just the line.
         switch software {
         case .off:
             break
         case .on, .paused:
             let why = software == .paused ? "Paused: another app keeps changing the colors"
-                : hdmiAdapter ? "Dimmed in software: the HDMI adapter blocks control"
-                : connections == 0 && !hasDefault ? "Dimmed in software: can't find the Dell's connection"
-                : "Dimmed in software: the Dell isn't answering"
+                : hdmiAdapter ? "Software dimming: the HDMI adapter blocks control"
+                : connections == 0 && !hasDefault ? "Software dimming: can't find the Dell's connection"
+                : "Software dimming: the Dell isn't answering"
             return MonitorMenu(sliders: true, contrast: false, hints: [why], offerCheck: true)
         case .cantDim:
             return MonitorMenu(hints: ["Can't dim: another app is changing the colors"], offerCheck: true)
+        case .adjusted:
+            return MonitorMenu(hints: ["Can't dim: the screen's colors are already adjusted"], offerCheck: true)
         case .unsupported:
             return MonitorMenu(hints: ["Can't dim this screen in software"], offerCheck: true)
         }
@@ -1168,14 +1192,19 @@ struct DimWatch: Equatable {
         case dim                     // put Hammer's dimming (back) on it
     }
 
-    private(set) var resets = 0      // checks in a row that found something else's curves
+    private(set) var resets = 0      // checks in a row that found another app's curves
     private(set) var gaveUp = false
     private(set) var rival: GammaCurves?     // what was on the screen when Hammer gave up
     private(set) var calm = 0        // since then: checks in a row with steady curves of the screen's own
+    private(set) var sawOther = false        // another app's curves have been seen here (not just a reset)
+    private(set) var own: GammaCurves?       // the screen's own curves, as they were while all was well
     private var seen: GammaCurves?
 
-    /// One check. `now`: the screen's curves (nil: unreadable); `written`: what Hammer last put there.
-    mutating func check(now: GammaCurves?, written: GammaCurves?) -> Action {
+    /// One check. `now`: the screen's curves (nil: unreadable); `written`: what Hammer last put
+    /// there; `original`: the curves Hammer dims from. The screen's own curves coming back
+    /// (macOS resetting them, another app restoring them, a write lost while the display slept)
+    /// are never another app's: Hammer just dims again, every time.
+    mutating func check(now: GammaCurves?, written: GammaCurves?, original: GammaCurves? = nil) -> Action {
         if gaveUp {
             // Look, don't touch. Dim again only once the other app has let go: the screen's own
             // curves, not the other app's (some look much like a screen's own), steady for a while.
@@ -1187,19 +1216,102 @@ struct DimWatch: Equatable {
             calm = seen.map(now.matches) == true ? calm + 1 : 1
             seen = now
             guard calm >= Self.resumeAfter else { return .leave }
-            self = DimWatch()
+            self = DimWatch(sawOther: sawOther, own: own)
             return .dim
         }
         guard let written else { return .dim }               // never got to write yet: not anyone's fault
         if let now, now.matches(written) {
             resets = 0
+            own = original ?? own        // what it dims from while all is well (not curves adopted mid-fight)
             return .leave
         }
+        if let now, let own = own ?? original, now.matches(own) { return .dim }
+        if own == nil { own = original }   // before dimming again from the other app's curves, if they look like a screen's own
         resets += 1
+        if now != nil { sawOther = true }
         guard resets > Self.giveUpAfter else { return .dim }
         gaveUp = true
         rival = now
         return .leave
+    }
+
+    private init(sawOther: Bool, own: GammaCurves?) {
+        self.sawOther = sawOther
+        self.own = own
+    }
+
+    init() {}
+}
+
+/// The app's side of dimming in software: whether it's on, and what to do as things happen
+/// (a read of the monitor, launch or a replug, the 10-second check). The app keeps one and
+/// does what it says; it's here so it can be tested.
+struct SoftwareDimming: Equatable {
+    var on = false                   // dimming in software, as last applied
+
+    enum Change: Equatable {
+        case fadeIn                  // starting: ease into the saved level
+        case fadeOut                 // stopping: ease back to the screen's own colors
+        case reapply                 // carrying on: put the saved level back
+        case undo                    // still not dimming: make sure nothing of it is left
+    }
+
+    struct Plan: Equatable {
+        var change: Change
+        var remember: Bool?          // save (or clear) "dimmed in software" for the monitor; nil: leave it
+        var askAgain: Bool           // read the monitor once more in 10 seconds
+    }
+
+    /// At launch (after an update too), or when screens change: a monitor that was dimmed in
+    /// software is dimmed again at once, not left at full brightness until it's asked.
+    /// True: it just went on (put the dimming back, and watch it).
+    mutating func resume(wasActive: Bool) -> Bool {
+        guard !on && wasActive else { return false }
+        on = true
+        return true
+    }
+
+    /// After each read of the monitor. `screens`: there's a screen to dim (external, on a
+    /// direct cable, and not one whose brightness macOS sets itself).
+    mutating func afterRead(answers: Bool, misses: Int, hdmiAdapter: Bool, noConnection: Bool = false,
+                            wasActive: Bool = false, screens: Bool = true) -> Plan {
+        let was = on
+        on = screens && SoftwareDim.applies(answers: answers, misses: misses, hdmiAdapter: hdmiAdapter,
+                                            noConnection: noConnection, wasDimming: was || wasActive)
+        let change: Change = was ? (on ? .reapply : .fadeOut) : (on ? .fadeIn : .undo)
+        // A first miss can be a slow monitor (also one dimmed before a restart that answers now):
+        // ask again soon, unless nothing it could say would change anything.
+        return Plan(change: change, remember: on ? true : answers ? false : nil,
+                    askAgain: !answers && misses == 1 && !hdmiAdapter && !noConnection)
+    }
+
+    /// Whether the 10-second check may put the dimming back: only while dimming, so a check
+    /// queued just before the monitor answered can't dim it again (or stop the fade-out).
+    var keepsApplied: Bool { on }
+}
+
+/// Fading the dimming in or out: a few steps over about a quarter of a second. Anything
+/// else that sets a screen meanwhile (the slider, a wake, an undo) interrupts the fade
+/// and has the last word.
+struct DimFade: Equatable {
+    static let steps = 5
+    static let pause: UInt64 = 60_000_000            // between steps, in nanoseconds
+    private(set) var current = 0
+
+    /// Starts a fade: its number, to check before each step.
+    mutating func start() -> Int {
+        current += 1
+        return current
+    }
+
+    /// Something else set a screen: any fade under way stops.
+    mutating func interrupt() { current += 1 }
+
+    func goesOn(_ fade: Int) -> Bool { fade == current }
+
+    /// How much of the signal step `step` (of `steps`) keeps, on the way from `from` to `to`.
+    static func factor(step: Int, from: Double, to: Double) -> Double {
+        from + (to - from) * Double(min(max(step, 0), steps)) / Double(steps)
     }
 }
 

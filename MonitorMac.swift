@@ -214,7 +214,7 @@ enum MacMonitors {
 
         return ids.prefix(Int(count)).map { id in
             var screen = MonitorScreen(id: id, name: names[id] ?? "Display \(id)",
-                                       builtIn: CGDisplayIsBuiltin(id) != 0)
+                                       builtIn: CGDisplayIsBuiltin(id) != 0, vendor: CGDisplayVendorNumber(id))
             guard let createInfo = coreDisplayInfo else { return screen }    // can't tell; leave unknown
             guard let pointer = createInfo(id) else {
                 screen.direct = false
@@ -291,7 +291,8 @@ final class SoftwareDimmer {
     private var written: [CGDirectDisplayID: GammaCurves] = [:]   // what Hammer last put on each screen
     private var writtenFactor: [CGDirectDisplayID: Double] = [:]  // ...and how much of the signal that kept
     private var watches: [CGDirectDisplayID: DimWatch] = [:]      // whether something else keeps changing them
-    private var fadeID = 0                                        // bumps on every other change: a fade gives way
+    private var otherAppSeen: Set<CGDirectDisplayID> = []         // another app's curves were seen on these
+    private var fades = DimFade()                                 // any other change interrupts a fade
 
     /// Another app keeps changing a screen's curves (f.lux, another dimmer), so
     /// Hammer has stopped putting its dimming back on that screen.
@@ -319,16 +320,31 @@ final class SoftwareDimmer {
     }
 
     /// Whether this screen's picture can be dimmed (its curves can be read, and look like its own).
-    func canDim(_ display: CGDirectDisplayID) -> Bool { currentOriginal(display) != nil }
+    /// Only looks: what Hammer dims from is taken when it actually dims.
+    func canDim(_ display: CGDirectDisplayID) -> Bool {
+        SoftwareDim.base(live: read(display), written: written[display], previous: original[display]) != nil
+    }
 
     /// Whether this screen's curves can be read at all (if they can but it still can't be
-    /// dimmed, another app's curves are on it).
+    /// dimmed, they're already adjusted: another app, or a calibration).
     func canRead(_ display: CGDirectDisplayID) -> Bool { read(display) != nil }
+
+    /// Whether another app's curves have been seen changing this screen's under Hammer.
+    func sawOtherApp(_ display: CGDirectDisplayID) -> Bool { otherAppSeen.contains(display) }
+
+    /// After a wake or a display change: try again where Hammer gave way to another app
+    /// (if it's still at it, Hammer gives way again after three tries). True if there were any.
+    @discardableResult
+    func forgetGiveUps() -> Bool {
+        let any = contested
+        watches = watches.filter { !$0.value.gaveUp }
+        return any
+    }
 
     /// Dims `display` to `level` (0–100), saving it. false if this screen can't be dimmed this way.
     @discardableResult
     func set(_ level: Int, on display: CGDirectDisplayID, save: Bool = true) -> Bool {
-        fadeID += 1                                      // this has the last word over a fade
+        fades.interrupt()                                // this has the last word over a fade
         let level = min(100, max(0, level))
         if save {
             UserDefaults.standard.set(level, forKey: Self.key(display))
@@ -364,34 +380,41 @@ final class SoftwareDimmer {
         watches = watches.filter { displays.contains($0.key) }   // screens that are gone
         for display in displays where savedLevel(display) < 100 {
             var watch = watches[display] ?? DimWatch()
-            let action = watch.check(now: read(display), written: written[display])
+            let action = watch.check(now: read(display), written: written[display], original: original[display])
             watches[display] = watch
+            if watch.sawOther { otherAppSeen.insert(display) }
             if action == .dim { set(savedLevel(display), on: display, save: false) }
         }
     }
 
     /// Starts (`dimming`) or stops dimming in a few steps over about a quarter of a second,
-    /// rather than at once. It ends exactly as reapply or undoAll would; anything else that
-    /// sets a screen meanwhile (the slider, a wake) stops it and has the last word.
-    func fade(on displays: [CGDirectDisplayID], dimming: Bool) {
-        fadeID += 1
-        let id = fadeID
+    /// rather than at once. It ends exactly as setting the level or undoAll would; anything else
+    /// that sets a screen meanwhile (the slider, a wake, an undo) stops it and has the last word.
+    /// `levels`: where to fade to (the saved levels if nil).
+    func fade(on displays: [CGDirectDisplayID], dimming: Bool, levels: [CGDirectDisplayID: Int]? = nil) {
+        let id = fades.start()
+        let targets = levels ?? Dictionary(displays.map { ($0, savedLevel($0)) }, uniquingKeysWith: { first, _ in first })
         // Each screen's way, as how much of the signal is kept: from all of it to its level, or back.
         let paths: [FadePath] = dimming
-            ? displays.filter { !gaveUp($0) && savedLevel($0) < 100 }
-                .map { FadePath(display: $0, from: 1, to: SoftwareDim.factor(level: savedLevel($0))) }
+            ? displays.filter { !gaveUp($0) && (targets[$0] ?? 100) < 100 }
+                .map { FadePath(display: $0, from: 1, to: SoftwareDim.factor(level: targets[$0] ?? 100)) }
             : writtenFactor.filter { isHammers($0.key) }.map { FadePath(display: $0.key, from: $0.value, to: 1) }
-        let steps = 5
         Task { @MainActor in
-            for step in 1..<steps {
-                guard id == self.fadeID else { return }
+            for step in 1..<DimFade.steps {
+                guard self.fades.goesOn(id) else { return }
                 for path in paths where dimming || self.isHammers(path.display) {
-                    _ = self.apply(path.from + (path.to - path.from) * Double(step) / Double(steps), on: path.display)
+                    _ = self.apply(DimFade.factor(step: step, from: path.from, to: path.to), on: path.display)
                 }
-                try? await Task.sleep(nanoseconds: 60_000_000)
+                try? await Task.sleep(nanoseconds: DimFade.pause)
             }
-            guard id == self.fadeID else { return }
-            if dimming { self.reapply(on: displays) } else { self.undoAll() }
+            guard self.fades.goesOn(id) else { return }
+            if dimming {
+                for display in displays where !self.gaveUp(display) {
+                    self.set(targets[display] ?? 100, on: display, save: false)
+                }
+            } else {
+                self.undoAll()
+            }
         }
     }
 
@@ -406,7 +429,7 @@ final class SoftwareDimmer {
     /// Puts back a screen's original curves, if Hammer dimmed it and they're still
     /// Hammer's (if macOS or another app has changed them since, they're left alone).
     func undo(_ display: CGDirectDisplayID) {
-        fadeID += 1
+        fades.interrupt()
         if let base = original[display], isHammers(display) {
             _ = write(base, to: display)
         }
@@ -417,7 +440,7 @@ final class SoftwareDimmer {
 
     /// Undoes the dimming on every screen Hammer dimmed (the monitor answers again).
     func undoAll() {
-        fadeID += 1
+        fades.interrupt()
         for display in Array(written.keys) { undo(display) }
         watches = [:]
     }
@@ -451,9 +474,10 @@ final class SoftwareDimmer {
 
 /// `Hammer dim-check`: dims the main screen to half, then stands in for the things
 /// that change a screen's curves (macOS resetting them, another app dimming them)
-/// and checks Hammer dims from the right curves each time, never stacking; fades
-/// out; then puts everything back exactly. Run by the macOS build check. macOS can report
-/// curves it didn't actually show, so the screen itself still needs a look on a real Mac.
+/// and checks Hammer dims from the right curves each time, never stacking; fades in
+/// and out, and an undo during a fade; then puts everything back exactly. Run by the
+/// macOS build check. macOS can report curves it didn't actually show, so the screen
+/// itself still needs a look on a real Mac.
 @MainActor
 func runDimCheck() -> Int32 {
     let display = CGMainDisplayID()
@@ -498,6 +522,25 @@ func runDimCheck() -> Int32 {
     dimmer.set(50, on: display, save: false)
     wait(0.5)
     check(dimmer.curvesNow(display).map { $0.matches(expected) } == true, "set during a fade: that wins")
+    dimmer.set(100, on: display, save: false)
+    dimmer.fade(on: [display], dimming: true, levels: [display: 50])
+    wait(0.1)
+    check(dimmer.curvesNow(display).map { !$0.matches(expected) && !$0.matches(before) } == true,
+          "fading in: partway after 0.1 s (top \(dimmer.curvesNow(display)?.r.last ?? -1))")
+    wait(0.5)
+    check(dimmer.curvesNow(display).map { $0.matches(expected) } == true, "fading in: then exactly half")
+    dimmer.set(100, on: display, save: false)
+    dimmer.fade(on: [display], dimming: true, levels: [display: 50])
+    wait(0.1)
+    dimmer.undo(display)
+    wait(0.5)
+    check(dimmer.curvesNow(display) == before, "undone during a fade in: stays undone")
+    dimmer.set(50, on: display, save: false)
+    dimmer.fade(on: [display], dimming: false)
+    wait(0.1)
+    dimmer.undoAll()
+    wait(0.5)
+    check(dimmer.curvesNow(display) == before, "undone during a fade out: stays undone")
     dimmer.set(100, on: display, save: false)
     check(dimmer.curvesNow(display) == before, "100%: put back exactly")
     if dimmer.curvesNow(display) != before { _ = dimmer.write(before, to: display) }

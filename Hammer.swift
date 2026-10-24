@@ -1284,7 +1284,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var screenChanges = 0                        // a burst of display changes gets one rescan
 
     @objc private func screensChanged() {
-        reapplyIfDimming()                               // macOS resets the colors on a change: dim again at once
+        // The screens now (quick), so a replugged monitor is dimmed again at once; the full rescan
+        // of its connections waits for the burst of changes to end.
+        monitorScreens = MacMonitors.screens()
+        if !resumeSoftwareDimming() { reapplyIfDimming() }
         screenChanges += 1
         let change = screenChanges
         Task { @MainActor in
@@ -1298,9 +1301,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Dimming the picture in software (when the monitor can't dim itself)
 
-    private var dimmingInSoftware = false               // as last applied
+    private var softwareDimming = SoftwareDimming()      // when to dim, and what to do next (Monitor.swift)
     private var dimWatch: Timer?                         // while dimming: puts it back if something resets it
     private var softwareReadout: NSTextField?            // the software Brightness slider's "40%"
+    private var shownDimState = SoftwareDimState.off     // what the menu shows
+
+    private var dimmingInSoftware: Bool {                // as last applied
+        get { softwareDimming.on }
+        set { softwareDimming.on = newValue }
+    }
 
     /// Dimming in software before (this run, or before a restart, until the monitor answers again).
     private var wasDimming: Bool {
@@ -1313,58 +1322,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             noConnection: noMonitorConnection, wasDimming: wasDimming)
     }
 
-    private var dimsInSoftware: Bool {
-        SoftwareDim.applies(answers: monitorAnswers, misses: monitorMisses, hdmiAdapter: monitorViaHDMIAdapter,
-                            noConnection: noMonitorConnection, wasDimming: wasDimming)
-    }
-
     /// What dimming in software can do now, for the menu and the monitor check.
     private var softwareDimState: SoftwareDimState {
         guard softwareSliderShowing, !dimmableScreens.isEmpty else { return .off }
         let dimmer = SoftwareDimmer.shared
         if dimmableScreens.contains(where: { dimmer.canDim($0) }) { return dimmer.contested ? .paused : .on }
-        return dimmableScreens.contains(where: { dimmer.canRead($0) }) ? .cantDim : .unsupported
+        guard dimmableScreens.contains(where: { dimmer.canRead($0) }) else { return .unsupported }
+        // "Another app" only if one was seen changing the curves; otherwise they were already adjusted.
+        return dimmableScreens.contains(where: { dimmer.sawOtherApp($0) }) ? .cantDim : .adjusted
     }
 
     private var softwareDimLevel: Int { dimmableScreens.first.map { SoftwareDimmer.shared.savedLevel($0) } ?? 100 }
 
-    /// External screens with a real cable (not DisplayLink or AirPlay, which have no color curves to change).
+    /// External screens with a real cable (not DisplayLink or AirPlay, which have no color curves
+    /// to change), except Apple displays, whose brightness macOS sets itself.
     private var dimmableScreens: [CGDirectDisplayID] {
-        monitorScreens.filter { !$0.builtIn && $0.direct != false }.map { CGDirectDisplayID($0.id) }
+        monitorScreens.filter { !$0.builtIn && $0.direct != false && !$0.brightnessByMacOS }.map { CGDirectDisplayID($0.id) }
     }
 
     /// Dims (or undims) the picture to match what the monitor said, after each read.
-    private func updateSoftwareDimming() {
-        guard monitorAnswers != nil else { return }        // not asked yet: reapplyIfDimming covers that time
-        let was = dimmingInSoftware
-        dimmingInSoftware = dimsInSoftware
-        if dimmingInSoftware || monitorAnswers == true {
-            for display in dimmableScreens { SoftwareDimmer.shared.setActive(dimmingInSoftware, for: display) }
-        }
+    /// True: ask the monitor again in 10 seconds.
+    @discardableResult
+    private func updateSoftwareDimming() -> Bool {
+        guard let answers = monitorAnswers else { return false }   // not asked yet: reapplyIfDimming covers that time
         let dimmer = SoftwareDimmer.shared
-        switch (was, dimmingInSoftware) {
-        case (false, true): dimmer.fade(on: dimmableScreens, dimming: true)      // starting or stopping: a short fade
-        case (true, false): dimmer.fade(on: dimmableScreens, dimming: false)
-        case (true, true): dimmer.reapply(on: dimmableScreens)
-        case (false, false): dimmer.undoAll()
+        let plan = softwareDimming.afterRead(answers: answers, misses: monitorMisses, hdmiAdapter: monitorViaHDMIAdapter,
+                                             noConnection: noMonitorConnection,
+                                             wasActive: dimmableScreens.contains { dimmer.wasActive($0) },
+                                             screens: !dimmableScreens.isEmpty)
+        if let remember = plan.remember {
+            for display in dimmableScreens { dimmer.setActive(remember, for: display) }
+        }
+        switch plan.change {
+        case .fadeIn: dimmer.fade(on: dimmableScreens, dimming: true)      // starting or stopping: a short fade
+        case .fadeOut: dimmer.fade(on: dimmableScreens, dimming: false)
+        case .reapply: dimmer.reapply(on: dimmableScreens)
+        case .undo: dimmer.undoAll()
         }
         watchDimming()
+        return plan.askAgain
     }
 
     /// At launch (also after an update) or when a monitor that was dimmed in software is
     /// plugged in again: dim it straight away, rather than at full brightness until it's asked.
-    private func resumeSoftwareDimming() {
-        guard !dimmingInSoftware, dimmableScreens.contains(where: { SoftwareDimmer.shared.wasActive($0) }) else { return }
-        dimmingInSoftware = true
+    @discardableResult
+    private func resumeSoftwareDimming() -> Bool {
+        guard softwareDimming.resume(wasActive: dimmableScreens.contains { SoftwareDimmer.shared.wasActive($0) }) else { return false }
         reapplyIfDimming()
         watchDimming()
+        return true
     }
 
     /// After a wake, display sleep or a display change macOS resets screens' curves:
     /// dim again straight away (and a moment later, as screens settle), without
-    /// waiting to ask the monitor.
+    /// waiting to ask the monitor. Where Hammer gave way to another app, it tries again.
     private func reapplyIfDimming() {
         guard dimmingInSoftware else { return }
+        if SoftwareDimmer.shared.forgetGiveUps() { rebuildMenuSoon() }   // drop "Paused"
         for delay in [0.0, 1.0, 3.0] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let delegate = self else { return }
@@ -1376,16 +1390,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// While dimming, checks every 10 seconds that the curves are still Hammer's.
+    /// While dimming, checks every 10 seconds that the curves are still Hammer's, and
+    /// updates the menu if what dimming can do changed (e.g. another app let go).
     private func watchDimming() {
         if dimmingInSoftware {
             guard dimWatch == nil else { return }
             let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
                 guard let delegate = self else { return }
                 Task { @MainActor in
-                    let before = SoftwareDimmer.shared.contested
+                    guard delegate.softwareDimming.keepsApplied else { return }   // the monitor answered meanwhile
                     SoftwareDimmer.shared.keepApplied(on: delegate.dimmableScreens)
-                    if SoftwareDimmer.shared.contested != before { delegate.rebuildMenuSoon() }   // show or drop the note
+                    if delegate.softwareDimState != delegate.shownDimState { delegate.rebuildMenuSoon() }
                 }
             }
             RunLoop.main.add(timer, forMode: .common)
@@ -1983,13 +1998,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             monitorValues[code] = value
             if let slider = monitorSliders[code] { show(value, on: slider) }
         }
-        updateSoftwareDimming()
+        let askAgain = updateSoftwareDimming()
         if before != answers || monitorMisses == 2 { rebuildMenuSoon() }   // "isn't answering", or dimming in software
-        if !answers && monitorMisses == 1 && !dimmingInSoftware { askMonitorAgain(generation: generation) }
+        if askAgain { askMonitorAgain(generation: generation) }
     }
 
     /// After a first miss, asks again in 10 seconds: a monitor that still doesn't answer is
-    /// then dimmed in software, rather than only once the menu is opened again.
+    /// then dimmed in software (and one that answers again, after a restart, is undimmed),
+    /// rather than only once the menu is opened again.
     private func askMonitorAgain(generation: Int) {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 10_000_000_000)
@@ -2003,6 +2019,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         monitorReadouts = [:]
         softwareReadout = nil
         let software = softwareDimState
+        shownDimState = software
         let state = MonitorMenu.make(connections: monitorCount, hasDefault: monitorHasDefault,
                                      attached: monitorAttached, screens: monitorScreens, answers: monitorAnswers,
                                      hdmiAdapter: monitorViaHDMIAdapter, software: software)

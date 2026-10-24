@@ -973,6 +973,12 @@ func fake(_ setUp: (FakeMonitor) -> Void) -> FakeMonitor { let m = FakeMonitor()
 func belkinLikeEntries() -> [RegistryEntry] {
     [framebuffer(300, "DELL U3818DW", display: true, transport: "DP → HDMI"), proxy(301, path: "IOService:/x/dcpext0@1/y")]
 }
+/// No connection services (as on a macOS without IOAVServiceCreateWithService), and those calls missing.
+func lacking(_ calls: [String]) -> MonitorCheck {
+    var check = runCheck(airEntries, airScreens, [:])
+    check.missingCalls = calls
+    return check
+}
 let everyVerdict = [
     runCheck(airEntries, airScreens, [201: FakeMonitor()]),
     runCheck(airEntries, airScreens, [201: fake { $0.values[0x10] = (0, 0) }]),
@@ -990,8 +996,9 @@ let everyVerdict = [
     runCheck(proUSBC, lidClosed, [301: fake { $0.readStatus = avError }]),
     runCheck(proUSBC, lidClosed, [301: fake { $0.readStatus = avError; $0.edidReadStatus = avError }]),
     runCheck(airEntries, airScreens, [201: fake { $0.ddcOn = false; $0.edidReadGarbage = true }]),
+    lacking(["IOAVServiceCreateWithService"]),
 ]
-expect(Set(everyVerdict.map { "\($0.verdict)" }).count == 11, "every verdict is covered")
+expect(Set(everyVerdict.map { "\($0.verdict)" }).count == 12, "every verdict is covered")
 for found in everyVerdict {
     expect((1...3).contains(found.advice.count) && !found.title.isEmpty && !found.title.hasPrefix("Result")
            && found.advice.allSatisfy { $0.count <= 120 && !found.details.contains($0) }
@@ -999,6 +1006,18 @@ for found in everyVerdict {
            && found.text.hasSuffix(found.details) && !found.details.contains("Result"),
            "\(found.verdict): a title, a few short lines, said once:\n\(found.text)")
 }
+check = lacking(["IOAVServiceCreateWithService"])
+expect(check.verdict == .macOSLacksCalls && check.title == "This version of macOS doesn't have what Hammer uses to reach monitors"
+       && check.advice == ["Send this report along, so Hammer can be updated for it."]
+       && check.details.contains("Not in this macOS: IOAVServiceCreateWithService")
+       && !check.advice.joined().contains("cable"), "macOS dropped a call Hammer needs: says so, no cable advice")
+expect(lacking(["IOAVServiceReadI2C"]).verdict == .macOSLacksCalls && lacking(["IOAVServiceWriteI2C"]).verdict == .macOSLacksCalls
+       && lacking(["IOAVServiceCreate"]).verdict == .macOSLacksCalls, "any of the four calls")
+expect(lacking(["IOAVServiceCopyEDID"]).verdict == .cantSend && lacking([]).verdict == .cantSend,
+       "only the EDID call missing (or none): the usual verdict")
+check = runCheck(airEntries, airScreens, [201: FakeMonitor()])
+check.missingCalls = ["IOAVServiceCopyEDID"]
+expect(check.verdict == .working, "a monitor that answers: working, whatever is missing")
 dell = FakeMonitor(); dell.readStatus = avError; dell.edid = makeEDID("DELL U3818DW", hdmi: true)
 check = runCheck(proUSBC, lidClosed, [301: dell])
 expect(check.title == "The DELL U3818DW is on HDMI through a USB-C adapter" && check.ports[0].edidOverI2C?.valid == true
@@ -1073,7 +1092,7 @@ expect(MonitorPort.hdmiLinkIsAdapter(onMac: "MacBookPro18,1") && MonitorPort.hdm
 // MARK: Monitor: dimming the picture in software
 
 expect(SoftwareDim.factor(level: 100) == 1 && SoftwareDim.factor(level: 0) == SoftwareDim.floor
-       && abs(SoftwareDim.factor(level: 50) - 0.575) < 1e-9, "slider 0–100 → 15%–100% of the light")
+       && abs(SoftwareDim.factor(level: 50) - 0.575) < 1e-9, "slider 0–100 → 15%–100% of the signal")
 expect(SoftwareDim.factor(level: -20) == SoftwareDim.floor && SoftwareDim.factor(level: 250) == 1, "out-of-range levels are clamped")
 expect(SoftwareDim.floor >= 0.1, "never fully dark")
 let dimCurve: [Float] = [0, 0.25, 0.5, 1]
@@ -1100,10 +1119,10 @@ expect(!SoftwareDim.applies(answers: true, misses: 0, hdmiAdapter: true) && !Sof
        "answers (or not asked yet): the monitor's own brightness")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, hdmiAdapter: true, software: .on)
 expect(state.sliders && !state.contrast && state.offerCheck
-       && state.hints == ["Dimmed in software: the HDMI adapter blocks control"],
+       && state.hints == ["Software dimming: the HDMI adapter blocks control"],
        "menu, adapter: Brightness dims the picture, no Contrast, one line says why")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, software: .on)
-expect(state.sliders && !state.contrast && state.hints == ["Dimmed in software: the Dell isn't answering"],
+expect(state.sliders && !state.contrast && state.hints == ["Software dimming: the Dell isn't answering"],
        "menu, no answer: the same")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: true)
 expect(state.sliders && state.contrast && state.hints.isEmpty, "menu, working: both sliders, no hint")
@@ -1111,7 +1130,7 @@ state = MonitorMenu.make(connections: 0, attached: 0, screens: lidClosed, answer
 expect(state.title == "Can't find the Dell's connection" && !state.sliders, "no connection, not decided yet: says so")
 state = MonitorMenu.make(connections: 0, attached: 0, screens: lidClosed, answers: false, software: .on)
 expect(state.sliders && !state.contrast && state.title == nil && state.offerCheck
-       && state.hints == ["Dimmed in software: can't find the Dell's connection"], "no connection at all: dimmed in software")
+       && state.hints == ["Software dimming: can't find the Dell's connection"], "no connection at all: software dimming")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, hdmiAdapter: true, software: .paused)
 expect(state.sliders && !state.contrast && state.hints == ["Paused: another app keeps changing the colors"],
        "paused for another app: one line; moving the slider tries again")
@@ -1120,7 +1139,22 @@ expect(!state.sliders && state.title == nil && state.offerCheck && state.hints =
        "can't dim (another app's curves on the screen): one line, no sliders that do nothing")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, software: .unsupported)
 expect(!state.sliders && state.hints == ["Can't dim this screen in software"], "a screen whose colors can't be changed: the same")
-for software in [SoftwareDimState.on, .paused, .cantDim, .unsupported] {
+state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, software: .adjusted)
+expect(!state.sliders && state.offerCheck && state.hints == ["Can't dim: the screen's colors are already adjusted"],
+       "colors already adjusted, no other app seen changing them (e.g. a calibration): says so, not \"another app\"")
+let studio = MonitorScreen(id: 4, name: "Studio Display", builtIn: false, framebuffer: 500, direct: true, vendor: 0x610)
+let dellWithVendor = MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 300, direct: true, vendor: 0x10AC)
+expect(studio.brightnessByMacOS && !dellWithVendor.brightnessByMacOS && !lidClosed[0].brightnessByMacOS,
+       "Apple displays (vendor 0x610): macOS sets their brightness; others and unknown: not")
+state = MonitorMenu.make(connections: 1, attached: 1, screens: [builtIn, studio], answers: false)
+expect(!state.sliders && !state.offerCheck && state.title == "Apple display connected"
+       && state.hints == ["macOS sets its brightness: keys or Control Center."]
+       && !state.hints.joined().contains("answering"), "only an Apple display: no sliders, no \"isn't answering\"")
+state = MonitorMenu.make(connections: 2, attached: 2, screens: [studio, dellWithVendor], answers: false, software: .on)
+expect(state.sliders && state.hints == ["Software dimming: the Dell isn't answering"], "an Apple display next to the Dell: the Dell's menu")
+state = MonitorMenu.make(connections: 1, attached: 1, screens: [], answers: nil)
+expect(state.title != "Apple display connected" && state.sliders, "no screen list: never taken for an Apple display")
+for software in [SoftwareDimState.on, .paused, .cantDim, .adjusted, .unsupported] {
     for (connections, adapter) in [(1, true), (1, false), (0, false)] {
         let menu = MonitorMenu.make(connections: connections, attached: 1, screens: lidClosed, answers: false,
                                     hdmiAdapter: adapter, software: software)
@@ -1157,39 +1191,113 @@ expect(!ownCurves.scaled(by: SoftwareDim.factor(level: 89)).isScreensOwn
        "Hammer's own dimming at 89–96 isn't taken for a screen's own")
 
 // Watching the screen while dimming: put back after a reset, but never fight another app.
-let mine = ownCurves.scaled(by: SoftwareDim.factor(level: 40))
-var watch = DimWatch()
-expect(watch.check(now: ownCurves, written: nil) == .dim, "nothing written yet: dim")
-expect(watch.check(now: mine, written: mine) == .leave && watch.resets == 0, "still Hammer's: leave it")
-expect(watch.check(now: ownCurves, written: mine) == .dim && watch.resets == 1, "reset once (display sleep): dim again")
-expect(watch.check(now: mine, written: mine) == .leave && watch.resets == 0, "and it holds")
+let hammersCurves = ownCurves.scaled(by: SoftwareDim.factor(level: 40))
+var curveWatch = DimWatch()
+expect(curveWatch.check(now: ownCurves, written: nil) == .dim, "nothing written yet: dim")
+expect(curveWatch.check(now: hammersCurves, written: hammersCurves) == .leave && curveWatch.resets == 0, "still Hammer's: leave it")
+expect(curveWatch.check(now: ownCurves, written: hammersCurves) == .dim && curveWatch.resets == 1, "reset once (display sleep): dim again")
+expect(curveWatch.check(now: hammersCurves, written: hammersCurves) == .leave && curveWatch.resets == 0, "and it holds")
 let nearOwn = GammaCurves(r: ramp(256), g: ramp(256, top: 0.99), b: ramp(256, top: 0.97))
 expect(nearOwn.isScreensOwn, "an app's curves can look like a screen's own")
-var actions = (0..<4).map { _ in watch.check(now: nearOwn, written: mine) }
-expect(actions == [.dim, .dim, .dim, .leave] && watch.gaveUp && watch.rival == nearOwn,
+var watchActions = (0..<4).map { _ in curveWatch.check(now: nearOwn, written: hammersCurves) }
+expect(watchActions == [.dim, .dim, .dim, .leave] && curveWatch.gaveUp && curveWatch.rival == nearOwn,
        "something keeps changing them: three tries, then stop")
-actions = (0..<30).map { _ in watch.check(now: nearOwn, written: mine) }
-expect(actions.allSatisfy { $0 == .leave } && watch.gaveUp, "while its curves stay: Hammer stays out (no flicker every 10 s)")
+watchActions = (0..<30).map { _ in curveWatch.check(now: nearOwn, written: hammersCurves) }
+expect(watchActions.allSatisfy { $0 == .leave } && curveWatch.gaveUp, "while its curves stay: Hammer stays out (no flicker every 10 s)")
 let driftA = GammaCurves(r: ramp(256), g: ramp(256), b: ramp(256, top: 0.8))
 let driftB = GammaCurves(r: ramp(256), g: ramp(256), b: ramp(256, top: 0.9))
-actions = (0..<10).map { i in watch.check(now: i % 2 == 0 ? driftA : driftB, written: mine) }
-expect(actions.allSatisfy { $0 == .leave } && watch.gaveUp, "curves that keep moving: the other app is still at it")
-actions = (0..<3).map { _ in watch.check(now: ownCurves, written: mine) }
-expect(actions == [.leave, .leave, .dim] && !watch.gaveUp && watch.resets == 0,
+watchActions = (0..<10).map { i in curveWatch.check(now: i % 2 == 0 ? driftA : driftB, written: hammersCurves) }
+expect(watchActions.allSatisfy { $0 == .leave } && curveWatch.gaveUp, "curves that keep moving: the other app is still at it")
+watchActions = (0..<3).map { _ in curveWatch.check(now: ownCurves, written: hammersCurves) }
+expect(watchActions == [.leave, .leave, .dim] && !curveWatch.gaveUp && curveWatch.resets == 0,
        "the other app let go (the screen's own curves, steady for three checks): dim again")
-let flux = GammaCurves(r: ramp(256), g: ramp(256, top: 0.8), b: ramp(256, top: 0.5))
-watch = DimWatch()
-for _ in 0..<4 { _ = watch.check(now: flux, written: mine) }
-actions = (0..<5).map { _ in watch.check(now: flux, written: mine) }
-expect(watch.gaveUp && watch.rival == flux && actions.allSatisfy { $0 == .leave }, "f.lux's curves: stopped, and stays stopped")
-actions = (0..<5).map { _ in watch.check(now: nil, written: mine) }
-expect(actions.allSatisfy { $0 == .leave } && watch.calm == 0 && watch.gaveUp, "curves that can't be read: nothing changes")
-actions = (0..<3).map { _ in watch.check(now: profile2, written: mine) }
-expect(actions == [.leave, .leave, .dim], "f.lux quit and the profile is back: dim again")
-watch = DimWatch()
-for _ in 0..<4 { _ = watch.check(now: nil, written: mine) }
-actions = (0..<3).map { _ in watch.check(now: ownCurves, written: mine) }
-expect(actions == [.leave, .leave, .dim], "unreadable for a while, then the screen's own: dim again")
+let fluxCurves = GammaCurves(r: ramp(256), g: ramp(256, top: 0.8), b: ramp(256, top: 0.5))
+curveWatch = DimWatch()
+for _ in 0..<4 { _ = curveWatch.check(now: fluxCurves, written: hammersCurves) }
+watchActions = (0..<5).map { _ in curveWatch.check(now: fluxCurves, written: hammersCurves) }
+expect(curveWatch.gaveUp && curveWatch.rival == fluxCurves && watchActions.allSatisfy { $0 == .leave }, "f.lux's curves: stopped, and stays stopped")
+watchActions = (0..<5).map { _ in curveWatch.check(now: nil, written: hammersCurves) }
+expect(watchActions.allSatisfy { $0 == .leave } && curveWatch.calm == 0 && curveWatch.gaveUp, "curves that can't be read: nothing changes")
+watchActions = (0..<3).map { _ in curveWatch.check(now: profile2, written: hammersCurves) }
+expect(watchActions == [.leave, .leave, .dim], "f.lux quit and the profile is back: dim again")
+curveWatch = DimWatch()
+for _ in 0..<4 { _ = curveWatch.check(now: nil, written: hammersCurves) }
+watchActions = (0..<3).map { _ in curveWatch.check(now: ownCurves, written: hammersCurves) }
+expect(watchActions == [.leave, .leave, .dim], "unreadable for a while, then the screen's own: dim again")
+
+// The screen's own curves coming back again and again (ColorSync restored by another app,
+// writes lost while the display sleeps) are never "another app": dim again every time.
+curveWatch = DimWatch()
+let ownFour = (0..<4).map { _ in curveWatch.check(now: ownCurves, written: hammersCurves, original: ownCurves) }
+let ownHundred = (0..<100).map { _ in curveWatch.check(now: ownCurves, written: hammersCurves, original: ownCurves) }
+expect(ownFour.allSatisfy { $0 == .dim } && ownHundred.allSatisfy { $0 == .dim } && !curveWatch.gaveUp && !curveWatch.sawOther,
+       "own ×4 then own ×100: dims again each time, never gives up")
+// A rival writing curves that look like a screen's own still gets Hammer to stop, even though
+// Hammer dims again from them each time (they're what it dims from by then).
+curveWatch = DimWatch()
+_ = curveWatch.check(now: hammersCurves, written: hammersCurves, original: ownCurves)             // all well: own is the screen's
+let fromRival = nearOwn.scaled(by: SoftwareDim.factor(level: 40))
+watchActions = [curveWatch.check(now: nearOwn, written: hammersCurves, original: ownCurves)]
+    + (0..<3).map { _ in curveWatch.check(now: nearOwn, written: fromRival, original: nearOwn) }
+expect(watchActions == [.dim, .dim, .dim, .leave] && curveWatch.gaveUp && curveWatch.sawOther,
+       "an app's near-own curves, adopted as the original: still stops after three tries")
+curveWatch = DimWatch()
+watchActions = [curveWatch.check(now: nearOwn, written: hammersCurves, original: ownCurves)]
+    + (0..<3).map { _ in curveWatch.check(now: nearOwn, written: fromRival, original: nearOwn) }
+expect(watchActions == [.dim, .dim, .dim, .leave] && curveWatch.gaveUp, "...also when the fight starts before any check went well")
+curveWatch = DimWatch()
+_ = curveWatch.check(now: hammersCurves, written: hammersCurves, original: ownCurves)
+let newProfile = GammaCurves(r: ramp(256), g: ramp(256, top: 0.98), b: ramp(256, top: 0.95))
+let fromNew = newProfile.scaled(by: SoftwareDim.factor(level: 40))
+watchActions = [curveWatch.check(now: newProfile, written: hammersCurves, original: ownCurves),
+           curveWatch.check(now: fromNew, written: fromNew, original: newProfile),
+           curveWatch.check(now: newProfile, written: fromNew, original: newProfile)]
+expect(watchActions == [.dim, .leave, .dim] && curveWatch.resets == 0 && curveWatch.own == newProfile,
+       "a new color profile: dimmed from, and then it's the screen's own")
+
+// The app's side: launch, reads, the 10-second check.
+var dimApp = SoftwareDimming()
+expect(!dimApp.resume(wasActive: false) && !dimApp.on, "launch, never dimmed: nothing")
+expect(dimApp.resume(wasActive: true) && dimApp.on && !dimApp.resume(wasActive: true), "launch after an update: dims at once, once")
+var dimPlan = dimApp.afterRead(answers: false, misses: 1, hdmiAdapter: false, wasActive: true)
+expect(dimApp.on && dimPlan == .init(change: .reapply, remember: true, askAgain: true),
+       "dimmed since launch, first read misses: carries on, and asks again in 10 s (it may answer now)")
+dimPlan = dimApp.afterRead(answers: true, misses: 0, hdmiAdapter: false, wasActive: true)
+expect(!dimApp.on && !dimApp.keepsApplied && dimPlan == .init(change: .fadeOut, remember: false, askAgain: false),
+       "it answers: fades out, forgets, and a 10-second check already queued does nothing")
+dimPlan = dimApp.afterRead(answers: true, misses: 0, hdmiAdapter: false)
+expect(dimPlan.change == .undo && !dimApp.on, "still answering: nothing left over")
+dimPlan = dimApp.afterRead(answers: false, misses: 1, hdmiAdapter: false)
+expect(!dimApp.on && dimPlan == .init(change: .undo, remember: nil, askAgain: true), "a first miss: not yet, ask again in 10 s")
+dimPlan = dimApp.afterRead(answers: false, misses: 2, hdmiAdapter: false)
+expect(dimApp.on && dimApp.keepsApplied && dimPlan == .init(change: .fadeIn, remember: true, askAgain: false),
+       "the second miss: fades in, remembers")
+dimPlan = dimApp.afterRead(answers: false, misses: 3, hdmiAdapter: false)
+expect(dimApp.on && dimPlan.change == .reapply && !dimPlan.askAgain, "carrying on")
+dimApp = SoftwareDimming()
+dimPlan = dimApp.afterRead(answers: false, misses: 1, hdmiAdapter: true)
+expect(dimApp.on && dimPlan.change == .fadeIn && !dimPlan.askAgain, "behind an HDMI adapter: at once, no need to ask again")
+dimApp = SoftwareDimming()
+dimPlan = dimApp.afterRead(answers: false, misses: 1, hdmiAdapter: false, noConnection: true)
+expect(dimApp.on && dimPlan.change == .fadeIn && !dimPlan.askAgain, "no connection: the same")
+dimApp = SoftwareDimming()
+dimPlan = dimApp.afterRead(answers: false, misses: 2, hdmiAdapter: true, screens: false)
+expect(!dimApp.on && dimPlan.change == .undo, "no screen it may dim (only an Apple display): never on")
+
+// Fades: a few steps between the two levels; anything else (an undo, the slider) stops one.
+let fadeInSteps = (1..<DimFade.steps).map { DimFade.factor(step: $0, from: 1, to: 0.575) }
+expect(fadeInSteps.count == 4 && zip(fadeInSteps, fadeInSteps.dropFirst()).allSatisfy { $0 > $1 } && fadeInSteps.allSatisfy { $0 < 1 && $0 > 0.575 }
+       && DimFade.factor(step: DimFade.steps, from: 1, to: 0.575) == 0.575 && DimFade.factor(step: 9, from: 1, to: 0.575) == 0.575,
+       "fading in: four steps on the way down, ending exactly at the level")
+expect(Double(DimFade.steps - 1) * Double(DimFade.pause) / 1e9 < 0.3, "about a quarter of a second")
+var dimFades = DimFade()
+let fadeOne = dimFades.start()
+expect(dimFades.goesOn(fadeOne), "a fade goes on")
+dimFades.interrupt()                                                   // undo during the fade
+expect(!dimFades.goesOn(fadeOne), "undone during a fade: the fade stops (it can't dim again afterwards)")
+let fadeTwo = dimFades.start()
+let fadeThree = dimFades.start()
+expect(!dimFades.goesOn(fadeTwo) && dimFades.goesOn(fadeThree), "a new fade replaces the one under way")
 let resampled = GammaCurves(r: ramp(1024), g: ramp(1024), b: ramp(1024)).scaled(by: SoftwareDim.factor(level: 50))
 expect(halfDim.matches(resampled), "the same curves handed back with more steps still match")
 expect(!halfDim.matches(ownCurves) && !halfDim.matches(ownCurves.scaled(by: 0.6)), "different curves don't")
