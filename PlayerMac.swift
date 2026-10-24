@@ -184,6 +184,9 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         onChange?()
     }
 
+    /// A report as if from the page (for the self-test).
+    func pageReported(_ report: [String: Any]) { received(report) }
+
     /// Whether the page is there, and what Back goes back to (for the self-test).
     var hasPage: Bool { webView != nil }
     var backHistory: [URL] { webView?.backForwardList.backList.map(\.url) ?? [] }
@@ -1146,7 +1149,10 @@ final class PlayerCheck: NSObject, NSApplicationDelegate {
             let popped = await wait(5) { self.player.place == .mini }
             expect(popped, "it starts with no window: it comes up in the mini player")
         } else {
-            note("  note it didn't start playing again here, so the no-window case can't be checked")
+            // WebKit here won't start a video in a window that isn't showing: tell the player it did.
+            player.pageReported(["playing": true, "hasVideo": true, "ad": false, "title": "Me at the zoo - YouTube"])
+            let popped = await wait(5) { self.player.place == .mini }
+            expect(popped, "it starts with no window: it comes up in the mini player (the page's report given here)")
         }
 
         // In the mini player: Space plays and pauses, Esc closes it (and pauses).
