@@ -2814,11 +2814,9 @@ let deliveredSubjects = [
     "USPS® Item Delivered, Front/Back Door/Porch 9400111899223344556677",
     "FedEx Shipment 771234567890 Delivered",
     "Your order has arrived!",
-    "Fwd: Your package has been delivered",
     "Your Walmart order was delivered",
     "=?utf-8?Q?Your_package_was_delivered_=E2=9C=85?=",
     "Your package was delivered earlier than expected",
-    "DELIVERED: \"Phone case\"",
     "Your package has been dropped off",
     "Your order from Target has arrived",
     "Your items have arrived",
@@ -2826,9 +2824,12 @@ let deliveredSubjects = [
 for subject in deliveredSubjects {
     expect(DeliveryMail.kind(ofSubject: subject) == .delivered, "delivered: \(subject)")
 }
+// An item named in quotes is a parcel when a store Hammer knows names it (Amazon's template).
+expect(DeliveryMail.kind(ofSubject: "DELIVERED: \"Phone case\"", from: "Amazon") == .delivered
+       && DeliveryMail.kind(ofSubject: "DELIVERED: \"Phone case\"") == nil
+       && DeliveryMail.kind(ofSubject: #"Out for delivery: "Anker 735 Charger""#, from: "Amazon") == .outForDelivery,
+       "quoted items count from a known store only")
 let problemSubjects = [
-    "Delivery attempted - we'll try again tomorrow",
-    "UPS Update: Delivery Attempted",
     "Your package couldn't be delivered",
     "Action needed: delivery exception for your order",
     "Your parcel is being returned to sender",
@@ -2837,8 +2838,12 @@ let problemSubjects = [
 for subject in problemSubjects {
     expect(DeliveryMail.kind(ofSubject: subject) == .problem, "problem: \(subject)")
 }
+// "Delivery attempted" names no parcel: it's one when a carrier sends it.
+for subject in ["Delivery attempted - we'll try again tomorrow", "UPS Update: Delivery Attempted"] {
+    expect(DeliveryMail.kind(ofSubject: subject, from: "UPS") == .problem && DeliveryMail.kind(ofSubject: subject) == nil,
+           "problem from a carrier, nothing from anyone else: \(subject)")
+}
 let outForDeliverySubjects = [
-    #"Out for delivery: "Anker 735 Charger""#,
     "USPS® Item Out for Delivery, 9400111899223344556677",
     "UPS Update: Package Out for Delivery Today",
     "Your package is out for delivery",
@@ -2847,6 +2852,7 @@ for subject in outForDeliverySubjects {
     expect(DeliveryMail.kind(ofSubject: subject) == .outForDelivery, "out for delivery: \(subject)")
 }
 let otherSubjects = [
+    "Fwd: Your package has been delivered",                // a forward: a conversation, not a notice
     "Your package will be out for delivery tomorrow",
     "Arriving today: Anker 735 Charger",
     "USPS® Expected Delivery on Saturday, October 17, 2026 arriving by 9:00pm",
@@ -2949,8 +2955,8 @@ expect(classified("Your order has been delivered", from: "orders@someshop.com") 
 expect(classified("USPS® Item Delivered, In/At Mailbox", from: "USPS <auto-reply@usps.com>") == .delivered, "USPS")
 expect(classified(#"Delivered: "Lamp""#, from: "Tiny Shop <hello@tinyshop.co>") == nil,
        "trade-off: an unknown shop's 'Delivered: \"Lamp\"' is skipped")
-expect(classified("UPS Update: Delivery Attempted", from: "someone@example.com") == .problem,
-       "delivery problems already need delivery wording")
+expect(classified("UPS Update: Delivery Attempted", from: "someone@example.com") == nil,
+       "'delivery' alone isn't a parcel: a delivery problem from someone else needs a package word")
 expect(DeliveryMail.knownShipper(from: "\"eBay\" <ebay@ebay.com>") == "eBay"
        && DeliveryMail.knownShipper(from: "Google Groups <noreply@groups.com>") == nil
        && DeliveryMail.knownShipper(from: "ups") == nil, "known shippers by domain")
@@ -3210,9 +3216,10 @@ expect(freshWrong.isEmpty, "the second set all get their verdict: \(freshWrong)"
 // The general rules behind some of them, in other words.
 for (subject, verdict) in [("We were unable to deliver your parcel today", Delivery.Kind.problem),
                            ("Our driver couldn't deliver your order", .problem), ("We attempted to deliver your package", .problem),
-                           ("Delivery unsuccessful: we'll try again", .problem), ("We have delivered your order", .delivered),
+                           ("Delivery unsuccessful: we'll try again", nil), ("We have delivered your order", .delivered),
                            ("Delivery complete: your Instacart order", .delivered), ("Shop update: Delivered", nil),
-                           ("Order #A1234: Shipped", nil), ("Store update: Out for delivery", .outForDelivery),
+                           ("Order #A1234: Shipped", nil), ("Store update: Out for delivery", nil),
+                           ("Store update: your order is out for delivery", .outForDelivery),
                            ("Your order has been canceled", nil), ("Cancellation: your order will not be delivered", nil),
                            ("Your parcel is ready to collect at the Post Office", nil), ("Ready for pickup: your order", nil),
                            ("Your next delivery, half price", nil), ("SV: Your package was delivered", nil),
@@ -3222,8 +3229,9 @@ for (subject, verdict) in [("We were unable to deliver your parcel today", Deliv
     expect(classified(subject, from: "Store <orders@tinyshop.co>") == verdict,
            "general rule: \(subject) → \(verdict.map(\.rawValue) ?? "nil")")
 }
-expect(classified("Etsy: Delivered", from: "Etsy <transaction@etsy.com>") == .delivered,
-       "'Delivered' after a label, from a known store (an unknown one also needs a package word)")
+expect(classified("Etsy: Delivered", from: "Etsy <transaction@etsy.com>") == nil
+       && classified("OnTrac: Delivered", from: "OnTrac <noreply@ontrac.com>") == .delivered,
+       "a bare 'Delivered' is about a parcel when a carrier sends it, not a store")
 
 // Negatives and questions: a question isn't news; "wasn't delivered" is a problem.
 for (subject, verdict) in [("Your package hasn't been delivered", Delivery.Kind.problem),
@@ -3249,10 +3257,202 @@ for subject in ["Your package has arrived at the sorting facility", "Your parcel
 }
 expect(DeliveryMail.kind(ofSubject: "[EXT] Re: Your package was delivered") == nil, "a tagged reply")
 expect(DeliveryMail.kind(ofSubject: "Your package was deliv\u{200B}ered") == .delivered, "zero-width spaces don't hide words")
-expect(DeliveryMail.kind(ofSubject: #"Delivered: 'Bob's Burgers DVD'"#) == .delivered
-       && DeliveryMail.kind(ofSubject: #"Shipped: 'Package Delivered Sign'"#) == nil, "single quotes are quotes too")
-expect(DeliveryMail.kind(ofSubject: "Shipped: “Item Delivered Tag”") == nil
-       && DeliveryMail.kind(ofSubject: "Delivered: “Missed Delivery Pad”") == .delivered, "and curly ones")
+expect(DeliveryMail.kind(ofSubject: #"Delivered: 'Bob's Burgers DVD'"#, from: "Amazon") == .delivered
+       && DeliveryMail.kind(ofSubject: #"Shipped: 'Package Delivered Sign'"#, from: "Amazon") == nil, "single quotes are quotes too")
+expect(DeliveryMail.kind(ofSubject: "Shipped: “Item Delivered Tag”", from: "Amazon") == nil
+       && DeliveryMail.kind(ofSubject: "Delivered: “Missed Delivery Pad”", from: "Amazon") == .delivered, "and curly ones")
+
+// MARK: Delivery emails: the pipeline, step by step (third review)
+
+let walmartFrom = "Walmart <help@walmart.com>"
+// 1. Conversations: replies, forwards and read receipts, in many mail programs' words.
+for prefix in ["Re:", "RE:", "re :", "Re[2]:", "Re(3):", "Fwd:", "FWD :", "FW:", "Fw:", "AW:", "WG:", "SV:", "VS:", "Antw:",
+               "Antwort:", "R:", "I:", "RV:", "TR:", "Réf :", "REF:", "Read:", "Automatic reply:", "[EXT] Re:", "  Fwd:"] {
+    expect(classified(prefix + " UPS Update: Package Delivered", from: upsFrom) == nil, "a conversation: \(prefix)")
+}
+expect(classified("Read the instructions: your package was delivered", from: upsFrom) == .delivered
+       && classified("Ireland: your parcel was delivered", from: "An Post <x@anpost.ie>") == .delivered,
+       "a word that merely starts like a prefix isn't one")
+// 2. Not yet: "out for delivery" before anything else; scheduled and on its way ignored.
+expect(classified("Delivery Notification: package 1Z999AA10123456784 out for delivery", from: upsFrom) == .outForDelivery,
+       "a delivery notification that says out for delivery is that")
+expect(classified("FedEx Delivery Notification 771234567890: estimated delivery Tuesday", from: fedexFrom) == nil,
+       "…and one with an estimated delivery isn't Delivered")
+expect(classified("UPS Delivery Notification, Tracking Number 1Z999AA10123456784", from: upsFrom) == .delivered,
+       "UPS's own delivered notice still is")
+expect(classified("Out for delivery today: order #1042 (order #1041 was delivered)", from: "Shop <s@shop.app>") == .outForDelivery,
+       "out for delivery comes first")
+expect(classified("Delivery attempted; redelivery scheduled for Monday", from: upsFrom) == nil,
+       "scheduled comes before problems")
+// 3. Not a parcel for you, before problems and delivered.
+expect(classified("Your order was cancelled and will not be delivered", from: walmartFrom) == nil, "cancelled comes before problems")
+expect(classified("Your Amazon.com eGift Card has been delivered", from: amazonFrom) == nil, "a gift card has nothing to deliver")
+for (subject, from) in [("Back to school: delivered", "Amazon.com <store-news@amazon.com>"), ("Holiday gifts: Delivered!", walmartFrom),
+                        ("Halloween costumes: delivered", "Target <target@em.target.com>"), ("Your next order: delivered", walmartFrom)] {
+    expect(classified(subject, from: from) == nil, "an ad, not a parcel: \(subject)")
+}
+// Each veto decides on its own, even when there's a parcel word.
+expect(classified("Your eGift card order was delivered to sam@example.com", from: amazonFrom) == nil,
+       "a gift card order: nothing comes to the door")
+expect(classified("Never have a missed delivery again: track your packages with UPS My Choice", from: upsFrom) == nil,
+       "an ad about missed deliveries isn't a missed delivery")
+expect(classified("Delivery notification for your order", from: "Shop <s@tinyshop.co>") == nil,
+       "a 'delivery notification' only says delivered with a tracking number in it")
+expect(DeliveryMail.trackingNumbers(in: "Ref 1234567890123456789012 / 12345678901234567890").isEmpty,
+       "20 to 22 digits are USPS's only when they start with 9")
+// 4. and 5. need a parcel: "delivery" alone isn't one.
+for (subject, from) in [("Your fax delivery failed", "eFax <message@efax.com>"), ("SMS delivery failed", "Twilio <no-reply@twilio.com>"),
+                        ("Webhook delivery failed", "GitHub <noreply@github.com>"),
+                        ("Your Amazon.com eGift Card delivery failed", "Amazon.com <gc-orders@gc.email.amazon.com>"),
+                        ("Report delivery complete", "Looker <noreply@looker.com>"), ("Delivery complete", amazonFrom)] {
+    expect(classified(subject, from: from) == nil, "'delivery' alone isn't a parcel: \(subject)")
+}
+expect(classified("Delivery failed for your package", from: "Shop <s@tinyshop.co>") == .problem
+       && classified("Delivery complete: your order #1042", from: "Shop <s@tinyshop.co>") == .delivered
+       && classified("Delivery failed: tracking 1Z999AA10123456784", from: "Shop <s@tinyshop.co>") == .problem,
+       "with a package word or a tracking number, they count")
+expect(classified("Package delivered, then a missed delivery for the other one", from: upsFrom) == .problem,
+       "problems come before delivered")
+// Questions decide nothing; a help page (a real question, then what to do) is ignored.
+expect(classified("UPS Update: Delivery Attempted - Questions? Contact Us", from: upsFrom) == .problem,
+       "boilerplate 'Questions? Contact us' doesn't hide a problem")
+expect(classified("Your package couldn't be delivered. Need help? Contact support", from: upsFrom) == .problem,
+       "…nor 'Need help?'")
+expect(classified("Your package was delivered! Questions? Contact us", from: upsFrom) == .delivered, "…nor a delivery")
+expect(classified("Item delivered - not as described? Open a case", from: ebayFrom) == nil
+       && classified("Order delivered - damaged? Request a refund", from: ebayFrom) == nil,
+       "a real question followed by what to do is a help page")
+expect(classified("Your package was delivered. Was everything OK?", from: upsFrom) == .delivered,
+       "a question with nothing to do after it doesn't make a help page")
+
+// Unverified senders: any domain, not just listed ones.
+let fedexCA = checkedByGmail("Your FedEx package could not be delivered", from: "FedEx <alerts@fedex.ca>",
+                             verdict: "mx.google.com; dkim=fail header.i=@fedex.ca")
+expect(fedexCA == nil, "an unverified sender's delivery problem isn't shown, listed domain or not")
+let shopCA = checkedByGmail("Your package was delivered", from: "Shop <orders@tinyshop.co>", verdict: "mx.google.com; dkim=none")
+expect(shopCA?.store == "Unverified sender", "and any unverified sender shows as such, never by its claimed domain")
+expect(checkedByGmail("Your package was delivered", from: "Shop <orders@tinyshop.co>",
+                      verdict: "mx.google.com; dkim=pass header.i=@tinyshop.co")?.store == "tinyshop.co",
+       "a verified unknown sender shows its domain")
+
+// MARK: Delivery emails: the frozen hold-out set
+
+// Written before the third round of classifier changes and never tuned against:
+// carrier and store templates (UPS, USPS, FedEx, DHL, Amazon, eBay, Walmart, Target,
+// Best Buy, Etsy, Shopify stores, food), and ordinary mail that uses the same words
+// (marketing, gift cards, fax/SMS/webhook/report "delivery", bounces, newsletters,
+// replies and forwards). The score is recorded, not forced to 100%: it may only go up.
+let hUPS = "UPS <mcinfo@ups.com>", hUSPS = "USPS <auto-reply@usps.com>", hFedEx = "FedEx <TrackingUpdates@fedex.com>"
+let hDHL = "DHL Express <noreply@dhl.com>", hAmazon = "Amazon.com <shipment-tracking@amazon.com>"
+let hEBay = "eBay <ebay@ebay.com>", hWalmart = "Walmart <help@walmart.com>", hTarget = "Target <orders@oe1.target.com>"
+let hBestBuy = "Best Buy <BestBuyInfo@emailinfo.bestbuy.com>", hEtsy = "Etsy <transaction@etsy.com>"
+let hShop = "Maple & Co <store+61234@t.shopifyemail.com>", hFriend = "Sam Lee <sam.lee@gmail.com>"
+let holdOut: [(subject: String, from: String, verdict: Delivery.Kind?)] = [
+    ("UPS Update: Package Scheduled for Delivery Tomorrow", hUPS, nil),
+    ("UPS Update: Delivery Attempt Made", hUPS, .problem),
+    ("UPS Update: Package Delivered to UPS Access Point", hUPS, .delivered),
+    ("UPS Ship Notification, Tracking Number 1Z999AA10123456784", hUPS, nil),
+    ("UPS Delivery Change: Your Delivery Has Been Rescheduled", hUPS, nil),
+    ("UPS Update: Your Package Has Been Delayed", hUPS, nil),
+    ("UPS My Choice: Delivery Exception", hUPS, .problem),
+    ("USPS® Item Delivered, Front Door/Porch 9405511899223344556677", hUSPS, .delivered),
+    ("USPS® Delivery Attempted - No Access to Delivery Location 9400111899223344556699", hUSPS, .problem),
+    ("USPS® Item Out for Delivery 9300111899223344556677", hUSPS, .outForDelivery),
+    ("USPS® Expected Delivery on Monday, November 2, 2026 Between 10:30am and 2:30pm", hUSPS, nil),
+    ("USPS® Item In Transit, Arriving Late 9400111899223344556677", hUSPS, nil),
+    ("USPS® Delivery Attempted - Business Closed", hUSPS, .problem),
+    ("USPS® Item Delivered, Parcel Locker", hUSPS, .delivered),
+    ("USPS Informed Delivery® Daily Digest", "USPS Informed Delivery <USPSInformeddelivery@email.informeddelivery.usps.com>", nil),
+    ("USPS® Item Being Returned to Sender, 9400111899223344556677", hUSPS, .problem),
+    ("Your package is scheduled for delivery Monday, 11/2/2026", hFedEx, nil),
+    ("Your FedEx shipment is on its way", hFedEx, nil),
+    ("Your FedEx package is out for delivery today", hFedEx, .outForDelivery),
+    ("Your package has been delivered to the front door", hFedEx, .delivered),
+    ("FedEx delivery exception: Customer not available or business closed", hFedEx, .problem),
+    ("FedEx Delivery Manager: Your delivery is confirmed for tomorrow", hFedEx, nil),
+    ("We'll try to deliver your FedEx package again tomorrow", hFedEx, .problem),
+    ("DHL On Demand Delivery: Your shipment 1234567890 is on its way", hDHL, nil),
+    ("DHL Express shipment 1234567890 has been delivered", hDHL, .delivered),
+    ("DHL: Delivery attempt for shipment 1234567890", hDHL, .problem),
+    ("Your DHL shipment is out for delivery", hDHL, .outForDelivery),
+    ("Delivered: Your Amazon.com order #113-2223334-4455667", hAmazon, .delivered),
+    (#"Your Amazon.com order of "Echo Dot (5th Gen)" has shipped!"#, hAmazon, nil),
+    (#"Arriving tomorrow: "Kindle Scribe""#, hAmazon, nil),
+    (#"Out for delivery: "Ninja Air Fryer" and 2 more items"#, hAmazon, .outForDelivery),
+    (#"Delivery attempted: "Ninja Air Fryer""#, hAmazon, .problem),
+    ("Your Amazon.com eGift Card has been delivered", "Amazon.com <gc-orders@gc.email.amazon.com>", nil),
+    ("Your Amazon.com order has been cancelled", "Amazon.com <auto-confirm@amazon.com>", nil),
+    ("Your refund for Ninja Air Fryer", "Amazon.com <return@amazon.com>", nil),
+    ("Amazon Fresh: Your groceries have been delivered", hAmazon, .delivered),
+    ("Prime Day deals, delivered fast", "Amazon.com <store-news@amazon.com>", nil),
+    ("Your Subscribe & Save delivery is coming soon", "Amazon.com <no-reply@amazon.com>", nil),
+    ("Your eBay item was delivered: Sony WH-1000XM5", hEBay, .delivered),
+    ("Order update: Your item is out for delivery", hEBay, .outForDelivery),
+    ("Your item has shipped: Sony WH-1000XM5", hEBay, nil),
+    ("Delivery update: your item is delayed", hEBay, nil),
+    ("Re: Order #12-34567-89012 - item not delivered", "seller42 <seller42@members.ebay.com>", nil),
+    ("Your eBay Bucks are here", hEBay, nil),
+    ("Delivered: your Walmart.com order", hWalmart, .delivered),
+    ("Your package is arriving today", hWalmart, nil),
+    ("We weren't able to deliver your order", hWalmart, .problem),
+    ("Your order is ready for pickup", hWalmart, nil),
+    ("Rollbacks delivered right to your door", "Walmart <walmart@em.walmart.com>", nil),
+    ("Your order was delivered!", hTarget, .delivered),
+    ("Your Target order is on its way", hTarget, nil),
+    ("Your Drive Up order is ready", hTarget, nil),
+    ("Weekly Ad: deals delivered to your door", "Target <target@em.target.com>", nil),
+    ("Your Best Buy package is out for delivery", hBestBuy, .outForDelivery),
+    ("Your Best Buy order BBY01-806123456789 has been delivered", hBestBuy, .delivered),
+    ("Your order BBY01-806123456789 is ready for store pickup", hBestBuy, nil),
+    ("Delivery and installation appointment confirmed", hBestBuy, nil),
+    ("Your Etsy order has shipped", hEtsy, nil),
+    ("Your Etsy order from MapleLeafPrints was delivered", hEtsy, .delivered),
+    ("Your Etsy purchase from MapleLeafPrints is out for delivery", hEtsy, .outForDelivery),
+    ("A shipment from order #1042 is on the way", hShop, nil),
+    ("A shipment from order #1042 is out for delivery", hShop, .outForDelivery),
+    ("A shipment from order #1042 has been delivered", hShop, .delivered),
+    ("Shipping update for order #1042", hShop, nil),
+    ("Order #1042 has been canceled", hShop, nil),
+    ("Your order #1042 is ready for pickup", hShop, nil),
+    ("Your Uber Eats order has been delivered", "Uber Eats <noreply@uber.com>", .delivered),
+    ("Your Uber Eats delivery is on its way", "Uber Eats <noreply@uber.com>", nil),
+    ("Fax delivery failed to +1 555 0100", "eFax <message@inbound.efax.com>", nil),
+    ("Your fax was delivered successfully", "eFax <message@inbound.efax.com>", nil),
+    ("SMS delivery report: message delivered", "Twilio <no-reply@twilio.com>", nil),
+    ("[GitHub] A webhook delivery to example.com failed", "GitHub <noreply@github.com>", nil),
+    ("Delivery Status Notification (Failure)", "Mail Delivery Subsystem <mailer-daemon@googlemail.com>", nil),
+    ("Undeliverable: Invoice 4471", "postmaster@contoso.com", nil),
+    ("Your scheduled report has been delivered", "Looker <noreply@looker.com>", nil),
+    ("Message delivered: Contract draft", "Mailtrack <notifications@mailtrack.io>", nil),
+    ("The Morning: news delivered to your inbox", "The New York Times <nytdirect@nytimes.com>", nil),
+    ("Your weekly digest has arrived", "Medium Daily Digest <noreply@medium.com>", nil),
+    ("Read: Your package was delivered", hFriend, nil),
+    ("Fwd: UPS Update: Package Delivered", hFriend, nil),
+    ("FW: Your order has been delivered", hFriend, nil),
+    ("Re[2]: Package delivered?", hFriend, nil),
+    ("TR: Votre colis a été livré", hFriend, nil),
+    ("WG: Ihr Paket wurde zugestellt", hFriend, nil),
+    ("Flowers delivered: send a bouquet today", "1-800-Flowers <orders@1800flowers.com>", nil),
+    ("Your eGift card delivery failed", "Target GiftCards <giftcards@target.com>", nil),
+    ("Your package from Amazon has been delivered", "Ring <no-reply@ring.com>", .delivered),
+    ("Your order is on hold", hWalmart, nil),
+    ("Payment failed: your order couldn't be completed", hWalmart, nil),
+    ("Your return has been received and your refund is on its way", hAmazon, nil),
+    ("We missed you – your parcel is at your local post office", "Royal Mail <no-reply@royalmail.com>", .problem),
+    ("Your Evri parcel is on its way", "Evri <noreply@evri.com>", nil),
+    ("Your Canada Post package was delivered to your community mailbox", "Canada Post <noreply@canadapost.ca>", .delivered),
+    ("Australia Post: Your parcel is awaiting collection", "Australia Post <noreply@notifications.auspost.com.au>", nil),
+]
+var holdOutRight = 0
+var holdOutMisses: [String] = []
+for c in holdOut {
+    let got = classified(c.subject, from: c.from)
+    if got == c.verdict { holdOutRight += 1 } else { holdOutMisses.append("\(c.subject) → \(got.map(\.rawValue) ?? "nil") (want \(c.verdict.map(\.rawValue) ?? "nil"))") }
+}
+print("hold-out: \(holdOutRight) of \(holdOut.count) right")
+for miss in holdOutMisses { print("  hold-out miss: \(miss)") }
+// Scores: 403a26e 86 of 94, 5e3209e 85 of 94, the third round 91 of 94. Later rounds may only do better.
+expect(holdOut.count == 94 && holdOutRight >= 91, "the hold-out set doesn't get worse: \(holdOutRight) of \(holdOut.count)")
 
 // MARK: Delivery emails: senders, Gmail's check, names, bodies, dates
 
@@ -3294,11 +3494,11 @@ expect(DeliveryMail.knownShipper(from: "Cool Shop <mailer@shopify.com>") == nil
        && DeliveryMail.store(from: "Cool Shop <mailer@shopify.com>") == "shopify.com"
        && DeliveryMail.knownShipper(from: "Shop <no-reply@shop.app>") == "Shop", "shopify.com sends for every shop: not a known sender")
 expect(DeliveryMail.store(from: "Amazon <x@evil.example.com>") == "example.com", "a display name never names the store")
-let spoofProblem = DeliveryMail.classify(headers: ["subject": "Missed delivery: reschedule now",
+let spoofProblem = DeliveryMail.classify(headers: ["subject": "Missed delivery: reschedule your package now",
                                                    "from": "UPS Support <help@ups-reschedule.top>"], uid: 1)
 expect(spoofProblem?.kind == .problem && spoofProblem?.store == "ups-reschedule.top",
        "problem alerts follow the same rules: \(spoofProblem?.title ?? "-")")
-expect(DeliveryMail.classify(headers: ["subject": "Delivery attempted", "from": "x@spam.top"], uid: 1)?.store == "spam.top",
+expect(DeliveryMail.classify(headers: ["subject": "Delivery attempted for your parcel", "from": "x@spam.top"], uid: 1)?.store == "spam.top",
        "an unknown sender's problem shows its domain")
 
 // Gmail's check of the sender (Authentication-Results, on the app-password route).
@@ -3465,13 +3665,46 @@ expect(partA?.package != nil && partA?.package != partB?.package, "same order, d
 let cut1 = amazonEmail(#"Delivered: "Apple AirPods Pro (2nd..." and 1 more item"#, "c1", "Sat, 17 Oct 2026 12:00:00 +0000")
 let cut2 = amazonEmail(#"Out for delivery: "Apple AirPods Pro (2nd...""#, "c2", "Sat, 17 Oct 2026 08:00:00 +0000")
 expect(cut1?.package != cut2?.package, "a name cut short, with and without '+1 more': not the same parcel")
+// A store's long order number isn't a tracking number, so two orders don't become one parcel.
+func storeEmail(_ subject: String, _ from: String, _ id: String, _ date: String) -> Delivery? {
+    DeliveryMail.classify(headers: ["subject": subject, "from": from, "message-id": "<\(id)@x>", "date": date], uid: 1)
+}
+let targetOut = storeEmail("Your Target order #102003456789012 is out for delivery", "Target <orders@oe1.target.com>", "t1",
+                           "Sat, 17 Oct 2026 08:00:00 +0000")
+let targetIn = storeEmail("Your Target order #102003456789099 has been delivered", "Target <orders@oe1.target.com>", "t2",
+                          "Sat, 17 Oct 2026 12:00:00 +0000")
+expect(targetOut?.package == nil && targetIn.flatMap { d in targetOut.map { DeliveryList.replaced(by: d, in: [$0]) } } == .some(nil),
+       "a 15-digit order number isn't a tracking number: \(targetOut?.package ?? "-")")
+let bestBuy = storeEmail("Your Best Buy order BBY01-806123456789 has been delivered", "Best Buy <BestBuyInfo@emailinfo.bestbuy.com>",
+                         "b1", "Sat, 17 Oct 2026 12:00:00 +0000")
+expect(bestBuy?.package == nil, "…nor a 12-digit one: \(bestBuy?.package ?? "-")")
+let fedexOut = storeEmail("Your FedEx package 771234567890 is out for delivery", fedexFrom, "f1", "Sat, 17 Oct 2026 08:00:00 +0000")
+let fedexIn = storeEmail("FedEx Shipment 771234567890 Delivered", fedexFrom, "f2", "Sat, 17 Oct 2026 12:00:00 +0000")
+if let fedexOut, let fedexIn {
+    expect(fedexOut.package == "fedex:771234567890" && DeliveryList.replaced(by: fedexIn, in: [fedexOut])?.key == fedexOut.key,
+           "from FedEx itself, 12 digits are its tracking number")
+}
+// Two orders of the same thing out for delivery at once: the first "Delivered" can't tell which, so it replaces neither.
+if let outA = amazonEmail(#"Out for delivery: "USB-C Cable""#, "o1", "Sat, 17 Oct 2026 07:00:00 +0000"),
+   let outB = amazonEmail(#"Out for delivery: "USB-C Cable""#, "o2", "Sat, 17 Oct 2026 08:00:00 +0000"),
+   let inA = amazonEmail(#"Delivered: "USB-C Cable""#, "o3", "Sat, 17 Oct 2026 11:00:00 +0000"),
+   let early = amazonEmail(#"Delivered: "USB-C Cable""#, "o4", "Sat, 17 Oct 2026 06:00:00 +0000") {
+    expect(DeliveryList.replaced(by: inA, in: [outA, outB]) == nil
+           && DeliveryList.adding([inA], to: [outB, outA], now: packNow).count == 3,
+           "a repeat order out at the same time: each keeps its own notification")
+    expect(DeliveryList.replaced(by: early, in: [outA]) == nil, "a 'Delivered' sent before the 'Out for delivery' doesn't replace it")
+}
 let phone1 = DeliveryMail.classify(headers: ["subject": "Your Samsung order has been delivered — questions? Call 18005551234",
                                              "from": "Samsung <noreply@samsung.com>"], uid: 1)
 expect(phone1?.package == nil && DeliveryMail.trackingNumbers(in: "Call 18005551234 or 8005551234").isEmpty,
        "phone numbers aren't tracking numbers")
 expect(DeliveryMail.trackingNumbers(in: "1Z999AA10123456784 TBA123456789012 EA123456789US 771234567890 9400111899223344556677")
-       == ["1Z999AA10123456784", "TBA123456789012", "EA123456789US", "771234567890", "9400111899223344556677"],
-       "UPS, Amazon, USPS international, FedEx and USPS formats")
+       == ["1Z999AA10123456784", "TBA123456789012", "EA123456789US", "9400111899223344556677"],
+       "UPS, Amazon, USPS international and USPS formats, from anyone")
+expect(DeliveryMail.trackingNumbers(in: "Shipment 771234567890 / 771234567890123", store: "FedEx") == ["771234567890", "771234567890123"]
+       && DeliveryMail.trackingNumbers(in: "Order 102003456789012 / BBY01-806123456789", store: "Target").isEmpty
+       && DeliveryMail.trackingNumbers(in: "Order 8187654321098765432", store: "AliExpress").isEmpty,
+       "12- and 15-digit numbers only from FedEx: a store's order number isn't a tracking number")
 expect(DeliveryMail.trackingNumbers(in: "Shipment 1234567890", store: "DHL") == ["1234567890"]
        && DeliveryMail.trackingNumbers(in: "Shipment 1234567890").isEmpty, "10 digits only from DHL")
 expect(DeliveryMail.bodyText("Your order was delivered. Questions? Call 18005551234", store: "x.com")
@@ -3590,10 +3823,13 @@ let shelfTool = standIn("shelf-tool", """
     if [ "$1" = "-i" ]; then
       line=$(cat); a=$(echo "$line" | sed -n 's/.* -a \\([^ ]*\\) .*/\\1/p'); v=$(echo "$line" | sed -n 's/.* -w \\([^ ]*\\)$/\\1/p')
       [ -e '\(shelf)/refuse-'"$a" ] && exit 0
-      printf '%s' "$v" > '\(shelf)/'"$a"; exit 0
+      printf '%s' "$v" > '\(shelf)/'"$a"; touch '\(shelf)/written-'"$a"; exit 0
     fi
     a=$(account "$@")
-    if [ "$1" = "find-generic-password" ]; then [ -e '\(shelf)/'"$a" ] || exit 44; cat '\(shelf)/'"$a"; exit 0; fi
+    if [ "$1" = "find-generic-password" ]; then
+      [ -e '\(shelf)/flaky-'"$a" ] && [ -e '\(shelf)/written-'"$a" ] && { rm '\(shelf)/flaky-'"$a" '\(shelf)/written-'"$a"; exit 36; }
+      [ -e '\(shelf)/'"$a" ] || exit 44; cat '\(shelf)/'"$a"; exit 0
+    fi
     if [ "$1" = "delete-generic-password" ]; then [ -e '\(shelf)/'"$a" ] || exit 44; rm '\(shelf)/'"$a"; exit 0; fi
     exit 1
 
@@ -3610,6 +3846,14 @@ try? FileManager.default.removeItem(atPath: shelf + "/refuse-script-key")
 expect(shelfTool.saveAll(service: "s", [("script-url", "L", newURL), ("script-key", "K", String(repeating: "a", count: 64))])
        && shelfTool.find(service: "s", account: "script-url") == .found(newURL)
        && shelfTool.find(service: "s", account: "script-key") == .found(String(repeating: "a", count: 64)), "both saved")
+// The key's write lands but reading it back fails once: the key is put back too, not just the address.
+try? FileManager.default.removeItem(atPath: shelf + "/written-script-key")
+_ = FileManager.default.createFile(atPath: shelf + "/flaky-script-key", contents: Data())   // the next write's read-back fails
+let olderKey = String(repeating: "a", count: 64), newerKey = String(repeating: "b", count: 64)
+expect(!shelfTool.saveAll(service: "s", [("script-url", "L", oldURL), ("script-key", "K", newerKey)])
+       && shelfTool.find(service: "s", account: "script-url") == .found(newURL)
+       && shelfTool.find(service: "s", account: "script-key") == .found(olderKey),
+       "a save that can't be confirmed is undone too: the address and key still go together")
 try? FileManager.default.removeItem(at: keychainDir)
 
 // The script's web address moves from Hammer's settings into the Keychain, once.

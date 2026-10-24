@@ -348,6 +348,40 @@ check(GmailKeychain.scriptURL() == .found(scriptAddress.absoluteString) && Gmail
 GmailKeychain.tool = KeychainTool(path: securityPath, timeout: 10)
 try? FileManager.default.removeItem(atPath: refusals)
 
+print("[script: the new key's write lands, but reading it back fails once]")
+let armed = FileManager.default.temporaryDirectory.appendingPathComponent("armed-\(getpid())").path
+let failNext = FileManager.default.temporaryDirectory.appendingPathComponent("failnext-\(getpid())").path
+let flakyPath = FileManager.default.temporaryDirectory.appendingPathComponent("flaky-security-\(getpid())").path
+let flakyScript = """
+    #!/bin/sh
+    if [ "$1" = "-i" ]; then
+      line=$(cat)
+      case "$line" in *" -a script-key "*) [ -e '\(armed)' ] && { rm '\(armed)'; touch '\(failNext)'; };; esac
+      printf '%s\\n' "$line" | '\(securityPath)' -i; exit $?
+    fi
+    if [ "$1" = "find-generic-password" ]; then
+      prev=""; account=""
+      for arg in "$@"; do [ "$prev" = "-a" ] && account="$arg"; prev="$arg"; done
+      [ "$account" = "script-key" ] && [ -e '\(failNext)' ] && { rm '\(failNext)'; exit 36; }
+    fi
+    exec '\(securityPath)' "$@"
+
+    """
+_ = FileManager.default.createFile(atPath: flakyPath, contents: Data(flakyScript.utf8), attributes: [.posixPermissions: 0o755])
+_ = FileManager.default.createFile(atPath: armed, contents: Data())
+let flakyKey = DeliveryScript.newKey()
+scriptBox["key"] = flakyKey; saveScriptBox()
+GmailKeychain.tool = KeychainTool(path: flakyPath, timeout: 10)
+answer = .none
+watcher.turnOn(scriptURL: otherAddress, key: flakyKey) { answer = .some($0) }
+wait(2)
+scriptBox["key"] = scriptKey; saveScriptBox()
+GmailKeychain.tool = KeychainTool(path: securityPath, timeout: 10)
+check(answer != nil && (answer!)?.message.contains("Keychain") == true, "says it couldn't save: \(String(describing: answer))")
+check(GmailKeychain.scriptKey() == .found(scriptKey) && GmailKeychain.scriptURL() == .found(scriptAddress.absoluteString),
+      "the key that did land is put back too: the address and key in use still go together")
+for path in [armed, failNext, flakyPath] { try? FileManager.default.removeItem(atPath: path) }
+
 print("[the script on the clipboard]")
 let board = NSPasteboard.general
 ScriptClipboard.copy(DeliveryScript.source(key: scriptKey))

@@ -76,30 +76,24 @@ enum DeliveryMail {
     static func classify(headers: [String: String], uid: Int) -> Delivery? {
         let subject = headers["subject"] ?? ""
         let from = headers["from"] ?? ""
-        guard !isBounce(from: from), let kind = kind(ofSubject: subject) else { return nil }
+        guard !isBounce(from: from) else { return nil }
         let sender = sender(from: from, headers: headers)
-        let name = shipperName(domain: sender.domain)
-        var store: String
-        var trusted = false
-        if let name, sender.verified != false {
-            // A store or carrier Hammer knows. (Without Gmail's check, on the script route,
-            // the address can't be verified; the README says so.)
-            store = name
-            trusted = !name.hasSuffix(" seller")
-        } else if name != nil {
-            // A known store's or carrier's domain that Gmail couldn't verify: maybe forged.
-            // Never shown as that store, and its "delivery problems" (the usual phishing,
-            // "pay a redelivery fee") aren't shown at all.
+        let name = sender.verified == false ? nil : shipperName(domain: sender.domain)
+        guard let kind = kind(ofSubject: subject, from: name ?? "") else { return nil }
+        // Who it's from, as shown. A sender Gmail couldn't verify is never shown by the
+        // name or domain it claims (it may be forged), and its "delivery problems" (the
+        // usual phishing: "pay a redelivery fee") aren't shown at all. (Without Gmail's
+        // check, on the script route, nothing can be verified; the README says so.)
+        let store: String
+        if sender.verified == false {
             guard kind != .problem else { return nil }
             store = "Unverified sender"
+        } else if let name {
+            store = name
         } else {
             let domain = registeredDomain(sender.domain)
             store = domain.isEmpty ? "Unknown sender" : shorten(domain, to: 40)
         }
-        // "Your message was delivered", "Your report has been delivered": the wording alone
-        // isn't enough. It has to come from a known store or carrier, or be about a package.
-        // The same goes for problems: a "missed delivery" from anyone else needs a package word.
-        if !trusted && !mentionsAPackage(subject) { return nil }
         let gmailID = headers[":gmail-id"].flatMap { $0.isEmpty ? nil : $0 }
         return Delivery(kind: kind, store: store, item: kind == .problem ? nil : item(in: subject),
                         subject: subject, messageID: headers["message-id"],
@@ -107,101 +101,186 @@ enum DeliveryMail {
                         package: packageKey(subject: subject, store: store))
     }
 
-    /// "Delivered", "problem" (a failed or attempted delivery), "out for delivery", or
-    /// nil for anything else: shipping updates, questions, returns, ads, replies.
-    static func kind(ofSubject raw: String) -> Delivery.Kind? {
-        var full = normalized(raw)
-        // "[EXT] Re: …": tags a mail system put in front
-        while full.hasPrefix("["), let close = full.firstIndex(of: "]"), full.distance(from: full.startIndex, to: close) < 24 {
-            full = String(full[full.index(after: close)...]).trimmingCharacters(in: .whitespaces)
-        }
-        // A conversation, not a notice: "Re:", and "AW:", "SV:", "Antw:" from other mail programs.
-        if matches(full, #"^(re|aw|sv|antw)\s?:"#) { return nil }
+    /// Carriers: everything they send is about a parcel, so their "Delivery attempted"
+    /// needs no other word to be about one.
+    static let carriers: Set<String> = ["UPS", "USPS", "FedEx", "DHL", "OnTrac", "LaserShip", "Royal Mail", "Canada Post",
+                                        "Australia Post", "Purolator", "DPD", "Evri"]
 
-        // Product names can't decide: 'Shipped: "Package Delivered Sign"' is a shipping
-        // update, 'Delivered: "Expected Value"' a delivery.
+    /// The verdict on a subject: delivered, problem (a failed or attempted delivery), out
+    /// for delivery, or nil (ignored). `from` is the store or carrier it comes from, if
+    /// Hammer knows it (and, over IMAP, Gmail verified it). One pipeline, in order; the
+    /// first step that applies decides:
+    ///
+    ///  1. A conversation (a reply, a forward, a read receipt): ignored.
+    ///  2. Not delivered yet: "out for delivery" is out for delivery; scheduled, on its
+    ///     way, shipped or arriving is ignored.
+    ///  3. Not a parcel coming to you (cancelled, refunded, a return you sent, a gift
+    ///     card, waiting to be picked up, handed to the carrier, an ad): ignored.
+    ///  4. A failed or attempted delivery: problem.
+    ///  5. Delivered, said in the past tense: delivered.
+    ///  6. Anything else: ignored.
+    ///
+    /// Out for delivery, problem and delivered also need the subject to be about a parcel
+    /// (`aboutAParcel`): "delivery" alone isn't (fax, SMS, webhooks, reports). Product
+    /// names in quotes never decide, and questions don't either.
+    static func kind(ofSubject raw: String, from shipper: String = "") -> Delivery.Kind? {
+        if isConversation(raw) { return nil }                                         // 1
+        let full = normalized(raw)
         let text = withoutQuotes(full)
-        let trimmed = text.trimmingCharacters(in: .whitespaces)
-        // How the subject starts decides: Amazon's "Shipped: …", "Arriving today: …", also
-        // after a short label ("Amazon.com: Delivered: …", "Order #1045: Shipped").
-        let label = #"^([^:]{1,25}:\s*)?"#
-        if matches(trimmed, label + #"(shipped|ordered|shipping confirmation)\s*([:\-–—|]|$)"#)
-            || matches(trimmed, label + #"(now )?arriving\b"#)
-            || matches(trimmed, #"^your (\S+ ){0,2}(order|package|item|shipment|parcel)s? (has|have) (been )?shipped\b"#) {
-            return nil
-        }
-        if matches(trimmed, label + #"out for delivery\b"#) { return .outForDelivery }
-        if matches(trimmed, label + #"delivered( today| yesterday| this morning)?\s*([:\-–—|]|!?$)"#) { return .delivered }
-
-        // Questions ask rather than tell: "Was your order delivered on time?", "Item not delivered? Get help",
-        // and a question followed by a prompt is a help page: "Item delivered - not as described? Open a case".
-        let s = " " + withoutQuestions(text) + " "
+        let parts = clauses(text)
+        if isHelpPage(parts) { return nil }
+        let s = " " + parts.filter { !$0.question }.map(\.text).joined(separator: ". ") + " "
         guard !s.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
-        let prompt = #"\b(open a (case|claim|dispute)|request a refund|leave (a )?(review|feedback)|rate (your|us)|tell us|let us know|get help|contact (us|support)|here's what to do|report (it|a problem))\b"#
-        if text.contains("?") && matches(s, prompt) { return nil }
-        // Not a parcel arriving for you: returns you sent, parcels handed to the carrier,
-        // cancelled orders, parcels waiting to be picked up, ads for your next order.
-        let notYours = [#"\byour return\b"#, #"\breturn (package|parcel|shipment|item|order|label|request)s?\b"#,
-                        #"\bdrop[- ]?off\b[^.]*\breturn"#,
-                        #"\bdelivered to (the |a |an |our |your )?(carrier|courier|seller|merchant|retailer|shipper|warehouse|post office|postal service|airline|shipping (company|carrier|partner|provider)|logistics( partner| provider| company)?)\b"#,
-                        #"\b(handed|given) (over )?to (the |a )?(carrier|courier)\b"#,
-                        #"\b(cancell?ed|cancell?ation)\b"#,
-                        #"\b(ready|available) (for|to be) (pick ?up|picked up|collection|collected)\b"#,
-                        #"\bready to (pick ?up|collect)\b"#,
-                        #"\bnext (order|delivery|box|shipment)\b"#, #"\bdelivered free\b"#]
-        if notYours.contains(where: { matches(s, $0) }) { return nil }
-        let aboutAPackage = ["package", "parcel", "shipment", "order"].contains { s.contains($0) }
+        let quoted = text.filter { !$0.isWhitespace } != full.filter { !$0.isWhitespace }   // something was in quotes
+        let parcel = aboutAParcel(text: text, quotedItem: quoted, shipper: shipper)
+        if isOutForDelivery(s) { return parcel ? .outForDelivery : nil }              // 2
+        if isNotYet(s) { return nil }
+        if isNotYours(s) { return nil }                                               // 3
+        guard parcel else { return nil }
+        if isProblem(s) { return .problem }                                           // 4
+        if isDelivered(s, shipper: shipper) { return .delivered }                     // 5
+        return nil                                                                    // 6
+    }
 
-        // Failed or attempted deliveries. Some phrases only ever mean a package; the rest
-        // also turn up in bounced email ("Undeliverable: …"), so they need a package word.
-        // "Never have a missed delivery again" is an ad.
-        if matches(s, #"\b(never|no more|avoid|prevent|without|don't|stop|end)\b[^.!?:]{0,30}\b(missed deliver|delivery attempt|attempted deliver|failed deliver)"#) {
-            return nil
+    /// Step 1: a reply, forward or read receipt, with any mail program's prefix ("Re:",
+    /// "Re[2]:", "Fwd:", "FW:", "AW:", "WG:", "SV:", "VS:", "Antw:", "Antwort:", "R:",
+    /// "I:", "RV:", "TR:", "Réf :", "Read:"…), in any case, with or without a space
+    /// before the colon. A mail system's tag in front ("[EXT]") doesn't hide it.
+    static func isConversation(_ raw: String) -> Bool {
+        var text = HeaderText.decode(String(raw.prefix(400))).lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        while text.hasPrefix("["), let close = text.firstIndex(of: "]"), text.distance(from: text.startIndex, to: close) < 24 {
+            text = String(text[text.index(after: close)...]).trimmingCharacters(in: .whitespaces)
         }
-        let alwaysProblem = ["delivery attempt", "attempted delivery", "delivery was attempted",
-                             "delivery exception", "missed delivery"]
-        let problemWithPackage = ["not delivered", "not been delivered", "couldn't be delivered",
-                                  "could not be delivered", "wasn't delivered", "unable to deliver", "undeliverable",
-                                  "failed delivery", "returned to sender", "return to sender",
-                                  "being returned"]
-        // "was never delivered", "hasn't been delivered", "not yet delivered"
-        let negated = #"(\bnot|\bnever|n't)\s+([a-z]+\s+){0,2}delivered\b"#
-        // "We couldn't deliver…", "We tried to deliver…", "Delivery failed" (not "Mail delivery failed")
-        let couldNot = #"\b(couldn't|could not|can't|cannot|unable to|tried to|failed to|attempted to|weren't able to|were not able to)\s+(deliver|be delivered)\b"#
-        let failed = #"(?<!mail )(?<!message )\bdelivery (has |was )?(failed|unsuccessful)\b"#
-        if alwaysProblem.contains(where: { s.contains($0) }) || matches(s, failed)
-            || (aboutAPackage && (problemWithPackage.contains(where: { s.contains($0) }) || matches(s, negated)
-                                  || matches(s, couldNot))) {
-            return .problem
-        }
-        if matches(s, negated) { return nil }
+        let prefixes = "re|fwd?|aw|wg|sv|vs|antw|antwort|r|i|rv|tr|réf|ref|enc|odp|ynt|vb|rif|res|read|lu|gelesen|automatic reply|auto(matic)?-?reply|out of office"
+        return matches(text, #"^("# + prefixes + #")\s*(\[\d+\]|\(\d+\))?\s*:"#)
+    }
 
-        // Plainly past tense: delivered, whatever else the subject says.
-        let delivered = ["was delivered", "were delivered", "has been delivered", "have been delivered",
-                         "is delivered", "are delivered", "got delivered", "item delivered", "items delivered",
-                         "package delivered", "parcel delivered", "order delivered", "shipment delivered",
-                         "was dropped off", "been dropped off"]
-        if delivered.contains(where: { s.contains($0) }) && !s.contains("will have been") { return .delivered }
-        if matches(s, #"\bwe('ve| have)? delivered (your|the)\b|\bdelivery (is |was )?(complete|completed|successful)\b"#) {
-            return .delivered
+    /// The subject in clauses, each marked if it's a question.
+    static func clauses(_ text: String) -> [(text: String, question: Bool)] {
+        var parts: [(text: String, question: Bool)] = []
+        var current = ""
+        func end(question: Bool) {
+            let clause = current.trimmingCharacters(in: .whitespaces)
+            if !clause.isEmpty { parts.append((clause, question)) }
+            current = ""
         }
+        let chars = Array(text)
+        for (index, c) in chars.enumerated() {
+            let atBreak = index + 1 >= chars.count || chars[index + 1].isWhitespace
+            switch c {
+            case "?": end(question: true)
+            case "!", ";", "|": end(question: false)
+            case "." where atBreak, ":" where atBreak: end(question: false)
+            case "-" where atBreak && index > 0 && chars[index - 1].isWhitespace,
+                 "–" where atBreak && index > 0 && chars[index - 1].isWhitespace,
+                 "—" where atBreak && index > 0 && chars[index - 1].isWhitespace:
+                end(question: false)
+            default: current.append(c)
+            }
+        }
+        end(question: false)
+        return parts
+    }
+
+    /// The text without its questions: "Was your package delivered? Tell us" → "Tell us".
+    static func withoutQuestions(_ text: String) -> String {
+        clauses(text).filter { !$0.question }.map(\.text).joined(separator: ". ")
+    }
+
+    /// A help page rather than a notice: a real question followed by what to do about it
+    /// ("Item delivered - not as described? Open a case"). A question that's only
+    /// boilerplate ("Questions? Contact us", "Need help?") doesn't count: the rest decides.
+    static func isHelpPage(_ parts: [(text: String, question: Bool)]) -> Bool {
+        let boilerplate = #"^((any|have|got) )?questions?( or (concerns|comments))?$|^need (help|assistance|support)$|^help$"#
+        let prompt = #"\b(open a (case|claim|dispute)|request a refund|leave (a )?(review|feedback)|rate (your|us|the)|tell us|let us know|get help|contact (us|support|the seller)|here's what to do|report (it|a problem)|start a return)\b"#
+        guard let asked = parts.firstIndex(where: { $0.question && !matches($0.text, boilerplate) }) else { return false }
+        return parts[(asked + 1)...].contains { matches($0.text, prompt) }
+    }
+
+    /// About a parcel: a package, parcel, shipment, order, item, purchase or box (outside
+    /// product names), a tracking number, a carrier sending it, or an item named in quotes
+    /// by a store Hammer knows (Amazon's 'Delivered: "…"'; anyone else can quote anything).
+    static func aboutAParcel(text: String, quotedItem: Bool, shipper: String) -> Bool {
+        if carriers.contains(shipper) || hasParcelWord(text) { return true }
+        if !trackingNumbers(in: text, store: shipper).isEmpty { return true }
+        return quotedItem && !shipper.isEmpty && !shipper.hasSuffix(" seller")
+    }
+
+    static func hasParcelWord(_ text: String) -> Bool {
+        let words = Set(text.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init))
+        return !words.isDisjoint(with: ["package", "packages", "parcel", "parcels", "shipment", "shipments", "order", "orders",
+                                        "item", "items", "purchase", "purchases", "box", "boxes"])
+    }
+
+    /// Step 2: "Your package is out for delivery", but not "will be out for delivery tomorrow".
+    static func isOutForDelivery(_ s: String) -> Bool {
+        matches(s, #"\bout for delivery\b"#)
+            && !matches(s, #"\b(will|to|should|expected to|scheduled to) (be|go) out for delivery\b"#)
+    }
+
+    /// Step 2: not delivered yet: shipped, on its way, arriving, scheduled or expected.
+    static func isNotYet(_ s: String) -> Bool {
+        let patterns = [#"\b(shipped|dispatched|in transit|on (its|the|their) way|label created|ready to ship)\b"#,
+                        #"\b(arriving|arrives)\b"#, #"\bwill (be delivered|arrive|be there)\b"#, #"\b(to be|being) delivered\b"#,
+                        #"\b(scheduled|expected|estimated|planned|confirmed) (for )?(delivery|arrival|to (arrive|be delivered))\b"#,
+                        #"\bdelivery (is |was |has been )?(scheduled|expected|estimated|planned|confirmed|date|window|time|day)\b"#,
+                        #"\b(expected|estimated) (on|by|today|tomorrow|between)\b"#, #"\bscheduled for\b"#,
+                        #"\bcoming (soon|today|tomorrow)\b"#]
+        return patterns.contains { matches(s, $0) }
+    }
+
+    /// Step 3: not a parcel coming to you.
+    static func isNotYours(_ s: String) -> Bool {
+        let patterns = [
+            // returns you sent, and parcels handed on rather than to you
+            #"\byour return\b"#, #"\breturn (package|parcel|shipment|item|order|label|request)s?\b"#, #"\bdrop[- ]?off\b[^.]*\breturn"#,
+            #"\bdelivered to (the |a |an |our |your )?(carrier|courier|seller|merchant|retailer|shipper|warehouse|post office|postal service|airline|shipping (company|carrier|partner|provider)|logistics( partner| provider| company)?)\b"#,
+            #"\b(handed|given) (over )?to (the |a )?(carrier|courier)\b"#,
+            // cancelled or refunded
+            #"\b(cancell?ed|cancell?ation|refund(ed|s)?)\b"#,
+            // waiting to be picked up
+            #"\b(ready|available) (for|to be) (pick ?up|picked up|collection|collected)\b"#, #"\bready to (pick ?up|collect)\b"#,
+            #"\bawaiting (collection|pick ?up)\b"#, #"\b(store|curbside|drive up) pick ?up\b"#,
+            // gift cards and the like: nothing to deliver to the door
+            #"\b(e-?gift|gift ?cards?|e-?cards?|vouchers?)\b"#,
+            // ads: the next order, deals, "never miss a delivery again"
+            #"\bnext (order|delivery|box|shipment)\b"#,
+            #"\b(deals?|sale|coupons?|promo(tion)?s?|discounts?|shop (now|today)|free (delivery|shipping)|delivered free)\b"#, #"% off"#,
+            #"\b(never|no more|avoid|prevent|without|don't|stop|end)\b[^.!?:]{0,30}\b(miss(ed)? (a |another )?deliver|delivery attempt|attempted deliver|failed deliver)"#,
+        ]
+        return patterns.contains { matches(s, $0) }
+    }
+
+    /// Step 4: a failed or attempted delivery.
+    static func isProblem(_ s: String) -> Bool {
+        let phrases = ["delivery attempt", "attempted delivery", "delivery was attempted", "delivery exception",
+                       "missed delivery", "undeliverable", "returned to sender", "return to sender", "being returned",
+                       "failed delivery"]
+        let patterns = [#"(?<!mail )(?<!message )\bdelivery (has |was )?(failed|unsuccessful)\b"#,          // not "Mail delivery failed"
+                        #"\b(couldn't|could not|can't|cannot|unable to|tried to|failed to|attempted to|weren't able to|were not able to|wasn't able to|was not able to)\s+(deliver|be delivered)\b"#,
+                        negated]
+        return phrases.contains { s.contains($0) } || patterns.contains { matches(s, $0) }
+    }
+
+    /// "was never delivered", "hasn't been delivered", "not yet delivered"
+    private static let negated = #"(\bnot|\bnever|n't)\s+([a-z]+\s+){0,2}delivered\b"#
+
+    /// Step 5: delivered, said in the past tense.
+    static func isDelivered(_ s: String, shipper: String) -> Bool {
+        if matches(s, negated) || s.contains("will have been") { return false }
+        let trimmed = s.trimmingCharacters(in: .whitespaces)
+        if matches(trimmed, #"^delivered( today| yesterday| this morning)?\s*([:\-–—|.]|!?$)"#) { return true }
+        let phrases = ["was delivered", "were delivered", "has been delivered", "have been delivered", "is delivered",
+                       "are delivered", "got delivered", "item delivered", "items delivered", "package delivered",
+                       "packages delivered", "parcel delivered", "order delivered", "shipment delivered", "was dropped off",
+                       "been dropped off"]
+        if phrases.contains(where: { s.contains($0) }) { return true }
+        if matches(s, #"\bwe('ve| have)? delivered (your|the)\b|\bdelivery (is |was )?(complete|completed|successful)\b"#) { return true }
         // UPS's own "UPS Delivery Notification, Tracking Number 1Z…"
-        if matches(s, #"\bdelivery notification\b"#) && !trackingNumbers(in: s).isEmpty { return .delivered }
-        if hasArrived(s) { return .delivered }
-
-        if s.contains("out for delivery")
-            && !matches(s, #"\b(will|to) (be|go) out for delivery|\bscheduled\b|\bexpected\b"#) {
-            return .outForDelivery
-        }
-        let notYet = ["will be delivered", "to be delivered", "out for delivery", "expected", "estimated",
-                      "scheduled", "arriving", "on its way", "on the way", "get it delivered",
-                      "get them delivered", "have it delivered", "free delivery", "% off"]
-        if notYet.contains(where: { s.contains($0) }) { return nil }
-
+        if matches(s, #"\bdelivery notification\b"#) && !trackingNumbers(in: s, store: shipper).isEmpty { return true }
+        if hasArrived(s) { return true }
         // "FedEx Shipment 7712… Delivered"
-        let words = s.split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" })
-        if words.last == "delivered" && aboutAPackage { return .delivered }
-        return nil
+        return s.split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" }).last == "delivered"
     }
 
     /// "Your order has arrived", "Your package has arrived at a UPS Access Point", but not
@@ -449,12 +528,8 @@ enum DeliveryMail {
             || (verdict.dmarcPass && verdict.headerFrom.map(registeredDomain) == sender)
     }
 
-    /// Whether the subject is about a package rather than, say, a message or report.
-    static func mentionsAPackage(_ subject: String) -> Bool {
-        let words = Set(tidy(subject).lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init))
-        return !words.isDisjoint(with: ["package", "packages", "parcel", "parcels", "order", "orders", "shipment",
-                                        "shipments", "item", "items", "purchase", "purchases", "delivery", "box"])
-    }
+    /// Whether the subject names a package (not just a "delivery"), rather than, say, a message or report.
+    static func mentionsAPackage(_ subject: String) -> Bool { hasParcelWord(tidy(subject)) }
 
     /// The store or carrier, from the sender's address alone: a name Hammer knows, or
     /// else the sender's domain ("tinyshop.co"). The name an email shows isn't used:
@@ -496,9 +571,10 @@ enum DeliveryMail {
         return nil
     }
 
-    /// Tracking numbers, by the carriers' formats: UPS "1Z…", Amazon "TBA…", USPS's 20–22
-    /// digits or "EA123456789US", FedEx's 12 or 15 digits, and DHL's 10 digits (only from
-    /// DHL: other 10- and 11-digit numbers are usually phone numbers).
+    /// Tracking numbers, only in a carrier's own format: UPS "1Z…", Amazon "TBA…", USPS's
+    /// 20 to 22 digits starting with 9, and international "EA123456789US" from anyone;
+    /// FedEx's 12 or 15 digits only from FedEx, DHL's 10 only from DHL. Other long numbers
+    /// (a store's order number, a phone number) aren't tracking numbers.
     static func trackingNumbers(in text: String, store: String = "") -> [String] {
         text.split(whereSeparator: { !($0.isASCII && ($0.isLetter || $0.isNumber)) }).map(String.init).filter { word in
             let upper = word.uppercased()
@@ -506,8 +582,9 @@ enum DeliveryMail {
             if upper.hasPrefix("1Z") && word.count == 18 { return true }
             if upper.hasPrefix("TBA") && word.count == 15 && word.dropFirst(3).allSatisfy(\.isNumber) { return true }
             if word.count == 13, upper.range(of: #"^[A-Z]{2}\d{9}[A-Z]{2}$"#, options: .regularExpression) != nil { return true }
-            if digits && [12, 15, 20, 22].contains(word.count) { return true }
-            return digits && word.count == 10 && store == "DHL"
+            if digits && (20...22).contains(word.count) && word.hasPrefix("9") { return true }
+            if digits && store == "FedEx" && (word.count == 12 || word.count == 15) { return true }
+            return digits && store == "DHL" && word.count == 10
         }
     }
 
@@ -611,35 +688,6 @@ enum DeliveryMail {
             index += 1
         }
         return String(chars)
-    }
-
-    /// The text without its questions, which ask rather than tell: "Was your package
-    /// delivered? Tell us" → "Tell us". Sentences are split at . ! ? ; | and at a colon
-    /// or a dash with spaces around it.
-    static func withoutQuestions(_ text: String) -> String {
-        var kept: [String] = []
-        var current = ""
-        func end(question: Bool) {
-            let clause = current.trimmingCharacters(in: .whitespaces)
-            if !clause.isEmpty && !question { kept.append(clause) }
-            current = ""
-        }
-        let chars = Array(text)
-        for (index, c) in chars.enumerated() {
-            let atBreak = index + 1 >= chars.count || chars[index + 1].isWhitespace
-            switch c {
-            case "?": end(question: true)
-            case "!", ";", "|": end(question: false)
-            case "." where atBreak, ":" where atBreak: end(question: false)
-            case "-" where atBreak && index > 0 && chars[index - 1].isWhitespace,
-                 "–" where atBreak && index > 0 && chars[index - 1].isWhitespace,
-                 "—" where atBreak && index > 0 && chars[index - 1].isWhitespace:
-                end(question: false)
-            default: current.append(c)
-            }
-        }
-        end(question: false)
-        return kept.joined(separator: ". ")
     }
 
     // MARK: Dates
@@ -1264,17 +1312,16 @@ struct KeychainTool {
         return find(service: service, account: account) == .found(secret)
     }
 
-    /// Saves several items as one: if one can't be saved, the ones saved before it are
-    /// put back as they were, so a failed save never leaves half of a setup behind.
+    /// Saves several items as one: if one can't be saved, it and the ones saved before it
+    /// are put back as they were (a write can land even when reading it back fails), so a
+    /// failed save never leaves half of a setup behind.
     @discardableResult
     func saveAll(service: String, _ items: [(account: String, label: String, secret: String)]) -> Bool {
         var saved: [(account: String, label: String, before: KeychainRead)] = []
         for item in items {
             let before = find(service: service, account: item.account)
-            if save(service: service, account: item.account, label: item.label, secret: item.secret) {
-                saved.append((item.account, item.label, before))
-                continue
-            }
+            saved.append((item.account, item.label, before))
+            if save(service: service, account: item.account, label: item.label, secret: item.secret) { continue }
             for done in saved.reversed() {
                 switch done.before {
                 case .found(let old): save(service: service, account: done.account, label: done.label, secret: old)
@@ -1708,13 +1755,15 @@ enum DeliveryList {
 
     /// The "Out for delivery" a new delivery takes the place of, if any: only a
     /// "Delivered" replaces, only an "Out for delivery", of the same package, sent within
-    /// 2 days before it. Never the other way round.
+    /// 2 days before it. Never the other way round, and never a guess: if two of them
+    /// could be the one (two orders of the same thing out at once), neither is replaced.
     static func replaced(by delivery: Delivery, in list: [Delivery]) -> Delivery? {
         guard delivery.kind == .delivered, let package = delivery.package, let date = delivery.date else { return nil }
-        return list.first { old in
+        let candidates = list.filter { old in
             guard old.kind == .outForDelivery, old.package == package, let then = old.date else { return false }
             return date >= then && date.timeIntervalSince(then) <= samePackageWithin
         }
+        return candidates.count == 1 ? candidates[0] : nil
     }
 
     /// The list with new deliveries (oldest first) added at the top. A "Delivered" takes
