@@ -1356,7 +1356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func showMenuAtMouse() {
-        guard let menu = statusItem.menu else { return }
+        guard statusItem.menu != nil else { return }
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
         // One of Hammer's dialogs is open: bring it forward (the menu would wait behind it).
         if let dialog = NSApp.modalWindow {
@@ -1364,9 +1364,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         // A moment later (the app launcher closes first), and from the run loop: see `fromRunLoop`.
-        let later = Timer(timeInterval: 0.15, repeats: false) { _ in
+        let later = Timer(timeInterval: 0.15, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
-                _ = menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+                _ = self?.statusItem.menu?.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
             }
         }
         RunLoop.main.add(later, forMode: .default)
