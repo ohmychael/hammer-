@@ -40,6 +40,7 @@ open(f"{work}/Menu.swift", "w").write('''import Foundation
 @MainActor final class MenuShell {
     private func label(_ t: String) -> NSMenuItem { NSMenuItem(title: t, action: nil, keyEquivalent: "") }
     private func hint(_ t: String) -> NSMenuItem { label(t) }
+    private func header(_ t: String) -> NSMenuItem { label(t) }
     private func action(_ t: String, _ s: Selector, lightID: String? = nil) -> NSMenuItem {
         NSMenuItem(title: t, action: s, keyEquivalent: "") }
     private func clockTime(_ d: Date) -> String { "" }
