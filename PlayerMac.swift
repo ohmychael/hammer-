@@ -272,6 +272,7 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         idleGeneration += 1                                  // cancels unloading
         popOutGeneration += 1                                // and a pop-out still on its way
         popOutPending = false
+        stayPutUntil = .distantPast
         if !loaded {
             loaded = true
             web.load(URLRequest(url: YouTubeLink.home))
@@ -457,12 +458,24 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         if place == .mini {
             // YouTube moves on to the next video in the same page: keep showing it.
             run("window.__hammer && window.__hammer.mini(true)")
-        } else if place == .hidden && playing && Date() > stayPutUntil {
-            // Playing with no window (you closed the dropdown before the video began): into the mini player.
-            popOut()
+        } else if place == .hidden && playing {
+            popOutIfPlayingUnseen()
         }
         backButton.isEnabled = webView?.canGoBack ?? false
         onChange?()
+    }
+
+    /// Playing with no window (you closed the dropdown before the video began): into the mini
+    /// player. Just after Hammer paused it, the pause gets a moment first; if it's still
+    /// playing then (the page only reports changes), it goes to the mini player all the same.
+    private func popOutIfPlayingUnseen() {
+        let wait = stayPutUntil.timeIntervalSinceNow
+        guard wait > 0 else { popOut(); return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64((wait + 0.1) * 1_000_000_000))
+            guard let self, self.place == .hidden, self.playing, Date() > self.stayPutUntil else { return }
+            self.popOut()
+        }
     }
 
     // MARK: Pages: YouTube stays in the player, everything else opens in your browser
