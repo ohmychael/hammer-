@@ -278,6 +278,18 @@ scenario_cut_off_after_move() {
   check '[ "$(app_version)" = "$B" ] && [ "$(running)" = "$B" ]' "back online, the update is tried again, and works"
 }
 
+scenario_put_back_blocked() {
+  echo "[2: the new app that didn't start can't be moved out of the way]"
+  B="$(commit B)"
+  FAKE_CRASH_VERSION="$B" FAKE_MV_FAIL_DISCARD=1 upd
+  check '[ "$(cat "$HOME/Hammer/build/Hammer-previous.app/Contents/Resources/VERSION" 2>/dev/null)" = "$A" ] && [ "$(app_version)" = "$B" ] && [ -z "$(find "$HOME/Applications/Hammer.app" -name "Hammer-previous.app")" ]' \
+    "both are left as they are: the one you had stays set aside, never inside the new one"
+  check '[ -e "$HOME/Hammer/build/.swapping" ] && said "Couldn.t move"' "the log says so, and the note stays for the next run"
+  upd
+  check '[ "$(app_version)" = "$A" ] && [ "$(running)" = "$A" ] && [ ! -e "$HOME/Hammer/build/.swapping" ]' \
+    "the next run puts it back and starts it"
+}
+
 scenario_stopped_after_success() {
   echo "[1: stopped while deleting the old app, after the new one started]"
   B="$(commit B)"
@@ -468,13 +480,23 @@ scenario_open_during_swap() {
 scenario_mac_problems() {
   echo "[5: problems with the Mac, not the update]"
   B="$(commit B)"
+  : > "$FAKE/git-calls"
   FAKE_CLT_BROKEN=1 upd
+  gits="$(cat "$FAKE/git-calls")"
   check '[ "$(state)" = retry ] && [[ "$(detail)" == *"xcode-select --install"* ]]' \
     "command-line tools broken by a macOS upgrade: says how to fix them (not \"check your internet\")"
   check '[ "$(builds)" = 0 ] && [ "$(failed_version)" = - ] && [ "$(git -C "$HOME/Hammer/repo" rev-parse --short origin/main)" = "$A" ]' \
     "…runs no git, builds nothing, blames no version"
+  head="$(git -C "$HOME/Hammer/repo" rev-parse HEAD)"
+  : > "$FAKE/git-calls"
   FAKE_NO_CLT=1 upd
   check '[ "$(state)" = retry ] && [[ "$(detail)" == *"xcode-select --install"* ]]' "the tools removed: the same"
+  FAKE_NO_CLT=1 bash "$HOME/Hammer/repo/build.sh" > "$WORK/out.txt" 2>&1
+  status=$?
+  gits="$gits$(cat "$FAKE/git-calls")"
+  check '[ $status = 4 ] && [ "$(sed -n 1p "$HOME/Hammer/.retry-later")" = "$head" ]' \
+    "build.sh on its own: the same, and it still names the version (read from .git)"
+  check '[ -z "$gits" ]' "…all without running git (which would ask to install the tools, every few minutes)${gits:+: $gits}"
   FAKE_FREE_KB=200000 upd
   check '[ "$(state)" = retry ] && [[ "$(message)" == *"almost full"* ]] && [ "$(builds)" = 0 ]' \
     "almost out of space: says so, builds nothing"
@@ -651,7 +673,7 @@ scenario_bad_version() {
 }
 
 all=(update restart_loop swap_fails killed_mid_swap logout_mid_swap logout_twice cut_off_after_move
-     stopped_after_success leftover_previous lock installer installer_restores fresh_install crash_at_launch
+     put_back_blocked stopped_after_success leftover_previous lock installer installer_restores fresh_install crash_at_launch
      open_during_swap mac_problems hangs no_perl not_yours login_items login_items_move cli_binary local_edits
      signing_logout busy no_icon bad_version t_ok t_exit4 t_minos t_crash t_term)
 chosen=("$@")

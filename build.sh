@@ -27,8 +27,8 @@ BUNDLE_ID="local.hammer"
 PLISTBUDDY="${HAMMER_PLISTBUDDY:-/usr/libexec/PlistBuddy}"   # tests swap in stand-ins
 PERL="${HAMMER_PERL:-perl}"
 TESTS_LIMIT="${HAMMER_TESTS_LIMIT:-600}"                    # seconds
-VERSION="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo dev)"
-VERSION_DATE="$(git -C "$REPO" log -1 --date=short --format=%cd 2>/dev/null || true)"
+VERSION=""                             # from git, once the developer tools are known to work
+VERSION_DATE=""
 built=no                               # becomes yes once the slow part (compiling) has started
 
 mkdir -p "$BUILD"
@@ -46,10 +46,24 @@ limit() {
 free_kb() { df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }'; }
 low_on_space() { local free; free="$(free_kb)"; [ -n "$free" ] && [ "$free" -lt 1048576 ]; }
 
+# The commit checked out, read from .git without running git (on a Mac without the
+# developer tools, /usr/bin/git asks to install them).
+head_commit() {
+  local head ref
+  head="$(cat "$REPO/.git/HEAD" 2>/dev/null)" || return 0
+  case "$head" in
+    "ref: "*)
+      ref="${head#ref: }"
+      cat "$REPO/.git/$ref" 2>/dev/null || awk -v r="$ref" '$2 == r { print $1 }' "$REPO/.git/packed-refs" 2>/dev/null
+      ;;
+    *) echo "$head" ;;
+  esac
+}
+
 # retry_later <message> <detail>: a problem with this Mac. Exits 4. update.sh waits
 # an hour before building that version again if the build had already started.
 retry_later() {
-  printf '%s\n%s\n%s\n%s\n' "$VERSION" "$1" "$2" "$built" > "$RETRY" 2>/dev/null || true
+  printf '%s\n%s\n%s\n%s\n' "${VERSION:-$(head_commit)}" "$1" "$2" "$built" > "$RETRY" 2>/dev/null || true
   echo "$2"
   exit 4
 }
@@ -74,28 +88,35 @@ stop_hammer() {   # stops Hammer and waits until it has quit
   sleep 0.5
 }
 
+# bring_back: the Hammer you had (set aside) back in place. If what's in its place
+# can't be moved away, both are left as they are (never one inside the other).
+bring_back() {
+  discard "$APP" || true
+  if [ -e "$APP" ]; then
+    echo "Couldn't move ~/Applications/Hammer.app out of the way, so the Hammer you had stays set aside (tried again next time)."
+    return 1
+  fi
+  mkdir -p "$(dirname "$APP")" && mv "$PREVIOUS" "$APP"
+}
+
 # An update cut off part-way (a logout, a shutdown) can leave the Hammer you had set
 # aside, with a new one that never started, or nothing, in its place. This puts it
 # back and starts it. The only good copy is never deleted.
 restore() {
-  local reopen=false
+  local reopen=false done=true
   if [ -e "$SWAPPING" ]; then
     reopen=true
     if valid_app "$PREVIOUS"; then
       echo "An update was cut off part-way, so the Hammer you had is going back."
       stop_hammer
-      discard "$APP"
-      mkdir -p "$(dirname "$APP")"
-      mv "$PREVIOUS" "$APP"
+      bring_back || done=false
     fi
   elif ! valid_app "$APP" && valid_app "$PREVIOUS"; then
     echo "Hammer was set aside by an update that was cut off; putting it back."
     reopen=true
-    discard "$APP"
-    mkdir -p "$(dirname "$APP")"
-    mv "$PREVIOUS" "$APP"
+    bring_back || done=false
   fi
-  rm -f "$SWAPPING"
+  if $done; then rm -f "$SWAPPING"; fi   # otherwise the next run tries again
   if $reopen && valid_app "$APP" && ! pgrep -x Hammer >/dev/null 2>&1; then open "$APP" --args --login || true; fi
 }
 
@@ -129,10 +150,13 @@ restore
 [ "${1:-}" = --restore ] && exit 0
 
 # 0. Problems with the Mac, before anything is built.
-if ! xcrun --find swiftc >/dev/null 2>&1; then
+developer="$(xcode-select -p 2>/dev/null || true)"
+if [ -z "$developer" ] || [ ! -d "$developer" ] || ! xcrun --find swiftc >/dev/null 2>&1; then
   retry_later "Can't update: developer tools missing" \
     "Apple's command-line tools need reinstalling. In Terminal, run: xcode-select --install"
 fi
+VERSION="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo dev)"
+VERSION_DATE="$(git -C "$REPO" log -1 --date=short --format=%cd 2>/dev/null || true)"
 if low_on_space; then no_space; fi
 if [ -d "$APP" ]; then
   existing_id="$("$PLISTBUDDY" -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" 2>/dev/null || true)"
@@ -267,8 +291,7 @@ started() {   # the new Hammer said it has started, and it's still running
 put_back() {
   stop_hammer
   if valid_app "$PREVIOUS"; then
-    discard "$APP"
-    mv "$PREVIOUS" "$APP"
+    bring_back || return 0             # still swapping: finish tries once more, and keeps the note
     open "$APP" --args --login || true
     echo "The Hammer you had is back."
   fi

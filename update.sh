@@ -30,6 +30,10 @@ if [ "${1:-}" = "--manual" ] || [ -f "$FLAG" ]; then MANUAL=true; fi
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
 
+# same_version <a> <b>: the same commit, short or full (build.sh writes the full one
+# when it stopped before it could run git).
+same_version() { [ -n "$1" ] && [ -n "$2" ] && { [ "${1#"$2"}" != "$1" ] || [ "${2#"$1"}" != "$2" ]; }; }
+
 # status <state> <message> [<detail>]
 status() {
   { echo "state=$1"; echo "time=$(date +%s)"; echo "version=${latest:-}"; echo "message=$2"; echo "detail=${3:-}"; } \
@@ -127,7 +131,7 @@ fi
 
 # An older update.sh counted build.sh's "a problem with this Mac" (exit 4) as a failed
 # build, which would block that version until the next one: undo that.
-if [ -f "$FAILED" ] && [ "$(sed -n 1p "$RETRY" 2>/dev/null)" = "$(cat "$FAILED")" ]; then
+if [ -f "$FAILED" ] && same_version "$(sed -n 1p "$RETRY" 2>/dev/null)" "$(cat "$FAILED")"; then
   log "$(cat "$FAILED"): not a failed build (a problem with this Mac), so it'll be tried again"
   rm -f "$FAILED"
 fi
@@ -138,7 +142,7 @@ if ! $MANUAL && [ "$(cat "$FAILED" 2>/dev/null)" = "$latest" ]; then
 fi
 # One that hit a problem with this Mac after building is built again after an hour (or
 # on a manual check); problems found before building are checked again every time.
-if ! $MANUAL && [ "$(sed -n 1p "$RETRY" 2>/dev/null)" = "$latest" ] && [ "$(sed -n 4p "$RETRY" 2>/dev/null)" = yes ] \
+if ! $MANUAL && same_version "$(sed -n 1p "$RETRY" 2>/dev/null)" "$latest" && [ "$(sed -n 4p "$RETRY" 2>/dev/null)" = yes ] \
    && [ -n "$(find "$RETRY" -mmin -60 2>/dev/null)" ]; then
   log "$latest: $(sed -n 3p "$RETRY"); trying again later"
   exit 0
