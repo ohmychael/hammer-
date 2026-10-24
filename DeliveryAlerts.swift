@@ -586,6 +586,7 @@ enum KeychainCheck {
     }
 
     static func run(_ args: [String]) -> Int32 {
+        setvbuf(stdout, nil, _IOLBF, 0)
         let mode = args.dropFirst().first ?? "round-trip"
         let value = "hammer-test-" + UUID().uuidString
         var ok = true
@@ -599,7 +600,7 @@ enum KeychainCheck {
             }) && ok
         }
         if mode == "round-trip" || mode == "--read" {
-            let read = timed(15) { () -> (OSStatus, Data?) in
+            let read = timed(10) { () -> (OSStatus, Data?) in
                 var query = base()
                 query[kSecReturnData as String] = true
                 query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -608,6 +609,7 @@ enum KeychainCheck {
                 return (status, result as? Data)
             }
             ok = say("read", read?.0) && ok
+            if read == nil { print("keychain check FAILED"); return 1 }
             if let data = read?.1 {
                 let text = String(decoding: data, as: UTF8.self)
                 print("read value: \(mode == "round-trip" ? (text == value ? "matches" : "DIFFERENT") : (text.hasPrefix("hammer-test-") ? "a test value" : "unexpected"))")

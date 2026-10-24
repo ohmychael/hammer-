@@ -178,18 +178,23 @@ jobs:
           limit 60 "$app" keychain-check >> $out 2>&1; echo "exit $?" >> $out
           echo "== A keeps one" >> $out
           limit 30 "$app" keychain-check --keep >> $out 2>&1; echo "exit $?" >> $out
-          echo "== /usr/bin/security reads A's item" >> $out
-          limit 20 /usr/bin/security find-generic-password -s local.hammer.keychain-check -a test -w > /tmp/kc-sec.txt 2>&1; echo "exit $?" >> $out
-          grep -c hammer-test /tmp/kc-sec.txt >> $out
           rm -rf /tmp/HammerB.app && cp -R ~/Applications/Hammer.app /tmp/HammerB.app
           /usr/libexec/PlistBuddy -c 'Set :CFBundleVersion experiment' /tmp/HammerB.app/Contents/Info.plist
           (source ./signing.sh && sign_app /tmp/HammerB.app) >> $out 2>&1
           codesign -dvvv ~/Applications/Hammer.app 2>&1 | grep -E "^CDHash=|TeamIdentifier|Authority" >> $out
           codesign -dvvv /tmp/HammerB.app 2>&1 | grep -E "^CDHash=|TeamIdentifier|Authority" >> $out
+          codesign -d -r- ~/Applications/Hammer.app 2>&1 | grep designated >> $out
+          codesign -d -r- /tmp/HammerB.app 2>&1 | grep designated >> $out
           echo "== B (same certificate, new build) reads A's item" >> $out
-          limit 30 /tmp/HammerB.app/Contents/MacOS/Hammer keychain-check --read >> $out 2>&1; echo "exit $?" >> $out
-          mkdir -p /tmp/player-shots && screencapture -x /tmp/player-shots/keychain.png
-          echo "== A cleans up" >> $out
+          limit 40 /tmp/HammerB.app/Contents/MacOS/Hammer keychain-check --read >> $out 2>&1; echo "exit $?" >> $out
+          mkdir -p /tmp/player-shots && screencapture -x /tmp/player-shots/keychain-b.png
+          echo "== A reads it again, then deletes it" >> $out
+          limit 40 "$app" keychain-check --read >> $out 2>&1; echo "exit $?" >> $out
+          echo "== /usr/bin/security reads an item A made" >> $out
+          limit 30 "$app" keychain-check --keep >> $out 2>&1; echo "exit $?" >> $out
+          limit 15 /usr/bin/security find-generic-password -s local.hammer.keychain-check -a test -w > /tmp/kc-sec.txt 2>&1; echo "exit $?" >> $out
+          grep -c hammer-test /tmp/kc-sec.txt >> $out
+          screencapture -x /tmp/player-shots/keychain-security.png
           limit 30 "$app" keychain-check --delete >> $out 2>&1; echo "exit $?" >> $out
           cat $out
           body="$(sed -e 's/%/%25/g' $out | awk '{printf "%s%%0A", $0}')"
