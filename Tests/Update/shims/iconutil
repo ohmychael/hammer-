@@ -1,0 +1,4 @@
+#!/bin/bash
+# Stand-in for iconutil -c icns <folder>.iconset -o <file>.icns
+[ "${FAKE_ICONUTIL_FAIL:-0}" = 1 ] && exit 1
+[ -f "$3/icon_512x512@2x.png" ] && echo ICNS > "$5"

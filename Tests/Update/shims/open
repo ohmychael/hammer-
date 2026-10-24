@@ -1,0 +1,18 @@
+#!/bin/bash
+# Stand-in for /usr/bin/open: "launches" Hammer.app by writing its version to
+# $FAKE/running and, like the real Hammer once it has started, ~/Hammer/.launched.
+# Like LaunchServices, opening an app that's already running just brings it forward.
+source "$(dirname "$0")/_log"
+app="$1"
+v="$(cat "$app/Contents/Resources/VERSION" 2>/dev/null || echo '?')"
+args=""; [[ " $* " == *" --login "* ]] && args=" --login"
+if [ ! -d "$app" ]; then echo "The file $app does not exist." >&2; log "open FAILED (no app)$args"; exit 1; fi
+if [ -n "${FAKE_OPEN_FAIL_VERSION:-}" ] && [ "$v" = "$FAKE_OPEN_FAIL_VERSION" ]; then
+  echo "The application cannot be opened for an unexpected reason, error=Error Domain=NSOSStatusErrorDomain Code=-10669" >&2
+  log "open FAILED ($v)$args"; exit 1
+fi
+if [ -f "$FAKE/running" ]; then log "open: brought the running Hammer $(cat "$FAKE/running") forward$args"; exit 0; fi
+if [ -n "${FAKE_CRASH_VERSION:-}" ] && [ "$v" = "$FAKE_CRASH_VERSION" ]; then log "open OK ($v)$args, then it crashed"; exit 0; fi
+echo "$v" > "$FAKE/running"
+mkdir -p "$HOME/Hammer" && printf '%s\n%s\n' "$v" 4242 > "$HOME/Hammer/.launched"
+log "open OK ($v)$args"

@@ -1,0 +1,7 @@
+#!/bin/bash
+# Stand-in for xcrun. FAKE_CLT_BROKEN=1: the tools are there but broken (after a macOS upgrade).
+if [ "${FAKE_CLT_BROKEN:-0}" = 1 ]; then
+  echo "xcrun: error: invalid active developer path (/Library/Developer/CommandLineTools), missing xcrun at: /Library/Developer/CommandLineTools/usr/bin/xcrun" >&2
+  exit 1
+fi
+[ "$1" = --find ] && echo "/Library/Developer/CommandLineTools/usr/bin/$2"

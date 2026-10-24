@@ -1,0 +1,10 @@
+#!/bin/bash
+# Stand-in for mkdir. FAKE_KILL_AT_APPS=KILL|TERM: the update is killed (logout, shutdown)
+# right in the middle of swapping the app (when ~/Applications is made).
+if [ -n "${FAKE_KILL_AT_APPS:-}" ] && [ "${@: -1}" = "$HOME/Applications" ] && [ ! -e "$FAKE/killed" ]; then
+  : > "$FAKE/killed"
+  echo "SIG$FAKE_KILL_AT_APPS to the whole update, mid-swap" >> "$FAKE_LOG"
+  kill -s "$FAKE_KILL_AT_APPS" -- "-$(ps -o pgid= -p $$ | tr -d ' ')"
+  perl -e 'select(undef, undef, undef, 2)'
+fi
+for real in /bin/mkdir /usr/bin/mkdir; do [ -x "$real" ] && exec "$real" "$@"; done

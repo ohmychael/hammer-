@@ -9,10 +9,9 @@
 set -euo pipefail
 trap 'echo; echo "Something went wrong above. Copy everything in this window and paste it to Claude."' ERR
 
-REPO_URL="https://github.com/ohmychael/hammer-.git"
+REPO_URL="${HAMMER_REPO_URL:-https://github.com/ohmychael/hammer-.git}"   # tests use a local copy
 DIR="$HOME/Hammer/repo"
-AGENTS="$HOME/Library/LaunchAgents"
-UID_NUM="$(id -u)"
+LOCK="$HOME/Hammer/.update.lock"       # shared with update.sh: one install or update at a time
 
 step() { printf '\n==> %s\n' "$1"; }
 
@@ -23,11 +22,37 @@ if ! xcode-select -p >/dev/null 2>&1; then
   echo "Click Install in the window that just opened. When it finishes, run this same command again."
   exit 0
 fi
+if ! xcrun --find swiftc >/dev/null 2>&1; then
+  step "Apple's command-line developer tools need reinstalling (this happens after some macOS updates)"
+  xcode-select --install 2>/dev/null || true
+  echo "Click Install in the window that just opened. When it finishes, run this same command again."
+  exit 0
+fi
 
-# 2. Get the code (or bring an existing copy up to date).
-step "Downloading Hammer"
+# 2. Wait for an update that's running to finish, then keep updates off until this is done.
 mkdir -p "$HOME/Hammer"
+holder_alive() {
+  local pid started
+  pid="$(sed -n 1p "$LOCK/pid" 2>/dev/null)"
+  started="$(sed -n 2p "$LOCK/pid" 2>/dev/null)"
+  if [ -z "$pid" ]; then [ -n "$(find "$LOCK" -maxdepth 0 -mmin -1 2>/dev/null)" ]; return; fi
+  kill -0 "$pid" 2>/dev/null && [ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]
+}
+waited=0
+until mkdir "$LOCK" 2>/dev/null; do
+  if ! holder_alive; then rm -rf "$LOCK"; continue; fi
+  if [ "$waited" = 0 ]; then step "Waiting for an update that's running to finish"; fi
+  if [ "$waited" -ge 3600 ]; then echo "It's still running after an hour. Restart your Mac, then try again."; exit 1; fi
+  sleep 5
+  waited=$((waited + 5))
+done
+printf '%s\n%s\n' "$$" "$(ps -o lstart= -p $$)" > "$LOCK/pid"
+trap 'rm -rf "$LOCK"' EXIT
+
+# 3. Get the code (or bring an existing copy up to date).
+step "Downloading Hammer"
 if [ -d "$DIR/.git" ]; then
+  if [ -n "$(find "$DIR/.git/index.lock" -mmin +10 2>/dev/null)" ]; then rm -f "$DIR/.git/index.lock"; fi
   git -C "$DIR" fetch --quiet origin main
   git -C "$DIR" reset --hard --quiet origin/main
 else
@@ -35,49 +60,18 @@ else
   git clone --quiet "$REPO_URL" "$DIR"
 fi
 
-# 3. Build and install the app.
+# 4. Build and install the app.
 step "Building Hammer"
 bash "$DIR/build.sh"
+rm -f "$HOME/Hammer/.failed-build"
 
-# 4. Open Hammer at login.
-step "Setting Hammer to open when you log in"
-mkdir -p "$AGENTS"
-cat > "$AGENTS/local.hammer.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>local.hammer</string>
-  <key>ProgramArguments</key>
-  <array><string>/usr/bin/open</string><string>$HOME/Applications/Hammer.app</string></array>
-  <key>RunAtLoad</key><true/>
-</dict>
-</plist>
-PLIST
-
-# 5. Check for updates at login and every few minutes (Hammer also asks every 2 minutes).
-step "Turning on automatic updates"
-cat > "$AGENTS/local.hammer.updater.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>local.hammer.updater</string>
-  <key>ProgramArguments</key>
-  <array><string>/bin/bash</string><string>$DIR/update.sh</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>StartInterval</key><integer>300</integer>
-  <key>StandardOutPath</key><string>$HOME/Hammer/update.log</string>
-  <key>StandardErrorPath</key><string>$HOME/Hammer/update.log</string>
-</dict>
-</plist>
-PLIST
-rm -rf /tmp/hammer-update.lock        # clear anything left by an interrupted update
-launchctl bootout "gui/$UID_NUM/local.hammer.updater" 2>/dev/null || true
-launchctl bootstrap "gui/$UID_NUM" "$AGENTS/local.hammer.updater.plist" 2>/dev/null || true
+# 5. Open Hammer at login, and check for updates at login and every 5 minutes
+# (Hammer also asks every 2 minutes). In Login Items these are "Hammer" and "Hammer Updates".
+step "Setting Hammer to open when you log in, and to update itself"
+bash "$DIR/agents.sh" || echo "Turn them on in System Settings → General → Login Items (Allow in the Background)."
+printf 'state=current\ntime=%s\nmessage=Up to date\ndetail=\n' "$(date +%s)" > "$HOME/Hammer/update-status"
 
 # 6. Pop the menu up next to the pointer so you can see it worked.
-sleep 2
 open "$HOME/Applications/Hammer.app"
 
 echo

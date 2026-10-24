@@ -1,0 +1,8 @@
+#!/bin/bash
+# Stand-in for xcode-select. FAKE_NO_CLT=1: the command-line tools aren't installed.
+source "$(dirname "$0")/_log"
+case "$1" in
+  -p) [ "${FAKE_NO_CLT:-0}" = 1 ] && { echo "xcode-select: error: unable to get active developer directory" >&2; exit 2; }
+      echo "$FAKE" ;;
+  --install) log "xcode-select --install" ;;
+esac

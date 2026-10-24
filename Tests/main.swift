@@ -1623,6 +1623,55 @@ expect(TimerText.describe(minutes: 60) == "1 hr", "1 hr")
 expect(TimerText.describe(minutes: 90) == "1 hr 30 min", "1 hr 30 min")
 expect(TimerText.describe(minutes: 480) == "8 hr", "8 hr")
 
+// MARK: Updates and starting (the shell side: update.sh's status file, launch arguments)
+
+let statusText = "state=current\ntime=1761340440\nmessage=Up to date\ndetail=\n"
+let upToDate = UpdateStatus.parse(statusText)
+expect(upToDate?.state == "current" && upToDate?.message == "Up to date"
+       && upToDate?.time == Date(timeIntervalSince1970: 1_761_340_440), "the status file is read")
+expect(upToDate?.menuLine(when: "2:14 PM") == "Up to date · checked 2:14 PM", "up to date, and when")
+expect(UpdateStatus.parse("state=updated\ntime=1\nmessage=Updated to abc1234\ndetail=Fix a=b\n")?.detail == "Fix a=b",
+       "values may contain =")
+expect(UpdateStatus.parse("") == nil && UpdateStatus.parse("state=current\n") == nil
+       && UpdateStatus.parse("state=current\ntime=soon\n") == nil, "a half-written file is ignored")
+let updating = UpdateStatus(state: "updating", time: Date(timeIntervalSince1970: 1000), message: "Updating…", detail: "x")
+expect(updating.menuLine(when: "2:14 PM") == "Updating…", "in progress: no time")
+expect(!updating.isStale(now: Date(timeIntervalSince1970: 1000 + 600))
+       && updating.isStale(now: Date(timeIntervalSince1970: 1000 + 4000)), "still updating after an hour: cut off")
+let failedStatus = UpdateStatus(state: "failed", time: Date(timeIntervalSince1970: 5000),
+                                message: "Update failed to build", detail: "Hammer kept the version you have.")
+expect(failedStatus.menuLine(when: "Oct 22") == "Update failed to build · Oct 22", "failed, and when")
+
+// Notifications: news once, and every answer to Check for Updates.
+let soon = Date(timeIntervalSince1970: 5060)
+expect(failedStatus.notice(asked: nil, lastNotice: nil, now: soon)?.title == "Hammer couldn't update", "a failure is news")
+expect(failedStatus.notice(asked: nil, lastNotice: failedStatus.noticeKey, now: soon) == nil, "…once")
+expect(failedStatus.notice(asked: nil, lastNotice: nil, now: Date(timeIntervalSince1970: 5000 + 3600)) == nil,
+       "old news isn't shown")
+var current = failedStatus
+current.state = "current"; current.message = "Up to date"
+expect(current.notice(asked: nil, lastNotice: nil, now: soon) == nil, "up to date isn't news")
+expect(current.notice(asked: Date(timeIntervalSince1970: 4990), lastNotice: current.noticeKey, now: soon)?.title
+       == "Hammer is up to date", "…unless you asked")
+expect(current.notice(asked: Date(timeIntervalSince1970: 5100), lastNotice: nil, now: soon) == nil,
+       "an answer from before you asked doesn't count")
+var updated = failedStatus
+updated.state = "updated"; updated.message = "Updated to abc1234"; updated.detail = "Lights: faster"
+expect(updated.notice(asked: nil, lastNotice: failedStatus.noticeKey, now: soon)! == ("Hammer updated", "Lights: faster"),
+       "an update says what's new")
+expect(updating.notice(asked: Date(timeIntervalSince1970: 0), lastNotice: nil, now: soon) == nil,
+       "nothing while it's still going")
+var retry = failedStatus
+retry.state = "retry"; retry.message = "Can't update: developer tools missing"; retry.detail = "xcode-select --install"
+expect(retry.notice(asked: nil, lastNotice: nil, now: soon)! == ("Can't update: developer tools missing", "xcode-select --install"),
+       "a problem with the Mac says how to fix it")
+
+expect(Launch.startsMenuBarApp([]) && Launch.startsMenuBarApp(["--login"]) && Launch.startsMenuBarApp(["-psn_0_12345"]),
+       "the menu bar app starts from Finder, at login, and on older macOS")
+expect(!Launch.startsMenuBarApp(["--help"]) && !Launch.startsMenuBarApp(["brightness"])
+       && !Launch.startsMenuBarApp(["--login", "x"]), "anything else gets the usage")
+expect(Launch.atLogin(["--login"]) && !Launch.atLogin([]), "at login, the menu doesn't pop up")
+
 // MARK: Delivery emails: which subjects count
 
 let deliveredSubjects = [

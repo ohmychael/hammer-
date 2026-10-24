@@ -48,19 +48,41 @@ jobs:
         run: |
           start=$(date +%s)
           target="$(uname -m)-apple-macosx$(sw_vers -productVersion | cut -d. -f1).0"    # as build.sh does
-          swiftc -O -target "$target" HammerCore.swift Monitor.swift Player.swift Deliveries.swift Tests/main.swift \
+          swiftc -swift-version 5 -O -target "$target" HammerCore.swift Monitor.swift Player.swift Deliveries.swift Tests/main.swift \
             -o /tmp/hammer-tests 2>&1 | tee /tmp/tests-build.log
           /tmp/hammer-tests | tee /tmp/tests.log
           echo "::notice title=Tests::$(tail -1 /tmp/tests.log) (built and run in $(( $(date +%s) - start )) s)"
+
+      - name: Update and install scripts (in a sandbox; never touches this Mac's real apps or login items)
+        timeout-minutes: 6
+        run: |
+          perl -e 'alarm shift; exec @ARGV' 300 bash Tests/Update/run.sh 2>&1 | tee /tmp/update-tests.txt
+          echo "::notice title=Update scripts::$(tail -1 /tmp/update-tests.txt)"
 
       - name: Build the app
         timeout-minutes: 15
         run: |
           start=$(date +%s)
           target="$(uname -m)-apple-macosx$(sw_vers -productVersion | cut -d. -f1).0"    # as build.sh does
-          swiftc -parse-as-library -O -target "$target" Hammer.swift HammerCore.swift Monitor.swift MonitorMac.swift \
-            Player.swift PlayerMac.swift EdgeMac.swift Deliveries.swift DeliveryAlerts.swift -o /tmp/Hammer 2>&1 | tee /tmp/app-build.log
+          swiftc -swift-version 5 -parse-as-library -O -target "$target" Hammer.swift HammerCore.swift Monitor.swift MonitorMac.swift \
+            Player.swift PlayerMac.swift EdgeMac.swift Deliveries.swift DeliveryAlerts.swift UpdatesMac.swift \
+            -o /tmp/Hammer 2>&1 | tee /tmp/app-build.log
           echo "::notice title=App::built in $(( $(date +%s) - start )) s"
+
+      - name: Command line (usage, and the app icon)
+        timeout-minutes: 2
+        run: |
+          set +e
+          limit() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+          limit 10 /tmp/Hammer --no-such-thing > /tmp/cli.txt 2>&1; echo "exit $?" >> /tmp/cli.txt
+          limit 60 /tmp/Hammer make-icon /tmp/Hammer.iconset >> /tmp/cli.txt 2>&1; echo "make-icon exit $?" >> /tmp/cli.txt
+          iconutil -c icns /tmp/Hammer.iconset -o /tmp/Hammer.icns >> /tmp/cli.txt 2>&1; echo "iconutil exit $?" >> /tmp/cli.txt
+          ls /tmp/Hammer.iconset >> /tmp/cli.txt
+          mkdir -p /tmp/player-shots && cp /tmp/Hammer.iconset/icon_512x512@2x.png /tmp/player-shots/app-icon.png
+          cat /tmp/cli.txt
+          # An unknown argument prints the usage and exits 2 (it used to start a second Hammer).
+          grep -q "^usage: Hammer" /tmp/cli.txt && grep -q "^exit 2$" /tmp/cli.txt \
+            && grep -q "^make-icon exit 0$" /tmp/cli.txt && grep -q "^iconutil exit 0$" /tmp/cli.txt
 
       - name: Monitor commands (there's no monitor here)
         timeout-minutes: 3
@@ -85,7 +107,9 @@ jobs:
           perl -e 'alarm shift; exec @ARGV' 1100 bash build.sh 2>&1 \
             | while IFS= read -r line; do echo "$(date +%T) $line"; done | tee /tmp/install1.log
           grep -q "Signed with Hammer Local Signing" /tmp/install1.log
-          grep -q "installed (built for macOS" /tmp/install1.log      # macOS opened it; says which macOS it's for
+          grep -q "installed (built for macOS" /tmp/install1.log      # it started (wrote ~/Hammer/.launched); says which macOS it's for
+          grep -q "^.\{9\}Icon: made" /tmp/install1.log || echo "::warning title=Icon::build.sh made no app icon"
+          cat ~/Hammer/.launched
           codesign -d -r- ~/Applications/Hammer.app 2>&1 | grep designated | tee /tmp/req1.txt
 
       - name: The menu bar app starts and keeps running
@@ -202,7 +226,7 @@ jobs:
             [ -f "$log" ] || continue
             { grep -E "error:" "$log" || true; } | head -10 | while IFS= read -r line; do echo "::error::$line"; done
           done
-          for file in /tmp/launch.txt /tmp/tour.txt /tmp/player.txt /tmp/edge.txt /tmp/dim.txt /tmp/check.txt /tmp/install1.log /tmp/req1.txt /tmp/sign2.log /tmp/req2.txt /tmp/ps.log; do
+          for file in /tmp/update-tests.txt /tmp/cli.txt /tmp/launch.txt /tmp/tour.txt /tmp/player.txt /tmp/edge.txt /tmp/dim.txt /tmp/check.txt /tmp/install1.log /tmp/req1.txt /tmp/sign2.log /tmp/req2.txt /tmp/ps.log; do
             [ -f "$file" ] || continue
             body="$(tail -40 "$file" | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
             echo "::notice title=$(basename "$file")::$body"

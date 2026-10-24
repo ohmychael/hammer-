@@ -103,13 +103,21 @@ Paste into Terminal:
 curl -fsSL https://raw.githubusercontent.com/ohmychael/hammer-/main/install-hammer.sh | bash
 ```
 
-This builds Hammer on your Mac (it installs Apple's command-line developer tools first if needed), puts it in `~/Applications`, opens it at login, and turns on automatic updates.
+This builds Hammer on your Mac (it installs Apple's command-line developer tools first if needed), puts it in `~/Applications`, opens it at login, and turns on automatic updates. In System Settings → General → Login Items, these show as **Hammer** and **Hammer Updates**; if you turn one off, Hammer's menu says so and offers **Turn On…**.
+
+Opening Hammer from Spotlight, Finder or Apps shows its menu at the pointer, so you can reach it even when its menu bar icon is hidden. If the icon is hidden, the menu says so and shows where to allow it.
 
 ## Updates
 
 Each build is signed with a certificate made once on your Mac (in `~/Hammer/signing`, its own keychain, not your login keychain), so macOS recognizes every update as the same Hammer and doesn't ask for Bluetooth and other permissions again. You'll be asked one last time after the first build that uses it. If that certificate can't be made or used, the build is signed ad hoc as before, and the update log (`~/Hammer/update.log`) says which happened: "Signed with Hammer Local Signing" or "Signed ad hoc".
 
-Hammer checks this repo at login and every 2 minutes. When there's a new commit it rebuilds and restarts itself. Every update first runs the tests in `Tests/main.swift`; if a test fails or the new version doesn't build, the update stops and the current one keeps running. You can also choose **Check for Updates** in the menu. The log is at `~/Hammer/update.log`.
+Hammer checks this repo at login and every 5 minutes, and every 2 minutes while it's running. When there's a new commit it rebuilds and restarts itself. Every update first runs the tests in `Tests/main.swift`; if a test fails or the new version doesn't build, the update stops and the current one keeps running. The new version is kept only once it has started properly; if it doesn't, the one you had comes back. You can also choose **Check for Updates** in the menu. The menu shows what the last check found (for example "Up to date · checked 2:14 PM"), and Hammer shows a notification when it has updated.
+
+- An update doesn't restart Hammer while one of its dialogs is open (or, once that's connected, while YouTube is playing); it waits until you're done, for up to 30 minutes.
+- Problems with your Mac rather than the update (Apple's command-line tools need reinstalling after a macOS upgrade, the disk is almost full) are shown in the menu with what to do, and the update is tried again later.
+- An update cut off part-way (by a logout or a shutdown) puts the Hammer you had back on the next run, even offline.
+
+The log is at `~/Hammer/update.log`.
 
 ## Terminal commands
 
@@ -145,25 +153,32 @@ Bluetooth bulbs are controlled from the menu bar app only.
 | `build.sh` | Compiles and installs `~/Applications/Hammer.app` |
 | `signing.sh` | Signs every build with the same local certificate, so macOS remembers Hammer's permissions across updates |
 | `Tests/Signing/` | Tests for `signing.sh` with stand-ins for macOS's `security` and `codesign` |
-| `update.sh` | Pulls the latest commit and rebuilds |
+| `update.sh` | Pulls the latest commit and rebuilds; writes what it did to `~/Hammer/update-status` for the menu |
 | `install-hammer.sh` | One-time setup |
+| `agents.sh` | The two login items (open at login, updates), named "Hammer" and "Hammer Updates" |
+| `UpdatesMac.swift` | Hammer's side of updating: the menu's update line and notifications, login items, the busy and started notes for `build.sh`, the app icon (`Hammer make-icon`) |
+| `Tests/Update/` | Updates and installs played out in a sandbox (real git, stand-ins for swiftc, open, launchctl…): interrupted swaps, a crash at launch, broken tools, a full disk, hangs, the installer racing an update |
 | `.github/workflows/macos.yml` | Builds Hammer on a real Apple Silicon Mac for every push: tests, the app, the monitor check, and signing twice to confirm it stays the same |
 
 ## Uninstall
 
 ```
-launchctl bootout gui/$(id -u)/local.hammer.updater
+launchctl bootout gui/$(id -u)/local.hammer.updater; launchctl bootout gui/$(id -u)/local.hammer
 rm ~/Library/LaunchAgents/local.hammer.plist ~/Library/LaunchAgents/local.hammer.updater.plist
 pkill -x Hammer; rm -rf ~/Applications/Hammer.app ~/Hammer ~/.config/hammer
 security delete-generic-password -s local.hammer.gmail   # delivery alerts' key or app password (run until it says not found)
+sudo pmset repeat cancel                                 # if you used Turn On At with waking the Mac
 ```
 
 ## Running the tests by hand
 
 ```
 cd ~/Hammer/repo
-swiftc HammerCore.swift Monitor.swift Player.swift Deliveries.swift Tests/main.swift -o /tmp/hammer-tests && /tmp/hammer-tests
+target="$(uname -m)-apple-macosx$(sw_vers -productVersion | cut -d. -f1).0"   # the macOS this Mac runs, as build.sh does
+swiftc -swift-version 5 -target "$target" HammerCore.swift Monitor.swift Player.swift Deliveries.swift Tests/main.swift \
+  -o /tmp/hammer-tests && /tmp/hammer-tests
 node Tests/Player/script_test.js
+Tests/Update/run.sh                 # updates and installs, in a sandbox (about a minute)
 ```
 
 The Bluetooth scenarios play out 27 situations in real time, such as your phone taking a bulb and letting it go, connections that fail or hang, Bluetooth resetting, and a neighbor's bulb nearby. They check what Hammer does in each one. They need Linux with Swift 5.9+, because the real CoreBluetooth on a Mac gets in the way of the stand-in:

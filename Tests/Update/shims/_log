@@ -1,0 +1,2 @@
+# Sourced by the stand-ins: log "<line>" appends to the events log, with $HOME shown as ~.
+log() { printf '%s\n' "${1//"$HOME"/"~"}" >> "$FAKE_LOG"; }

@@ -1,0 +1,2 @@
+#!/bin/bash
+echo "${FAKE_OS:-27.0.1}"

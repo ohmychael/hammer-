@@ -1,0 +1,5 @@
+#!/bin/bash
+# Stand-in for sleep: no waiting, unless FAKE_SLEEP_SCALE says to wait that fraction of it.
+t="$(awk -v s="${1:-0}" -v k="${FAKE_SLEEP_SCALE:-0}" 'BEGIN { print s * k }')"
+[ "$t" = 0 ] && exit 0
+for real in /bin/sleep /usr/bin/sleep; do [ -x "$real" ] && exec "$real" "$t"; done

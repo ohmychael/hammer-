@@ -1,0 +1,17 @@
+#!/bin/bash
+# Stand-in for launchctl: a job is "loaded" while $FAKE/loaded/<label> exists. A label
+# in $FAKE/btm-off was switched off in Login Items, so bootstrap fails for it.
+source "$(dirname "$0")/_log"
+mkdir -p "$FAKE/loaded"
+case "$1" in
+  print) [ -f "$FAKE/loaded/${2##*/}" ] ;;
+  print-disabled) for f in "$FAKE"/btm-off/*; do [ -e "$f" ] && echo "	\"${f##*/}\" => disabled"; done; exit 0 ;;
+  enable) log "launchctl enable ${2##*/}" ;;
+  bootstrap)
+    label="$(basename "$3" .plist)"
+    if [ -e "$FAKE/btm-off/$label" ]; then echo "Bootstrap failed: 5: Input/output error" >&2; log "launchctl bootstrap $label FAILED"; exit 5; fi
+    cp "$3" "$FAKE/loaded/$label"; log "launchctl bootstrap $label" ;;
+  bootout) [ -f "$FAKE/loaded/${2##*/}" ] || exit 3; rm -f "$FAKE/loaded/${2##*/}"; log "launchctl bootout ${2##*/}" ;;
+  kickstart) [ -f "$FAKE/loaded/${2##*/}" ] || exit 113; log "launchctl kickstart ${2##*/}" ;;
+  *) log "launchctl $*"; exit 1 ;;
+esac

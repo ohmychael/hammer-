@@ -165,6 +165,78 @@ enum GoveeName {
     }
 }
 
+// MARK: - Updates: what update.sh last did, and how Hammer was started
+
+/// ~/Hammer/update-status, which update.sh (and build.sh) write: one `key=value` per line.
+///   state    current, updated, updating, waiting, checking, offline, failed or retry
+///   time     seconds since 1970
+///   message  a short line for the menu ("Up to date")
+///   detail   a sentence for the notification
+struct UpdateStatus: Equatable {
+    var state: String
+    var time: Date
+    var message: String
+    var detail: String
+
+    static func parse(_ text: String) -> UpdateStatus? {
+        var fields: [String: String] = [:]
+        for line in text.split(separator: "\n") {
+            guard let equals = line.firstIndex(of: "=") else { continue }
+            fields[String(line[..<equals])] = String(line[line.index(after: equals)...])
+        }
+        guard let state = fields["state"], !state.isEmpty,
+              let seconds = fields["time"].flatMap(TimeInterval.init) else { return nil }
+        return UpdateStatus(state: state, time: Date(timeIntervalSince1970: seconds),
+                            message: fields["message"] ?? "", detail: fields["detail"] ?? "")
+    }
+
+    /// Still going (checking, building, or waiting for you to finish).
+    var inProgress: Bool { ["checking", "updating", "waiting"].contains(state) }
+
+    /// A run that says it's still going after an hour was cut off.
+    func isStale(now: Date) -> Bool { inProgress && now.timeIntervalSince(time) > 3600 }
+
+    /// The menu line, e.g. "Up to date · checked 2:14 PM". `when` is the time, or the
+    /// day if it wasn't today ("2:14 PM", "Oct 22").
+    func menuLine(when: String) -> String {
+        if inProgress { return message }
+        return message + " · " + (state == "current" ? "checked " : "") + when
+    }
+
+    /// The notification for this status, or nil. `asked` is when you chose Check for
+    /// Updates (then any result is shown); otherwise only news is: an update installed,
+    /// or one that failed or can't happen, once per message.
+    func notice(asked: Date?, lastNotice: String?, now: Date) -> (title: String, body: String)? {
+        guard !inProgress else { return nil }
+        let isAnswer = asked.map { time >= $0.addingTimeInterval(-2) } ?? false
+        if !isAnswer {
+            guard ["updated", "failed", "retry"].contains(state), noticeKey != lastNotice,
+                  now.timeIntervalSince(time) < 900 else { return nil }
+        }
+        switch state {
+        case "updated": return ("Hammer updated", detail.isEmpty ? message : detail)
+        case "current": return ("Hammer is up to date", "")
+        case "failed": return ("Hammer couldn't update", detail)
+        default: return (message, detail)
+        }
+    }
+
+    /// What was last notified, so the same news isn't shown twice (kept by Hammer).
+    var noticeKey: String { state + "|" + message }
+}
+
+enum Launch {
+    /// The menu bar app starts with no arguments (from Finder, Spotlight or `open`),
+    /// with --login (the login item and updates, which don't pop the menu up), or with
+    /// the -psn_… argument older macOS versions add. Anything else that isn't a
+    /// command is a mistake, and gets the usage.
+    static func startsMenuBarApp(_ args: [String]) -> Bool {
+        args.allSatisfy { $0 == "--login" || $0.hasPrefix("-psn_") }
+    }
+
+    static func atLogin(_ args: [String]) -> Bool { args.contains("--login") }
+}
+
 // MARK: - Text
 
 enum TimerText {
