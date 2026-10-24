@@ -2073,6 +2073,125 @@ expect(DeliveryMail.kind(ofSubject: #"Delivered: 'Bob's Burgers DVD'"#) == .deli
 expect(DeliveryMail.kind(ofSubject: "Shipped: “Item Delivered Tag”") == nil
        && DeliveryMail.kind(ofSubject: "Delivered: “Missed Delivery Pad”") == .delivered, "and curly ones")
 
+// MARK: Delivery emails: the frozen hold-out set
+
+// Written before the third round of classifier changes and never tuned against:
+// carrier and store templates (UPS, USPS, FedEx, DHL, Amazon, eBay, Walmart, Target,
+// Best Buy, Etsy, Shopify stores, food), and ordinary mail that uses the same words
+// (marketing, gift cards, fax/SMS/webhook/report "delivery", bounces, newsletters,
+// replies and forwards). The score is recorded, not forced to 100%: it may only go up.
+let hUPS = "UPS <mcinfo@ups.com>", hUSPS = "USPS <auto-reply@usps.com>", hFedEx = "FedEx <TrackingUpdates@fedex.com>"
+let hDHL = "DHL Express <noreply@dhl.com>", hAmazon = "Amazon.com <shipment-tracking@amazon.com>"
+let hEBay = "eBay <ebay@ebay.com>", hWalmart = "Walmart <help@walmart.com>", hTarget = "Target <orders@oe1.target.com>"
+let hBestBuy = "Best Buy <BestBuyInfo@emailinfo.bestbuy.com>", hEtsy = "Etsy <transaction@etsy.com>"
+let hShop = "Maple & Co <store+61234@t.shopifyemail.com>", hFriend = "Sam Lee <sam.lee@gmail.com>"
+let holdOut: [(subject: String, from: String, verdict: Delivery.Kind?)] = [
+    ("UPS Update: Package Scheduled for Delivery Tomorrow", hUPS, nil),
+    ("UPS Update: Delivery Attempt Made", hUPS, .problem),
+    ("UPS Update: Package Delivered to UPS Access Point", hUPS, .delivered),
+    ("UPS Ship Notification, Tracking Number 1Z999AA10123456784", hUPS, nil),
+    ("UPS Delivery Change: Your Delivery Has Been Rescheduled", hUPS, nil),
+    ("UPS Update: Your Package Has Been Delayed", hUPS, nil),
+    ("UPS My Choice: Delivery Exception", hUPS, .problem),
+    ("USPS® Item Delivered, Front Door/Porch 9405511899223344556677", hUSPS, .delivered),
+    ("USPS® Delivery Attempted - No Access to Delivery Location 9400111899223344556699", hUSPS, .problem),
+    ("USPS® Item Out for Delivery 9300111899223344556677", hUSPS, .outForDelivery),
+    ("USPS® Expected Delivery on Monday, November 2, 2026 Between 10:30am and 2:30pm", hUSPS, nil),
+    ("USPS® Item In Transit, Arriving Late 9400111899223344556677", hUSPS, nil),
+    ("USPS® Delivery Attempted - Business Closed", hUSPS, .problem),
+    ("USPS® Item Delivered, Parcel Locker", hUSPS, .delivered),
+    ("USPS Informed Delivery® Daily Digest", "USPS Informed Delivery <USPSInformeddelivery@email.informeddelivery.usps.com>", nil),
+    ("USPS® Item Being Returned to Sender, 9400111899223344556677", hUSPS, .problem),
+    ("Your package is scheduled for delivery Monday, 11/2/2026", hFedEx, nil),
+    ("Your FedEx shipment is on its way", hFedEx, nil),
+    ("Your FedEx package is out for delivery today", hFedEx, .outForDelivery),
+    ("Your package has been delivered to the front door", hFedEx, .delivered),
+    ("FedEx delivery exception: Customer not available or business closed", hFedEx, .problem),
+    ("FedEx Delivery Manager: Your delivery is confirmed for tomorrow", hFedEx, nil),
+    ("We'll try to deliver your FedEx package again tomorrow", hFedEx, .problem),
+    ("DHL On Demand Delivery: Your shipment 1234567890 is on its way", hDHL, nil),
+    ("DHL Express shipment 1234567890 has been delivered", hDHL, .delivered),
+    ("DHL: Delivery attempt for shipment 1234567890", hDHL, .problem),
+    ("Your DHL shipment is out for delivery", hDHL, .outForDelivery),
+    ("Delivered: Your Amazon.com order #113-2223334-4455667", hAmazon, .delivered),
+    (#"Your Amazon.com order of "Echo Dot (5th Gen)" has shipped!"#, hAmazon, nil),
+    (#"Arriving tomorrow: "Kindle Scribe""#, hAmazon, nil),
+    (#"Out for delivery: "Ninja Air Fryer" and 2 more items"#, hAmazon, .outForDelivery),
+    (#"Delivery attempted: "Ninja Air Fryer""#, hAmazon, .problem),
+    ("Your Amazon.com eGift Card has been delivered", "Amazon.com <gc-orders@gc.email.amazon.com>", nil),
+    ("Your Amazon.com order has been cancelled", "Amazon.com <auto-confirm@amazon.com>", nil),
+    ("Your refund for Ninja Air Fryer", "Amazon.com <return@amazon.com>", nil),
+    ("Amazon Fresh: Your groceries have been delivered", hAmazon, .delivered),
+    ("Prime Day deals, delivered fast", "Amazon.com <store-news@amazon.com>", nil),
+    ("Your Subscribe & Save delivery is coming soon", "Amazon.com <no-reply@amazon.com>", nil),
+    ("Your eBay item was delivered: Sony WH-1000XM5", hEBay, .delivered),
+    ("Order update: Your item is out for delivery", hEBay, .outForDelivery),
+    ("Your item has shipped: Sony WH-1000XM5", hEBay, nil),
+    ("Delivery update: your item is delayed", hEBay, nil),
+    ("Re: Order #12-34567-89012 - item not delivered", "seller42 <seller42@members.ebay.com>", nil),
+    ("Your eBay Bucks are here", hEBay, nil),
+    ("Delivered: your Walmart.com order", hWalmart, .delivered),
+    ("Your package is arriving today", hWalmart, nil),
+    ("We weren't able to deliver your order", hWalmart, .problem),
+    ("Your order is ready for pickup", hWalmart, nil),
+    ("Rollbacks delivered right to your door", "Walmart <walmart@em.walmart.com>", nil),
+    ("Your order was delivered!", hTarget, .delivered),
+    ("Your Target order is on its way", hTarget, nil),
+    ("Your Drive Up order is ready", hTarget, nil),
+    ("Weekly Ad: deals delivered to your door", "Target <target@em.target.com>", nil),
+    ("Your Best Buy package is out for delivery", hBestBuy, .outForDelivery),
+    ("Your Best Buy order BBY01-806123456789 has been delivered", hBestBuy, .delivered),
+    ("Your order BBY01-806123456789 is ready for store pickup", hBestBuy, nil),
+    ("Delivery and installation appointment confirmed", hBestBuy, nil),
+    ("Your Etsy order has shipped", hEtsy, nil),
+    ("Your Etsy order from MapleLeafPrints was delivered", hEtsy, .delivered),
+    ("Your Etsy purchase from MapleLeafPrints is out for delivery", hEtsy, .outForDelivery),
+    ("A shipment from order #1042 is on the way", hShop, nil),
+    ("A shipment from order #1042 is out for delivery", hShop, .outForDelivery),
+    ("A shipment from order #1042 has been delivered", hShop, .delivered),
+    ("Shipping update for order #1042", hShop, nil),
+    ("Order #1042 has been canceled", hShop, nil),
+    ("Your order #1042 is ready for pickup", hShop, nil),
+    ("Your Uber Eats order has been delivered", "Uber Eats <noreply@uber.com>", .delivered),
+    ("Your Uber Eats delivery is on its way", "Uber Eats <noreply@uber.com>", nil),
+    ("Fax delivery failed to +1 555 0100", "eFax <message@inbound.efax.com>", nil),
+    ("Your fax was delivered successfully", "eFax <message@inbound.efax.com>", nil),
+    ("SMS delivery report: message delivered", "Twilio <no-reply@twilio.com>", nil),
+    ("[GitHub] A webhook delivery to example.com failed", "GitHub <noreply@github.com>", nil),
+    ("Delivery Status Notification (Failure)", "Mail Delivery Subsystem <mailer-daemon@googlemail.com>", nil),
+    ("Undeliverable: Invoice 4471", "postmaster@contoso.com", nil),
+    ("Your scheduled report has been delivered", "Looker <noreply@looker.com>", nil),
+    ("Message delivered: Contract draft", "Mailtrack <notifications@mailtrack.io>", nil),
+    ("The Morning: news delivered to your inbox", "The New York Times <nytdirect@nytimes.com>", nil),
+    ("Your weekly digest has arrived", "Medium Daily Digest <noreply@medium.com>", nil),
+    ("Read: Your package was delivered", hFriend, nil),
+    ("Fwd: UPS Update: Package Delivered", hFriend, nil),
+    ("FW: Your order has been delivered", hFriend, nil),
+    ("Re[2]: Package delivered?", hFriend, nil),
+    ("TR: Votre colis a été livré", hFriend, nil),
+    ("WG: Ihr Paket wurde zugestellt", hFriend, nil),
+    ("Flowers delivered: send a bouquet today", "1-800-Flowers <orders@1800flowers.com>", nil),
+    ("Your eGift card delivery failed", "Target GiftCards <giftcards@target.com>", nil),
+    ("Your package from Amazon has been delivered", "Ring <no-reply@ring.com>", .delivered),
+    ("Your order is on hold", hWalmart, nil),
+    ("Payment failed: your order couldn't be completed", hWalmart, nil),
+    ("Your return has been received and your refund is on its way", hAmazon, nil),
+    ("We missed you – your parcel is at your local post office", "Royal Mail <no-reply@royalmail.com>", .problem),
+    ("Your Evri parcel is on its way", "Evri <noreply@evri.com>", nil),
+    ("Your Canada Post package was delivered to your community mailbox", "Canada Post <noreply@canadapost.ca>", .delivered),
+    ("Australia Post: Your parcel is awaiting collection", "Australia Post <noreply@notifications.auspost.com.au>", nil),
+]
+var holdOutRight = 0
+var holdOutMisses: [String] = []
+for c in holdOut {
+    let got = classified(c.subject, from: c.from)
+    if got == c.verdict { holdOutRight += 1 } else { holdOutMisses.append("\(c.subject) → \(got.map(\.rawValue) ?? "nil") (want \(c.verdict.map(\.rawValue) ?? "nil"))") }
+}
+print("hold-out: \(holdOutRight) of \(holdOut.count) right")
+for miss in holdOutMisses { print("  hold-out miss: \(miss)") }
+// Scores: 403a26e 86 of 94, 5e3209e 85 of 94. Later rounds may only do better.
+expect(holdOut.count == 94 && holdOutRight >= 85, "the hold-out set doesn't get worse: \(holdOutRight) of \(holdOut.count)")
+
 // MARK: Delivery emails: senders, Gmail's check, names, bodies, dates
 
 // Known stores and carriers by their real domain, or a subdomain of it.
