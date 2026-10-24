@@ -40,11 +40,15 @@ case "$HOME" in "$WORK"/home) ;; *) echo "Stopped: HOME isn't the sandbox."; exi
 
 failed=0
 passed=0
+failures=""
+scenario=""
 check() {
   if eval "$1"; then
     passed=$((passed + 1)); echo "  ok   $2"
   else
     failed=$((failed + 1)); echo "  FAIL $2"
+    failures="$failures  FAIL [$scenario] $2 (elapsed ${elapsed:-?} s)
+"
     echo "       events: $(tr '\n' ';' < "$FAKE_LOG")"
     echo "       output: $(tail -8 "$WORK/out.txt" 2>/dev/null | tr '\n' ';')"
   fi
@@ -455,6 +459,8 @@ for name in "${chosen[@]}"; do
   name="${name//-/_}"
   if ! declare -F "scenario_$name" >/dev/null; then echo "No scenario $name. There are: ${all[*]//_/-}"; exit 2; fi
   reset_world
+  scenario="$name"
+  elapsed=""
   "scenario_$name"
 done
 
@@ -462,5 +468,6 @@ echo "[nothing used osascript (Hammer posts the notifications)]"
 check '[ ! -s "$FAKE_OSASCRIPT" ]' "no osascript"
 
 echo
+printf '%s' "$failures"
 if [ "$failed" = 0 ]; then echo "All $passed update checks passed."; else echo "$failed of $((passed + failed)) update checks FAILED."; fi
 exit $((failed > 0))

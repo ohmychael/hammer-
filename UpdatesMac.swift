@@ -159,7 +159,7 @@ final class Updates {
             guard let self, status != 0 else { return }
             self.asked = nil
             self.checkLoginItems()
-            self.post("Couldn't check for updates", "Hammer's updater is off. Choose Updates Are Off · Turn On… in its menu.")
+            self.post("Couldn't check for updates", "Updates are off. Turn them on from Hammer's menu.")
         }
     }
 

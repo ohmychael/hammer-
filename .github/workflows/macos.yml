@@ -53,12 +53,6 @@ jobs:
           /tmp/hammer-tests | tee /tmp/tests.log
           echo "::notice title=Tests::$(tail -1 /tmp/tests.log) (built and run in $(( $(date +%s) - start )) s)"
 
-      - name: Update and install scripts (in a sandbox; never touches this Mac's real apps or login items)
-        timeout-minutes: 6
-        run: |
-          perl -e 'alarm shift; exec @ARGV' 300 bash Tests/Update/run.sh 2>&1 | tee /tmp/update-tests.txt
-          echo "::notice title=Update scripts::$(tail -1 /tmp/update-tests.txt)"
-
       - name: Build the app
         timeout-minutes: 15
         run: |
@@ -217,6 +211,18 @@ jobs:
           cmp /tmp/req1.txt /tmp/req2.txt
           # The signing keychain must not be left on the search list.
           ! security list-keychains -d user | grep -q hammer-signing
+
+      - name: Update and install scripts (in a sandbox; never touches this Mac's real apps or login items)
+        if: ${{ !cancelled() }}            # also when a step before failed
+        timeout-minutes: 6
+        run: |
+          set +e
+          perl -e 'alarm shift; exec @ARGV' 300 bash Tests/Update/run.sh > /tmp/update-tests.txt 2>&1
+          status=$?
+          cat /tmp/update-tests.txt
+          grep -A2 "^  FAIL" /tmp/update-tests.txt | while IFS= read -r line; do echo "::error title=Update scripts::$line"; done
+          echo "::notice title=Update scripts::$(tail -1 /tmp/update-tests.txt) (exit $status)"
+          exit $status
 
       - name: Report
         if: always()
