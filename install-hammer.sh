@@ -9,6 +9,7 @@
 set -euo pipefail
 trap 'echo; echo "Something went wrong above. Copy everything in this window and paste it to Claude."' ERR
 
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then echo "No home folder (HOME isn't set)."; exit 1; fi
 REPO_URL="${HAMMER_REPO_URL:-https://github.com/ohmychael/hammer-.git}"   # tests use a local copy
 DIR="$HOME/Hammer/repo"
 LOCK="$HOME/Hammer/.update.lock"       # shared with update.sh: one install or update at a time
@@ -31,16 +32,23 @@ fi
 
 # 2. Wait for an update that's running to finish, then keep updates off until this is done.
 mkdir -p "$HOME/Hammer"
-holder_alive() {
+holder_alive() {   # holder_alive <lock folder>
   local pid started
-  pid="$(sed -n 1p "$LOCK/pid" 2>/dev/null)"
-  started="$(sed -n 2p "$LOCK/pid" 2>/dev/null)"
-  if [ -z "$pid" ]; then [ -n "$(find "$LOCK" -maxdepth 0 -mmin -1 2>/dev/null)" ]; return; fi
+  pid="$(sed -n 1p "$1/pid" 2>/dev/null)"
+  started="$(sed -n 2p "$1/pid" 2>/dev/null)"
+  if [ -z "$pid" ]; then [ -n "$(find "$1" -maxdepth 0 -mmin -1 2>/dev/null)" ]; return; fi
   kill -0 "$pid" 2>/dev/null && [ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]
 }
 waited=0
 until mkdir "$LOCK" 2>/dev/null; do
-  if ! holder_alive; then rm -rf "$LOCK"; continue; fi
+  if ! holder_alive "$LOCK"; then
+    # A dead run's lock: renamed first, so if two runs find it, only one clears it.
+    stale="$LOCK.stale.$$.$RANDOM"
+    if mv "$LOCK" "$stale" 2>/dev/null; then
+      if holder_alive "$stale"; then [ -e "$LOCK" ] || mv "$stale" "$LOCK" 2>/dev/null || true; else rm -rf "$stale"; fi
+    fi
+    continue
+  fi
   if [ "$waited" = 0 ]; then step "Waiting for an update that's running to finish"; fi
   if [ "$waited" -ge 3600 ]; then echo "It's still running after an hour. Restart your Mac, then try again."; exit 1; fi
   sleep 5
@@ -68,7 +76,7 @@ rm -f "$HOME/Hammer/.failed-build"
 # 5. Open Hammer at login, and check for updates at login and every 5 minutes
 # (Hammer also asks every 2 minutes). In Login Items these are "Hammer" and "Hammer Updates".
 step "Setting Hammer to open when you log in, and to update itself"
-bash "$DIR/agents.sh" || echo "Turn them on in System Settings → General → Login Items (Allow in the Background)."
+bash "$DIR/agents.sh" --install || echo "Turn them on in System Settings → General → Login Items (Allow in the Background)."
 printf 'state=current\ntime=%s\nmessage=Up to date\ndetail=\n' "$(date +%s)" > "$HOME/Hammer/update-status"
 
 # 6. Pop the menu up next to the pointer so you can see it worked.

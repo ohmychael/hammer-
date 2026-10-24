@@ -30,8 +30,14 @@ OPENSSL="${HAMMER_OPENSSL:-/usr/bin/openssl}"        # macOS's LibreSSL
 CODESIGN="${HAMMER_CODESIGN:-/usr/bin/codesign}"
 SIGN_LIMIT="${HAMMER_SIGN_LIMIT:-120}"               # seconds per step, so a hang can't stop updates
 
-# Runs a command, stopping it after SIGN_LIMIT seconds.
-signing_limit() { perl -e 'alarm shift; exec @ARGV or die "$ARGV[0]: $!\n"' "$SIGN_LIMIT" "$@"; }
+# Runs a command, stopping it after SIGN_LIMIT seconds (without perl, just runs it).
+signing_limit() {
+  if command -v "${HAMMER_PERL:-perl}" >/dev/null 2>&1; then
+    "${HAMMER_PERL:-perl}" -e 'alarm shift; exec @ARGV or die "$ARGV[0]: $!\n"' "$SIGN_LIMIT" "$@"
+  else
+    "$@"
+  fi
+}
 
 # The keychain while it's on your search list (for signing_cleanup).
 SIGNING_LISTED=""

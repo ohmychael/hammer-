@@ -181,13 +181,23 @@ enum TimerText {
 /// ~/Hammer/update-status, which update.sh (and build.sh) write: one `key=value` per line.
 ///   state    current, updated, updating, waiting, checking, offline, failed or retry
 ///   time     seconds since 1970
+///   version  the newest version, once it's known
 ///   message  a short line for the menu ("Up to date")
 ///   detail   a sentence for the notification
 struct UpdateStatus: Equatable {
     var state: String
     var time: Date
+    var version = ""
     var message: String
     var detail: String
+
+    init(state: String, time: Date, version: String = "", message: String, detail: String) {
+        self.state = state
+        self.time = time
+        self.version = version
+        self.message = message
+        self.detail = detail
+    }
 
     static func parse(_ text: String) -> UpdateStatus? {
         var fields: [String: String] = [:]
@@ -197,7 +207,7 @@ struct UpdateStatus: Equatable {
         }
         guard let state = fields["state"], !state.isEmpty,
               let seconds = fields["time"].flatMap(TimeInterval.init) else { return nil }
-        return UpdateStatus(state: state, time: Date(timeIntervalSince1970: seconds),
+        return UpdateStatus(state: state, time: Date(timeIntervalSince1970: seconds), version: fields["version"] ?? "",
                             message: fields["message"] ?? "", detail: fields["detail"] ?? "")
     }
 
@@ -233,7 +243,8 @@ struct UpdateStatus: Equatable {
     }
 
     /// What was last notified, so the same news isn't shown twice (kept by Hammer).
-    var noticeKey: String { state + "|" + message }
+    /// With the version: the same problem with a newer version is news again.
+    var noticeKey: String { state + "|" + version + "|" + message }
 }
 
 enum Launch {

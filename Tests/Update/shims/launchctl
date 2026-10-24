@@ -1,6 +1,7 @@
 #!/bin/bash
 # Stand-in for launchctl: a job is "loaded" while $FAKE/loaded/<label> exists. A label
 # in $FAKE/btm-off was switched off in Login Items, so bootstrap fails for it.
+# $FAKE/bootstrap-busy: how many bootstraps fail first (launchd still busy after a bootout).
 source "$(dirname "$0")/_log"
 mkdir -p "$FAKE/loaded"
 case "$1" in
@@ -9,6 +10,11 @@ case "$1" in
   enable) log "launchctl enable ${2##*/}" ;;
   bootstrap)
     label="$(basename "$3" .plist)"
+    busy="$(cat "$FAKE/bootstrap-busy" 2>/dev/null || echo 0)"
+    if [ "$busy" -gt 0 ]; then                    # launchd still letting go of it after a bootout
+      echo $((busy - 1)) > "$FAKE/bootstrap-busy"
+      echo "Bootstrap failed: 37: Operation already in progress" >&2; log "launchctl bootstrap $label BUSY"; exit 37
+    fi
     if [ -e "$FAKE/btm-off/$label" ]; then echo "Bootstrap failed: 5: Input/output error" >&2; log "launchctl bootstrap $label FAILED"; exit 5; fi
     cp "$3" "$FAKE/loaded/$label"; log "launchctl bootstrap $label" ;;
   bootout) [ -f "$FAKE/loaded/${2##*/}" ] || exit 3; rm -f "$FAKE/loaded/${2##*/}"; log "launchctl bootout ${2##*/}" ;;

@@ -1,0 +1,19 @@
+#!/bin/bash
+# Stand-in for rm. FAKE_KILL_AT_DISCARD=TERM|KILL: the update is stopped (a logout) while
+# it deletes an app it had set aside; half of it is gone by then (its Info.plist).
+if [ -n "${FAKE_KILL_AT_DISCARD:-}" ] && [ ! -e "$FAKE/killed" ]; then
+  for target in "$@"; do
+    case "$target" in
+      "$HOME"/Hammer/build/.trash.*|"$HOME"/Hammer/build/Hammer-previous.app)
+        [ -d "$target/Contents" ] || continue
+        : > "$FAKE/killed"
+        for real in /bin/rm /usr/bin/rm; do [ -x "$real" ] && break; done
+        "$real" -f "$target/Contents/Info.plist"
+        echo "SIG$FAKE_KILL_AT_DISCARD to the whole update, while deleting ${target##*/}" >> "$FAKE_LOG"
+        kill -s "$FAKE_KILL_AT_DISCARD" -- "-$(ps -o pgid= -p $$ | tr -d ' ')"
+        perl -e 'select(undef, undef, undef, 2)'
+        ;;
+    esac
+  done
+fi
+for real in /bin/rm /usr/bin/rm; do [ -x "$real" ] && exec "$real" "$@"; done

@@ -214,10 +214,10 @@ jobs:
 
       - name: Update and install scripts (in a sandbox; never touches this Mac's real apps or login items)
         if: ${{ !cancelled() }}            # also when a step before failed
-        timeout-minutes: 6
+        timeout-minutes: 12
         run: |
           set +e
-          perl -e 'alarm shift; exec @ARGV' 300 bash Tests/Update/run.sh > /tmp/update-tests.txt 2>&1
+          perl -e 'alarm shift; exec @ARGV' 600 bash Tests/Update/run.sh > /tmp/update-tests.txt 2>&1
           status=$?
           cat /tmp/update-tests.txt
           grep -A2 "^  FAIL" /tmp/update-tests.txt | while IFS= read -r line; do echo "::error title=Update scripts::$line"; done

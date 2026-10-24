@@ -15,8 +15,8 @@ private let hammerFolder = FileManager.default.homeDirectoryForCurrentUser.appen
 
 /// Tells build.sh not to restart Hammer for an update just now (it waits up to 30
 /// minutes). Dialogs are covered by `watchDialogs()`. Anything else that shouldn't be
-/// cut off calls `Busy.set("YouTube", true)` while it's going (e.g. the player is
-/// showing or playing), and `Busy.set("YouTube", false)` once it's done.
+/// cut off can call `Busy.set("<what>", true)` while it's going, and
+/// `Busy.set("<what>", false)` once it's done (nothing else does yet).
 @MainActor
 enum Busy {
     private static var reasons: Set<String> = []
@@ -123,7 +123,7 @@ final class Updates {
         let defaults = UserDefaults.standard
         if let notice = read.notice(asked: asked, lastNotice: defaults.string(forKey: "updateNotice"), now: Date()) {
             defaults.set(read.noticeKey, forKey: "updateNotice")
-            post(notice.title, notice.body)
+            notify(notice.title, notice.body)
         }
         if let asked, !read.inProgress, read.time >= asked.addingTimeInterval(-2) {
             self.asked = nil                 // answered
@@ -151,7 +151,7 @@ final class Updates {
         onChange?()
         // Tells update.sh this check was asked for, so it retries a version that failed.
         FileManager.default.createFile(atPath: hammerFolder.appendingPathComponent(".manual-check").path, contents: nil)
-        whenNotificationsAllowed { [weak self] in self?.post("Checking for updates…", "") }
+        notify("Checking for updates…", "")
         let plist = Self.agents.appendingPathComponent("local.hammer.updater.plist").path
         // Start the job; if it isn't loaded, load it (loading also starts it).
         run("launchctl kickstart '\(Self.domain)/local.hammer.updater' || launchctl bootstrap '\(Self.domain)' '\(plist)'") {
@@ -159,24 +159,32 @@ final class Updates {
             guard let self, status != 0 else { return }
             self.asked = nil
             self.checkLoginItems()
-            self.post("Couldn't check for updates", "Updates are off. Turn them on from Hammer's menu.")
+            self.notify("Couldn't check for updates", "Updates are off. Turn them on from Hammer's menu.")
         }
     }
 
     // MARK: Login items
 
     /// Are both login items on? You can turn them off in System Settings → General →
-    /// Login Items, and then Hammer doesn't update or open at login.
+    /// Login Items, and then Hammer doesn't update or open at login. One that's written
+    /// but not loaded yet isn't off: an install from before Hammer's login items were
+    /// loaded straight away leaves it so until the next login (or restart).
     func checkLoginItems(done: ((Bool) -> Void)? = nil) {
         guard isSetUp else { off = nil; done?(false); return }
         let updater = Self.agents.appendingPathComponent("local.hammer.updater.plist").path
         let login = Self.agents.appendingPathComponent("local.hammer.plist").path
         let script = """
         disabled="$(launchctl print-disabled '\(Self.domain)' 2>/dev/null)"
-        on() { launchctl print "\(Self.domain)/$1" >/dev/null 2>&1 \
-               && ! printf '%s' "$disabled" | grep -Eq "\\"$1\\" => (disabled|true)"; }
-        [ -f '\(updater)' ] && on local.hammer.updater || exit 3
-        [ ! -f '\(login)' ] || on local.hammer || exit 4
+        boot="$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ sec = \\([0-9]*\\).*/\\1/p')"
+        off() {   # off <label> <plist>
+          printf '%s' "$disabled" | grep -Eq "\\"$1\\" => (disabled|true)" && return 0
+          launchctl print "\(Self.domain)/$1" >/dev/null 2>&1 && return 1
+          # Not loaded: off, unless it was written after this Mac started (it loads at the next login).
+          [ -n "$boot" ] && [ "$(stat -f %m "$2" 2>/dev/null || echo 0)" -lt "$boot" ]
+        }
+        [ -f '\(updater)' ] || exit 3
+        off local.hammer.updater '\(updater)' && exit 3
+        [ -f '\(login)' ] && off local.hammer '\(login)' && exit 4
         exit 0
         """
         run(script) { [weak self] status in
@@ -206,7 +214,7 @@ final class Updates {
         let alert = NSAlert()
         alert.messageText = "Turn Hammer on in Login Items"
         alert.informativeText = "In System Settings → General → Login Items, under Allow in the Background, "
-            + "turn on Hammer and Hammer Updates (before Hammer next restarts, they may be listed as "
+            + "turn on Hammer and Hammer Updates (until you next log in, they may be listed as "
             + "“open” and “bash”). Then Hammer opens when you log in and keeps itself up to date."
         alert.addButton(withTitle: "Open Login Items")
         alert.addButton(withTitle: "Cancel")
@@ -216,6 +224,11 @@ final class Updates {
     }
 
     // MARK: Notifications (from Hammer itself, so macOS shows them as Hammer's)
+
+    /// Shows a notification, asking for permission first if Hammer never has.
+    private func notify(_ title: String, _ body: String) {
+        whenNotificationsAllowed { [weak self] in self?.post(title, body) }
+    }
 
     private func post(_ title: String, _ body: String) {
         guard Bundle.main.bundleIdentifier != nil else { return }      // only an app bundle can
@@ -227,8 +240,7 @@ final class Updates {
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
     }
 
-    /// Asks for permission the first time you check by hand (the question comes from
-    /// something you did), then runs `then` if notifications are allowed.
+    /// Asks for permission if Hammer never has, then runs `then` if notifications are allowed.
     private func whenNotificationsAllowed(_ then: @escaping @MainActor () -> Void) {
         guard Bundle.main.bundleIdentifier != nil else { return }
         let center = UNUserNotificationCenter.current()

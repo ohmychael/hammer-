@@ -1119,8 +1119,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Every 10 seconds: is the menu bar icon actually on screen? macOS hides it when
     /// the menu bar is too full (behind the camera notch) and, from macOS 26, when it's
-    /// turned off in Menu Bar settings. Not while the menu bar itself is hidden
-    /// (full screen) or the screen is off or locked.
+    /// turned off in Menu Bar settings. Not while the menu bar itself can be hidden
+    /// (full screen, or set to hide automatically) or the screen is off or locked.
     private func watchIcon() {
         let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkIcon() }
@@ -1130,7 +1130,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func checkIcon() {
-        guard NSMenu.menuBarVisible(), CGDisplayIsAsleep(CGMainDisplayID()) == 0,
+        guard NSMenu.menuBarVisible(), !UserDefaults.standard.bool(forKey: "_HIHideMenuBar"),
+              CGDisplayIsAsleep(CGMainDisplayID()) == 0,
               (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool != true,
               let window = statusItem.button?.window else { return }
         iconHiddenChecks = window.occlusionState.contains(.visible) ? 0 : iconHiddenChecks + 1
@@ -1139,6 +1140,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             iconHidden = hidden
             rebuildMenuSoon()
         }
+    }
+
+    /// Opened by clicking the icon: then it plainly isn't hidden.
+    private func menuOpening(_ menu: NSMenu) {
+        guard let window = statusItem.button?.window, NSApp.currentEvent?.window === window else { return }
+        iconHiddenChecks = 0
+        iconHidden = false
+        menu.items.first { $0.action == #selector(explainHiddenIcon) }?.isHidden = true
     }
 
     @objc private func explainHiddenIcon() {
@@ -1492,6 +1501,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// was busy with your phone shows up without a manual rescan.
     func menuWillOpen(_ menu: NSMenu) {
         menuIsOpen = true
+        menuOpening(menu)
         GoveeBluetooth.shared.rescan()
         // Catches changes made with the monitor's own buttons, and a monitor that
         // starts answering (e.g. DDC/CI switched on). Asking a silent one is slow,

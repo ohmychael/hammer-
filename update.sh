@@ -10,16 +10,15 @@
 # What it last did goes in ~/Hammer/update-status, which Hammer's menu shows and
 # turns into notifications:
 #   state=current|updated|updating|waiting|checking|offline|failed|retry
-#   time=<seconds since 1970>   message=<short, for the menu>   detail=<for the notification>
+#   time=<seconds since 1970>   version=<the newest version, once known>
+#   message=<short, for the menu>   detail=<for the notification>
 
 set -uo pipefail
 
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then echo "No home folder (HOME isn't set)."; exit 1; fi
 HAMMER="$HOME/Hammer"
 REPO="$HAMMER/repo"
 APP="$HOME/Applications/Hammer.app"
-BUILD="$HAMMER/build"
-PREVIOUS="$BUILD/Hammer-previous.app"
-SWAPPING="$BUILD/.swapping"          # build.sh: an app swap is under way
 LOCK="$HAMMER/.update.lock"          # held by this or install-hammer.sh; holds the PID
 FLAG="$HAMMER/.manual-check"         # Hammer: "Check for Updates" was chosen
 FAILED="$HAMMER/.failed-build"       # a version that didn't build or open
@@ -33,7 +32,8 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
 
 # status <state> <message> [<detail>]
 status() {
-  { echo "state=$1"; echo "time=$(date +%s)"; echo "message=$2"; echo "detail=${3:-}"; } > "$STATUS.tmp" \
+  { echo "state=$1"; echo "time=$(date +%s)"; echo "version=${latest:-}"; echo "message=$2"; echo "detail=${3:-}"; } \
+    > "$STATUS.tmp" \
     && mv -f "$STATUS.tmp" "$STATUS"
 }
 
@@ -53,44 +53,39 @@ mac_problem() {
 
 # One run at a time. The lock holds the PID (and start time) of the run that has it,
 # so a lock left by a run that was killed (logout, shutdown) doesn't block anything.
-lock_holder_alive() {
+lock_holder_alive() {   # lock_holder_alive <lock folder>
   local pid started
-  pid="$(sed -n 1p "$LOCK/pid" 2>/dev/null)"
-  started="$(sed -n 2p "$LOCK/pid" 2>/dev/null)"
+  pid="$(sed -n 1p "$1/pid" 2>/dev/null)"
+  started="$(sed -n 2p "$1/pid" 2>/dev/null)"
   if [ -z "$pid" ]; then                                   # being taken right now
-    [ -n "$(find "$LOCK" -maxdepth 0 -mmin -1 2>/dev/null)" ]
+    [ -n "$(find "$1" -maxdepth 0 -mmin -1 2>/dev/null)" ]
     return
   fi
   kill -0 "$pid" 2>/dev/null && [ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]
 }
-mkdir -p "$HAMMER"
-if ! mkdir "$LOCK" 2>/dev/null; then
-  lock_holder_alive && exit 0          # the request flag stays, for the next run
+take_lock() {
+  mkdir "$LOCK" 2>/dev/null && return 0
+  lock_holder_alive "$LOCK" && return 1
+  # A dead run's lock: renamed first, so if two runs find it, only one clears it.
+  local stale="$LOCK.stale.$$.$RANDOM"
+  mv "$LOCK" "$stale" 2>/dev/null || return 1
+  if lock_holder_alive "$stale"; then                      # it was taken again meanwhile: give it back
+    [ -e "$LOCK" ] || mv "$stale" "$LOCK" 2>/dev/null
+    return 1
+  fi
   log "cleared a lock left by an update that was cut off"
-  rm -rf "$LOCK"
-  mkdir "$LOCK" 2>/dev/null || exit 0
-fi
+  rm -rf "$stale"
+  mkdir "$LOCK" 2>/dev/null
+}
+mkdir -p "$HAMMER"
+take_lock || exit 0                    # the request flag stays, for the next run
 printf '%s\n%s\n' "$$" "$(ps -o lstart= -p $$)" > "$LOCK/pid"
 trap 'rm -rf "$LOCK"' EXIT
 rm -f "$FLAG"                          # it's ours now: this run reports
 
-# An update cut off mid-swap (logout, shutdown) can leave the app moved aside, or a
-# new one that was never checked. Put the one you had back and start it, even offline.
-cut_off=false
-if [ -e "$SWAPPING" ]; then
-  cut_off=true
-  if [ -d "$PREVIOUS" ]; then
-    log "an update was cut off mid-way; putting back the Hammer you had"
-    pkill -x Hammer 2>/dev/null
-    rm -rf "$APP" && mkdir -p "$(dirname "$APP")" && mv "$PREVIOUS" "$APP"
-  fi
-elif [ ! -d "$APP" ] && [ -d "$PREVIOUS" ]; then
-  cut_off=true
-  log "Hammer was moved aside by an update that was cut off; putting it back"
-  mkdir -p "$(dirname "$APP")" && mv "$PREVIOUS" "$APP"
-fi
-rm -f "$SWAPPING"
-if $cut_off && [ -d "$APP" ] && ! pgrep -x Hammer >/dev/null 2>&1; then open "$APP" --args --login; fi
+# An update cut off part-way (logout, shutdown) can leave the Hammer you had set
+# aside: build.sh puts it back and starts it, before going online.
+if [ -f "$REPO/build.sh" ]; then /bin/bash "$REPO/build.sh" --restore; fi
 
 # A signing step that was killed can leave Hammer's keychain on your keychain list.
 if [ -f "$REPO/signing.sh" ]; then
@@ -130,13 +125,20 @@ if [ "$installed" = "$latest" ]; then
   exit 0
 fi
 
+# An older update.sh counted build.sh's "a problem with this Mac" (exit 4) as a failed
+# build, which would block that version until the next one: undo that.
+if [ -f "$FAILED" ] && [ "$(sed -n 1p "$RETRY" 2>/dev/null)" = "$(cat "$FAILED")" ]; then
+  log "$(cat "$FAILED"): not a failed build (a problem with this Mac), so it'll be tried again"
+  rm -f "$FAILED"
+fi
 # Don't keep retrying a version that already failed; wait for a fix (or a manual check).
 if ! $MANUAL && [ "$(cat "$FAILED" 2>/dev/null)" = "$latest" ]; then
   log "$latest failed before; waiting for a newer version"
   exit 0
 fi
-# One that hit a problem with this Mac is tried again after an hour (or on a manual check).
-if ! $MANUAL && [ "$(sed -n 1p "$RETRY" 2>/dev/null)" = "$latest" ] \
+# One that hit a problem with this Mac after building is built again after an hour (or
+# on a manual check); problems found before building are checked again every time.
+if ! $MANUAL && [ "$(sed -n 1p "$RETRY" 2>/dev/null)" = "$latest" ] && [ "$(sed -n 4p "$RETRY" 2>/dev/null)" = yes ] \
    && [ -n "$(find "$RETRY" -mmin -60 2>/dev/null)" ]; then
   log "$latest: $(sed -n 3p "$RETRY"); trying again later"
   exit 0

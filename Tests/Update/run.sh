@@ -4,6 +4,8 @@
 # local stand-in for GitHub, and stand-ins (shims/) for swiftc, open, pkill,
 # launchctl, codesign and the rest. HOME is a temporary folder: nothing outside it
 # is touched, and no real open, pkill or launchctl ever runs.
+# The t-… scenarios start from the scripts as they were before (old/), and update to
+# these, as your Mac will.
 # Runs on Linux or a Mac in about a minute (bash, git and perl; python3 and openssl
 # for one signing scenario):
 #   Tests/Update/run.sh                     everything
@@ -11,18 +13,35 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/hammer-update-tests.XXXXXX")"
-WORK="$(cd "$WORK" && pwd -P)"
+
+# The sandbox: a new, empty folder of our own under the temporary folder, or nothing runs
+# (and nothing is ever deleted outside it).
+BASE="$(cd "${TMPDIR:-/tmp}" && pwd -P)" || exit 1
+WORK="$(mktemp -d "$BASE/hammer-update-tests.XXXXXX")" || { echo "Stopped: couldn't make a sandbox folder."; exit 1; }
+WORK="$(cd "$WORK" 2>/dev/null && pwd -P)" || exit 1
+case "$WORK" in
+  "$BASE"/hammer-update-tests.?*) ;;
+  *) echo "Stopped: the sandbox folder ($WORK) isn't where it should be."; exit 1 ;;
+esac
+if [ ! -d "$WORK" ] || [ -n "$(ls -A "$WORK")" ]; then echo "Stopped: the sandbox folder isn't new and empty."; exit 1; fi
 holders=()
 cleanup() {
   local pid
   for pid in "${holders[@]:-}"; do [ -n "$pid" ] && kill "$pid" 2>/dev/null; done
-  rm -rf "$WORK"
+  case "$WORK" in "$BASE"/hammer-update-tests.?*) rm -rf "$WORK" ;; esac
 }
 trap cleanup EXIT
+# wipe <path>…: rm -rf, only ever inside the sandbox.
+wipe() {
+  local path
+  for path in "$@"; do
+    case "$path" in "$WORK"/?*) rm -rf "$path" ;; *) echo "Stopped: won't delete $path"; exit 1 ;; esac
+  done
+}
 
 export HOME="$WORK/home" TMPDIR="$WORK/tmp" FAKE="$WORK/fake" FAKE_LOG="$WORK/fake/events.log"
 export FAKE_OSASCRIPT="$WORK/osascript-calls"
+osascript_users=""
 export PATH="$HERE/shims:/usr/bin:/bin"
 export HAMMER_SECURITY=/bin/false HAMMER_OPENSSL=/bin/false HAMMER_CODESIGN="$HERE/shims/codesign"
 export HAMMER_PLISTBUDDY="$HERE/shims/PlistBuddy"
@@ -61,19 +80,27 @@ commit() {   # commit <message>: a new commit on GitHub's main; prints its short
   git -C "$WORK/work" rev-parse --short HEAD
 }
 
+# reset_world [old]: Hammer A installed by these scripts, or (old) by the ones from
+# before, with login items as the old installer made them.
 reset_world() {
   local f
   for f in "${holders[@]:-}"; do [ -n "$f" ] && kill "$f" 2>/dev/null; done
   holders=()
-  rm -rf "$HOME" "$FAKE" "$TMPDIR" "$WORK/origin.git" "$WORK/offline.git" "$WORK/work"
+  wipe "$HOME" "$FAKE" "$TMPDIR" "$WORK/origin.git" "$WORK/offline.git" "$WORK/work" "$WORK/bin"
   mkdir -p "$HOME/Applications" "$FAKE" "$TMPDIR"
   : > "$FAKE_LOG"
+  : > "$FAKE_OSASCRIPT"
   git init -q --bare "$WORK/origin.git"
   git -C "$WORK/origin.git" symbolic-ref HEAD refs/heads/main
   git init -q "$WORK/work"
   ( cd "$WORK/work"
     git checkout -q -b main
-    cp "$REPO/build.sh" "$REPO/update.sh" "$REPO/signing.sh" "$REPO/agents.sh" "$REPO/install-hammer.sh" .
+    cp "$REPO/install-hammer.sh" .
+    if [ "${1:-}" = old ]; then
+      cp "$HERE/old/build.sh" "$HERE/old/update.sh" "$HERE/old/signing.sh" .
+    else
+      cp "$REPO/build.sh" "$REPO/update.sh" "$REPO/signing.sh" "$REPO/agents.sh" .
+    fi
     for f in Hammer HammerCore Monitor MonitorMac Player PlayerMac EdgeMac Deliveries DeliveryAlerts UpdatesMac; do
       echo "// $f" > "$f.swift"
     done
@@ -85,7 +112,22 @@ reset_world() {
   if ! bash "$HOME/Hammer/repo/build.sh" > "$WORK/out.txt" 2>&1; then
     echo "  (the first install failed)"; cat "$WORK/out.txt"; exit 1
   fi
+  if [ "${1:-}" = old ]; then   # the old installer's login items: bash and open; only the updater loaded
+    mkdir -p "$HOME/Library/LaunchAgents" "$FAKE/loaded"
+    printf '<plist><dict><key>Label</key><string>local.hammer.updater</string><key>ProgramArguments</key><array><string>/bin/bash</string><string>%s</string></array></dict></plist>\n' \
+      "$HOME/Hammer/repo/update.sh" > "$HOME/Library/LaunchAgents/local.hammer.updater.plist"
+    printf '<plist><dict><key>Label</key><string>local.hammer</string><key>ProgramArguments</key><array><string>/usr/bin/open</string><string>%s</string></array></dict></plist>\n' \
+      "$HOME/Applications/Hammer.app" > "$HOME/Library/LaunchAgents/local.hammer.plist"
+    cp "$HOME/Library/LaunchAgents/local.hammer.updater.plist" "$FAKE/loaded/local.hammer.updater"
+  fi
   : > "$FAKE_LOG"
+}
+
+# The new scripts arrive on GitHub (for the t-… scenarios).
+commit_new() {
+  ( cd "$WORK/work" && cp "$REPO/build.sh" "$REPO/update.sh" "$REPO/signing.sh" "$REPO/agents.sh" . \
+      && echo "// $1" >> Hammer.swift && git add -A && git commit -qm "$1" && git push -q origin main )
+  git -C "$WORK/work" rev-parse --short HEAD
 }
 
 # upd [args]: runs update.sh the way launchd does, as its own process group (so a
@@ -116,14 +158,14 @@ hold_lock() {
   printf '%s\n%s\n' "$!" "$(ps -o lstart= -p "$!")" > "$HOME/Hammer/.update.lock/pid"
 }
 
-# A "Hammer" that's busy (YouTube is open) for $1 seconds: a copy of sleep named Hammer.
+# A "Hammer" that's busy (a dialog is open) for $1 seconds: a copy of sleep named Hammer.
 busy_hammer() {
   local real
   for real in /bin/sleep /usr/bin/sleep; do [ -x "$real" ] && break; done
   mkdir -p "$WORK/bin" && /bin/cp "$real" "$WORK/bin/Hammer"
   "$WORK/bin/Hammer" "$1" &
   holders+=($!)
-  printf '%s\nYouTube\n' "$!" > "$HOME/Hammer/.busy"
+  printf '%s\na dialog is open\n' "$!" > "$HOME/Hammer/.busy"
 }
 
 app_version() { cat "$HOME/Applications/Hammer.app/Contents/Resources/VERSION" 2>/dev/null || echo none; }
@@ -147,7 +189,7 @@ scenario_update() {
   upd
   check '[ "$(app_version)" = "$B" ] && [ "$(running)" = "$B" ]' "the new version is installed and running"
   check 'happened "pkill -x Hammer (stopped $A)" && happened "open OK ($B) --login"' "the old one stopped, the new one opened with --login (no menu popping up)"
-  check '[ "$(state)" = updated ] && [ "$(message)" = "Updated to $B" ] && [ "$(detail)" = "Lights: faster" ]' \
+  check '[ "$(state)" = updated ] && [ "$(message)" = "Updated to $B" ] && [ "$(detail)" = "Lights: faster" ] && grep -q "^version=$B$" "$HOME/Hammer/update-status"' \
     "status: updated, with what's new (Hammer turns that into its notification)"
   check '[ ! -e "$HOME/Hammer/build/Hammer-previous.app" ] && [ ! -e "$HOME/Hammer/build/.swapping" ] && [ ! -e "$HOME/Hammer/.update.lock" ]' \
     "nothing left over: no app set aside, no swap marker, no lock"
@@ -213,6 +255,147 @@ scenario_logout_mid_swap() {
   check '[ "$(app_version)" = "$B" ]' "the next run updates"
 }
 
+scenario_logout_twice() {
+  echo "[2: a second SIGTERM while the Hammer you had is being put back]"
+  B="$(commit B)"
+  FAKE_KILL_AT_APPS=TERM FAKE_TERM_AGAIN=1 upd
+  check 'happened "SIGTERM again" && [ "$(app_version)" = "$A" ] && [ "$(running)" = "$A" ]' \
+    "it's ignored: the putting back finishes, and Hammer is started"
+}
+
+scenario_cut_off_after_move() {
+  echo "[2: killed after the new app was moved in, before it started (the .swapping note)]"
+  B="$(commit B)"
+  FAKE_KILL_AT_OPEN=KILL upd
+  check 'exit_was 137 && [ "$(app_version)" = "$B" ] && [ "$(running)" = nothing ] && [ -e "$HOME/Hammer/build/.swapping" ]' \
+    "(set-up: an unchecked new app in place, nothing running)"
+  mv "$WORK/origin.git" "$WORK/offline.git"
+  upd
+  check '[ "$(app_version)" = "$A" ] && [ "$(running)" = "$A" ] && [ ! -e "$HOME/Hammer/build/.swapping" ]' \
+    "the next run, offline, puts back the Hammer you had (the new one never started) and starts it"
+  mv "$WORK/offline.git" "$WORK/origin.git"
+  upd
+  check '[ "$(app_version)" = "$B" ] && [ "$(running)" = "$B" ]' "back online, the update is tried again, and works"
+}
+
+scenario_stopped_after_success() {
+  echo "[1: stopped while deleting the old app, after the new one started]"
+  B="$(commit B)"
+  FAKE_KILL_AT_DISCARD=TERM upd
+  check 'happened "while deleting" && [ "$(app_version)" = "$B" ] && [ "$(running)" = "$B" ] && [ ! -e "$HOME/Hammer/build/.swapping" ]' \
+    "the new Hammer stays: no rollback to a half-deleted copy"
+  : > "$FAKE_LOG"
+  upd
+  check '[ "$(state)" = current ] && [ "$(times pkill)" = 0 ] && [ "$(running)" = "$B" ] && [ -z "$(ls -d "$HOME"/Hammer/build/.trash.* 2>/dev/null)" ]' \
+    "the next run leaves it alone (and clears what was half-deleted)"
+}
+
+scenario_leftover_previous() {
+  echo "[1: an app left aside from before, stopped while it's deleted; a damaged app in place]"
+  cp -R "$HOME/Applications/Hammer.app" "$HOME/Hammer/build/Hammer-previous.app"
+  B="$(commit B)"
+  FAKE_KILL_AT_DISCARD=TERM upd
+  check 'happened "while deleting" && [ "$(app_version)" = "$A" ] && [ -f "$HOME/Applications/Hammer.app/Contents/Info.plist" ] && [ "$(running)" = "$A" ]' \
+    "the Hammer in place is untouched and running (the half-deleted leftover isn't put back)"
+  rm -f "$FAKE/killed"
+  rm -f "$HOME/Applications/Hammer.app/Contents/Info.plist"
+  upd
+  check '[ "$(app_version)" = "$B" ] && [ "$(state)" = updated ]' \
+    "an app in place without its Info.plist isn't \"another app in the way\": the update replaces it"
+}
+
+scenario_installer_restores() {
+  echo "[10: the installer finds the Hammer you had set aside by an update that was cut off]"
+  mv "$HOME/Applications/Hammer.app" "$HOME/Hammer/build/Hammer-previous.app"
+  rm -f "$FAKE/running"
+  B="$(commit B)"
+  FAKE_SWIFTC_FAIL=1 install
+  check '! exit_was 0 && [ "$(app_version)" = "$A" ] && [ "$(running)" = "$A" ]' \
+    "it's put back and started first, so it's there even when the build then fails"
+}
+
+scenario_no_perl() {
+  echo "[7: no perl (for the time limits)]"
+  B="$(commit B)"
+  HAMMER_PERL=/no/such/perl upd
+  check '[ "$(app_version)" = "$B" ] && [ "$(state)" = updated ]' "the steps just run without a time limit"
+}
+
+scenario_not_yours() {
+  echo "[8: Hammer.app belongs to another user]"
+  if [ "$(id -u)" = 0 ]; then echo "  skip (running as root, who may write anywhere)"; return; fi
+  B="$(commit B)"
+  chmod a-w "$HOME/Applications/Hammer.app"
+  upd
+  chmod u+w "$HOME/Applications/Hammer.app"
+  check '[ "$(state)" = retry ] && [[ "$(detail)" == *"sudo chown"* ]] && [ "$(builds)" = 0 ] && [ "$(times pkill)" = 0 ] && [ "$(running)" = "$A" ]' \
+    "says so, before building or stopping anything"
+}
+
+# --- From the scripts before these fixes (old/) to these, as on your Mac
+
+scenario_t_ok() {
+  echo "[old update.sh installs the new scripts]"
+  B="$(commit_new B)"
+  upd
+  check '[ "$(app_version)" = "$B" ] && [ "$(running)" = "$B" ] && exit_was 0 && [ "$(failed_version)" = - ]' \
+    "the old updater runs the new build.sh: B installed and running"
+  : > "$FAKE_LOG"; : > "$FAKE_OSASCRIPT"
+  upd
+  check '[ "$(state)" = current ] && grep -q "Hammer Updates" "$HOME/Library/LaunchAgents/local.hammer.updater.plist"' \
+    "the next run is the new update.sh: up to date, login items moved to the named scripts"
+  check '! happened bootout && ! happened bootstrap' "…without restarting anything"
+  rm -f "$FAKE/running"; : > "$FAKE_LOG"
+  "$HOME/Hammer/bin/Hammer"
+  check 'happened "open OK ($B) --login"' "at the next login, Hammer opens quietly"
+}
+
+scenario_t_exit4() {
+  echo "[the old update.sh meets the new build.sh's \"a problem with this Mac\" (tools broken)]"
+  B="$(commit_new B)"
+  FAKE_CLT_BROKEN=1 upd
+  check '[ "$(app_version)" = "$A" ] && [ "$(running)" = "$A" ] && [ "$(failed_version)" = "$B" ]' \
+    "(set-up: the old updater marks it as a failed build)"
+  : > "$FAKE_OSASCRIPT"
+  FAKE_CLT_BROKEN=1 upd
+  check '[ "$(state)" = retry ] && [[ "$(detail)" == *"xcode-select --install"* ]]' "the new update.sh says what to fix"
+  upd
+  check '[ "$(app_version)" = "$B" ] && [ "$(failed_version)" = - ]' "once the tools are fixed, the next run installs it (not blocked for good)"
+}
+
+scenario_t_minos() {
+  echo "[the old update.sh meets the new build.sh's minos check]"
+  B="$(commit_new B)"
+  FAKE_MINOS=28.0 upd
+  : > "$FAKE_OSASCRIPT"
+  upd
+  check '[ "$(app_version)" = "$A" ] && [ "$(failed_version)" = - ] && said "trying again later"' \
+    "not a failed build: it waits an hour before building again"
+  age 61 "$HOME/Hammer/.retry-later"
+  upd
+  check '[ "$(app_version)" = "$B" ]' "then installs it"
+}
+
+scenario_t_crash() {
+  echo "[the old update.sh, and the new app crashes at launch]"
+  B="$(commit_new B)"
+  FAKE_CRASH_VERSION="$B" upd
+  check '[ "$(app_version)" = "$A" ] && [ "$(running)" = "$A" ] && [ "$(failed_version)" = "$B" ]' "the Hammer you had is back; B failed"
+  : > "$FAKE_OSASCRIPT"
+  upd
+  check '[ "$(app_version)" = "$A" ] && [ "$(builds)" = 1 ]' "no retry loop"
+}
+
+scenario_t_term() {
+  echo "[the old update.sh, and a logout mid-swap]"
+  B="$(commit_new B)"
+  FAKE_KILL_AT_APPS=TERM upd
+  check '[ "$(app_version)" = "$A" ] && [ "$(running)" = "$A" ]' "the Hammer you had is back, and running"
+  : > "$FAKE_OSASCRIPT"
+  upd
+  check '[ "$(app_version)" = "$B" ]' "the next run installs B"
+}
+
 scenario_lock() {
   echo "[2, 8: the update lock, and Check for Updates while an update runs]"
   B="$(commit B)"
@@ -230,6 +413,7 @@ scenario_lock() {
   printf '%s\nMon Jan  1 00:00:00 2001\n' "$$" > "$HOME/Hammer/.update.lock/pid"
   upd
   check '[ "$(app_version)" = "$C" ]' "a lock naming a PID that's now another process (after a restart) is cleared too"
+  check '[ -z "$(ls -d "$HOME"/Hammer/.update.lock* 2>/dev/null)" ]' "stale locks are renamed, then removed: nothing left over"
 }
 
 scenario_installer() {
@@ -249,11 +433,11 @@ scenario_installer() {
 
 scenario_fresh_install() {
   echo "[a first install]"
-  rm -rf "$HOME/Hammer" "$HOME/Applications/Hammer.app"; rm -f "$FAKE/running"
+  wipe "$HOME/Hammer" "$HOME/Applications/Hammer.app" "$FAKE/running"
   install
   check 'exit_was 0 && [ "$(app_version)" = "$A" ] && [ "$(running)" = "$A" ]' "installs Hammer and starts it"
   check '[ -x "$HOME/Hammer/bin/Hammer" ] && [ -f "$FAKE/loaded/local.hammer.updater" ]' "with its login items"
-  rm -rf "$HOME/Hammer" "$HOME/Applications/Hammer.app"; rm -f "$FAKE/running"
+  wipe "$HOME/Hammer" "$HOME/Applications/Hammer.app" "$FAKE/running"
   FAKE_CLT_BROKEN=1 install
   check 'exit_was 0 && happened "xcode-select --install" && [ "$(app_version)" = none ]' \
     "command-line tools broken: asks to reinstall them first"
@@ -327,7 +511,7 @@ scenario_hangs() {
 
 scenario_login_items() {
   echo "[6: the login items]"
-  bash "$HOME/Hammer/repo/agents.sh" > "$WORK/out.txt" 2>&1
+  bash "$HOME/Hammer/repo/agents.sh" --install > "$WORK/out.txt" 2>&1
   check '[ $? = 0 ] && [ -f "$FAKE/loaded/local.hammer" ] && [ -f "$FAKE/loaded/local.hammer.updater" ]' "both set up and on"
   check '[ -x "$HOME/Hammer/bin/Hammer" ] && [ -x "$HOME/Hammer/bin/Hammer Updates" ]' \
     "they run scripts named Hammer and Hammer Updates (the names Login Items shows)"
@@ -351,6 +535,18 @@ scenario_login_items() {
   rm -f "$HOME/Hammer/update-status"
   "$HOME/Hammer/bin/Hammer Updates" >/dev/null 2>&1
   check '[ "$(state)" = current ]' "Hammer Updates runs update.sh"
+  echo 1 > "$FAKE/bootstrap-busy"
+  rm -f "$HOME/Hammer/bin/Hammer Updates"
+  bash "$HOME/Hammer/repo/agents.sh" > "$WORK/out.txt" 2>&1
+  check '[ $? = 0 ] && happened "bootout local.hammer.updater" && happened "bootstrap local.hammer.updater BUSY" && [ -f "$FAKE/loaded/local.hammer.updater" ]' \
+    "changed: restarted, trying the bootstrap again while launchd lets go of the old one"
+  rm -f "$HOME/Library/LaunchAgents/local.hammer.plist" "$FAKE/loaded/local.hammer"
+  bash "$HOME/Hammer/repo/agents.sh" --files >/dev/null 2>&1
+  bash "$HOME/Hammer/repo/agents.sh" >/dev/null 2>&1
+  check '[ ! -e "$HOME/Library/LaunchAgents/local.hammer.plist" ]' \
+    "you deleted the open-at-login item: neither an update nor Turn On… brings it back"
+  bash "$HOME/Hammer/repo/agents.sh" --install >/dev/null 2>&1
+  check '[ -f "$HOME/Library/LaunchAgents/local.hammer.plist" ] && [ -f "$FAKE/loaded/local.hammer" ]' "…the installer does"
   mkdir -p "$FAKE/btm-off" && touch "$FAKE/btm-off/local.hammer.updater" && rm -f "$FAKE/loaded/local.hammer.updater"
   bash "$HOME/Hammer/repo/agents.sh" > "$WORK/out.txt" 2>&1
   check '[ $? = 1 ] && said "Updates are off"' "switched off in Login Items: it says so (and Hammer shows where to turn it on)"
@@ -419,9 +615,13 @@ scenario_busy() {
   upd
   check '[ "$(app_version)" = "$C" ]' "still busy after 30 minutes: it installs anyway"
   D="$(commit D)"
-  printf '999999\nYouTube\n' > "$HOME/Hammer/.busy"
+  printf '999999\na dialog is open\n' > "$HOME/Hammer/.busy"
   upd
   check '! said "waits until" && [ "$(app_version)" = "$D" ]' "a note left by a Hammer that has quit is ignored"
+  E="$(commit E)"
+  printf '%s\na dialog is open\n' "$$" > "$HOME/Hammer/.busy"
+  upd
+  check '! said "waits until" && [ "$(app_version)" = "$E" ]' "…and one whose number now belongs to another program (not Hammer)"
 }
 
 scenario_no_icon() {
@@ -450,22 +650,24 @@ scenario_bad_version() {
   check '[ "$(app_version)" = "$B" ] && [ "$(failed_version)" = - ]' "Check for Updates retries it"
 }
 
-all=(update restart_loop swap_fails killed_mid_swap logout_mid_swap lock installer fresh_install crash_at_launch
-     open_during_swap mac_problems hangs login_items login_items_move cli_binary local_edits signing_logout busy
-     no_icon bad_version)
+all=(update restart_loop swap_fails killed_mid_swap logout_mid_swap logout_twice cut_off_after_move
+     stopped_after_success leftover_previous lock installer installer_restores fresh_install crash_at_launch
+     open_during_swap mac_problems hangs no_perl not_yours login_items login_items_move cli_binary local_edits
+     signing_logout busy no_icon bad_version t_ok t_exit4 t_minos t_crash t_term)
 chosen=("$@")
 [ ${#chosen[@]} -gt 0 ] || chosen=("${all[@]}")
 for name in "${chosen[@]}"; do
   name="${name//-/_}"
   if ! declare -F "scenario_$name" >/dev/null; then echo "No scenario $name. There are: ${all[*]//_/-}"; exit 2; fi
-  reset_world
+  case "$name" in t_*) reset_world old ;; *) reset_world ;; esac
   scenario="$name"
   elapsed=""
   "scenario_$name"
+  [ -s "$FAKE_OSASCRIPT" ] && osascript_users="$osascript_users $name"
 done
 
-echo "[nothing used osascript (Hammer posts the notifications)]"
-check '[ ! -s "$FAKE_OSASCRIPT" ]' "no osascript"
+echo "[nothing but the old update.sh used osascript (Hammer posts the notifications)]"
+check '[ -z "$osascript_users" ]' "no osascript${osascript_users:+ (used in:$osascript_users)}"
 
 echo
 printf '%s' "$failures"

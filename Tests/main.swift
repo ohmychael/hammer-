@@ -1661,6 +1661,13 @@ expect(updated.notice(asked: nil, lastNotice: failedStatus.noticeKey, now: soon)
        "an update says what's new")
 expect(updating.notice(asked: Date(timeIntervalSince1970: 0), lastNotice: nil, now: soon) == nil,
        "nothing while it's still going")
+var failedEarlier = failedStatus, failedLater = failedStatus
+failedEarlier.version = "abc1234"
+failedLater.version = "def5678"
+expect(failedLater.notice(asked: nil, lastNotice: failedEarlier.noticeKey, now: soon) != nil,
+       "the same failure with a newer version is news again")
+expect(UpdateStatus.parse("state=failed\ntime=1\nversion=abc1234\nmessage=m\n")?.version == "abc1234",
+       "the version is read from the file")
 var retry = failedStatus
 retry.state = "retry"; retry.message = "Can't update: developer tools missing"; retry.detail = "xcode-select --install"
 expect(retry.notice(asked: nil, lastNotice: nil, now: soon)! == ("Can't update: developer tools missing", "xcode-select --install"),
