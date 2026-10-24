@@ -151,12 +151,14 @@ enum EDID {
         return nil
     }
 
-    /// The model name it gives, e.g. "DELL U3818DW".
+    /// The model name it gives, e.g. "DELL U3818DW". Printable ASCII only (the standard's
+    /// character set), so a broken EDID can't put odd characters in the menu or the report.
     static func name(_ bytes: [UInt8]) -> String? {
         guard bytes.count >= 128 else { return nil }
         for start in stride(from: 54, through: 108, by: 18)
         where bytes[start] == 0 && bytes[start + 1] == 0 && bytes[start + 3] == 0xFC {
             let text = bytes[(start + 5)..<(start + 18)].prefix { $0 != 0x0A && $0 != 0x00 }
+                .filter { (0x20...0x7E).contains($0) }
             let name = String(decoding: text, as: UTF8.self).trimmingCharacters(in: .whitespaces)
             if !name.isEmpty { return name }
         }
@@ -639,6 +641,10 @@ struct MonitorCheck {
     var screens: [MonitorScreen] = []
     var ports: [PortResult] = []
     var otherConnections: [String] = []   // non-external connections, for the report
+    /// What Hammer's dimming in software was doing at the time: the app fills it in
+    /// (nil from Terminal, which can't tell).
+    var softwareDim: SoftwareDimState?
+    var softwareDimLevel = 100            // the Brightness slider's level, while dimming in software
 
     /// Runs the check. `bus` gives the connection for a registry ID (nil if macOS gives none);
     /// `defaultBus` is macOS's default connection, tried last if no port answers.
@@ -785,8 +791,15 @@ struct MonitorCheck {
         return "Hammer changed the brightness for a moment to test it, and put it back."
     }
 
+    /// The whole report, for Copy Report and Terminal: the result, what to do, then the details.
     var text: String {
-        var lines = ["Hammer monitor check", ""]
+        (["Hammer monitor check", "", "Result: " + title] + advice + ["", details]).joined(separator: "\n")
+    }
+
+    /// What the check found, step by step: the box in the check's window, under the result and
+    /// the advice (which it doesn't repeat).
+    var details: String {
+        var lines: [String] = []
         lines.append("Mac: " + [mac.model, mac.chip, mac.system.isEmpty ? "" : "macOS \(mac.system)"]
             .filter { !$0.isEmpty }.joined(separator: " · "))
         let screenList = screens.map { screen -> String in
@@ -798,145 +811,170 @@ struct MonitorCheck {
         let external = ports.filter { !$0.port.isDefault }.count
         lines.append("External connections: \(external)"
                      + (otherConnections.isEmpty ? "" : " · also \(otherConnections.joined(separator: ", "))"))
+        if let line = softwareDimLine { lines.append(line) }
 
+        var shown: [[String]] = []
         for result in ports {
             lines.append("")
             let port = result.port
             let title = port.isDefault ? "Tried last" : port.name ?? (port.attached ? "Monitor" : "No monitor seen here")
-            let details = [port.label, port.transport, port.throughHDMIConverter ? "HDMI converter" : nil]
+            let parts = [port.label, port.transport, port.throughHDMIConverter ? "HDMI converter" : nil]
                 .compactMap { $0 }
-            lines.append(title + (details.isEmpty ? "" : " (\(details.joined(separator: ", ")))"))
-            if result.noService {
-                lines.append("  macOS gave Hammer no way to talk to it")
+            let heading = title + (parts.isEmpty ? "" : " (\(parts.joined(separator: ", ")))")
+            let body = portLines(result)
+            // macOS's default connection is usually one of the ports again: one line if it says the same.
+            if port.isDefault && shown.contains(body) {
+                lines.append(heading + ": the same as above")
                 continue
             }
-            if let name = result.edidName {
-                let input = port.monitorInput.map { $0 == .hdmi ? ", on its HDMI input" : ", on its DisplayPort/USB-C input" } ?? ""
-                lines.append("  Its ID info (EDID), from macOS: \(name)\(input)")
-            }
-            let b = result.brightness
-            lines.append("  Sent: " + (b.sent ? "yes" : "no" + (b.sendError.map { " (error \(Self.hex($0)))" } ?? "")))
-            lines.append("  Brightness: " + Self.describe(b))
-            if let contrast = result.contrast { lines.append("  Contrast: " + Self.describe(contrast)) }
-            let back: String
-            switch result.restored {
-            case true?: back = ", put back"
-            case false?: back = ", put back (but it reads differently now)"
-            case nil: back = ", put back (couldn't confirm)"
-            }
-            switch result.change {
-            case let .confirmed(from, to)?:
-                lines.append("  Change test: \(from) → \(to), read back \(to)\(back) ✓")
-            case let .unconfirmed(from, to, readBack)?:
-                lines.append("  Change test: \(from) → \(to), read back \(readBack)\(back) ✗")
-            case let .noReadBack(from, to)?:
-                lines.append("  Change test: \(from) → \(to), then it didn't answer\(back) ?")
-            case nil:
-                break
-            }
-            if let way = b.way {
-                lines.append("  Answered on: \(way)" + (b.slow ? ", only when asked slowly (one request, 150 ms wait)" : ""))
-            }
-            if !b.answered, let reply = b.lastReply {
-                lines.append("  Last reply: " + reply.map { String(format: "%02X", $0) }.joined(separator: " "))
-            }
-            if !b.answered, !b.readErrors.isEmpty {
-                lines.append("  Read errors: " + Self.describe(b.readErrors))
-            }
-            if let probe = result.edidOverI2C {
-                lines.append("  Its ID info (EDID) over the same wire: " + (probe.valid ? "read fine"
-                    : probe.status != 0 ? "failed (error \(Self.hex(probe.status)))" : "came back, but not as expected"))
-            }
+            shown.append(body)
+            lines.append(heading)
+            lines.append(contentsOf: body)
         }
-
-        lines.append("")
-        lines.append(contentsOf: advice)
         return lines.joined(separator: "\n")
     }
 
-    /// What it means, and what to do.
-    var advice: [String] {
-        let name = monitorName
-        let Name = name.prefix(1).uppercased() + name.dropFirst()
-        // On HDMI, unless the monitor itself says it's on its DisplayPort input.
-        let hdmi = ports.contains { $0.port.attached && $0.port.looksLikeHDMI && $0.port.monitorInput != .displayPort }
-        let macHDMI = ports.contains { $0.port.attached && $0.port.throughHDMIConverter }
-        switch verdict {
-        case .working:
-            return ["Result: Working. Hammer can read and change \(name)'s brightness."]
-        case .untested:
-            return ["Result: \(Name) answers Hammer: it can read its brightness, but couldn't test changing it.",
-                    "Move Hammer's Brightness slider and watch the screen."]
-        case .unsure:
-            return ["Result: \(Name) answered Hammer, but went quiet after Hammer changed its brightness.",
-                    "Did the screen get brighter or dimmer for a moment during the check? If so, it works:",
-                    "Hammer's sliders will change it, they just may not always start at the right place."]
-        case .ignoresChanges:
-            return ["Result: \(Name) answers Hammer, but its brightness didn't change.",
-                    "The monitor has probably locked it. On the Dell, in its own menu:"] + Self.unlock
-        case .noBrightness:
-            return ["Result: \(Name) answers Hammer, but says it has no brightness setting the Mac can change.",
-                    "The monitor has probably locked it. On the Dell, in its own menu:"] + Self.unlock
-        case .noMonitor:
-            return ["Result: macOS doesn't see an external monitor.",
-                    "Check the cable at both ends, and that the monitor is on the right input (Menu → Input Source)."]
-        case .notDirect:
-            return ["Result: \(Name) is connected through DisplayLink, AirPlay or Sidecar,",
-                    "which can't carry brightness control. Plug its USB-C (or DisplayPort) cable straight into the Mac."]
-        case .notFound:
-            return ["Result: macOS shows \(name), but Hammer can't find the connection it's on.",
-                    "Plug its USB-C cable straight into the Mac, then check again.",
-                    "If that doesn't help, send this report along."]
-        case .cantSend:
-            return ["Result: macOS wouldn't let Hammer send anything to \(name).",
-                    macHDMI ? "This Mac's HDMI port doesn't pass monitor control. Plug the monitor's USB-C (or DisplayPort) cable straight into the Mac instead."
-                    : hdmi ? "HDMI doesn't pass monitor control here. Connect to the monitor's DisplayPort or USB-C port instead (not HDMI)."
-                    : "Plug its USB-C cable straight into the Mac (not through a hub, dock or adapter), then check again."]
-        case .hdmiAdapter:
-            return ["Result: \(Name) is plugged into one of its HDMI ports (its ID info says so), from a USB-C port on the Mac.",
-                    "Converting USB-C to HDMI, in a cable, adapter or hub, usually drops brightness control (DDC/CI).",
-                    "Connect to the monitor's DisplayPort or USB-C port instead:",
-                    "• a USB-C to USB-C cable into the monitor's USB-C port (the Dell U3818DW comes with one), or",
-                    "• a USB-C to DisplayPort cable, or a USB-C to DisplayPort adapter plus the DisplayPort cable from the Dell's box, into its DP port.",
-                    "Not a DisplayPort to HDMI cable: it still ends in an HDMI port.",
-                    "Then, on the monitor, choose Menu → Input Source → USB Type-C (or DP), and check again."]
-        case .noAnswer where wireReads == true:
-            return ["Result: Hammer can read \(name)'s ID info (EDID) over this connection,",
-                    "but its control channel (DDC/CI) doesn't answer. Try these, checking again after each:",
-                    "  1. On the monitor: Menu → Others → DDC/CI → On.",
-                    "  2. Unplug the monitor's power cord for 10 seconds, plug it back in, and turn it on.",
-                    "  3. Plug its USB-C cable straight into the Mac, not through a hub, dock or adapter."
-                        + (hdmi ? " Use USB-C rather than HDMI." : ""),
-                    "  4. Move Hammer's Brightness slider and watch the screen: some monitors take changes without answering.",
-                    "If it still doesn't work, send this report along."]
-        case .noAnswer where wireReads == false:
-            return ["Result: Nothing comes back from \(name) over this connection, not even its ID info (EDID).",
-                    "Messages go out, but no answers return. Try these, checking again after each:",
-                    "  1. Use a USB-C cable straight from the Mac to the monitor's USB-C port (no hub, dock or adapter),",
-                    "     and try another USB-C port on the Mac.",
-                    "  2. On the monitor: Menu → Others → DDC/CI → On.",
-                    "  3. Unplug the monitor's power cord for 10 seconds, plug it back in, and turn it on.",
-                    "  4. Move Hammer's Brightness slider and watch the screen: changes may still get through.",
-                    "If it still doesn't work, send this report along."]
-        case .noAnswer:
-            return ["Result: Hammer sent messages to \(name), but it didn't answer.",
-                    "Try these, checking again after each:",
-                    "  1. On the monitor: Menu → Others → DDC/CI → On. Then switch it off and on with its power button.",
-                    "  2. Plug its USB-C cable straight into the Mac, not through a hub, dock or adapter."
-                        + (hdmi ? " Use USB-C rather than HDMI." : ""),
-                    "  3. Move Hammer's Brightness slider and watch the screen: some monitors take changes without answering.",
-                    "If it still doesn't work, send this report along."]
+    private func portLines(_ result: PortResult) -> [String] {
+        if result.noService { return ["  macOS gave Hammer no way to talk to it"] }
+        let port = result.port
+        var lines: [String] = []
+        if let name = result.edidName {
+            let input = port.monitorInput.map { $0 == .hdmi ? ", on its HDMI input" : ", on its DisplayPort/USB-C input" } ?? ""
+            lines.append("  Its ID info (EDID), from macOS: \(name)\(input)")
+        }
+        let b = result.brightness
+        lines.append("  Sent: " + (b.sent ? "yes" : "no" + (b.sendError.map { " (error \(Self.hex($0)))" } ?? "")))
+        lines.append("  Brightness: " + Self.describe(b))
+        if let contrast = result.contrast { lines.append("  Contrast: " + Self.describe(contrast)) }
+        let back: String
+        switch result.restored {
+        case true?: back = ", put back"
+        case false?: back = ", put back (but it reads differently now)"
+        case nil: back = ", put back (couldn't confirm)"
+        }
+        switch result.change {
+        case let .confirmed(from, to)?:
+            lines.append("  Change test: \(from) → \(to), read back \(to)\(back) ✓")
+        case let .unconfirmed(from, to, readBack)?:
+            lines.append("  Change test: \(from) → \(to), read back \(readBack)\(back) ✗")
+        case let .noReadBack(from, to)?:
+            lines.append("  Change test: \(from) → \(to), then it didn't answer\(back) ?")
+        case nil:
+            break
+        }
+        if let way = b.way {
+            lines.append("  Answered on: \(way)" + (b.slow ? ", only when asked slowly (one request, 150 ms wait)" : ""))
+        }
+        if !b.answered, let reply = b.lastReply {
+            lines.append("  Last reply: " + reply.map { String(format: "%02X", $0) }.joined(separator: " "))
+        }
+        if !b.answered, !b.readErrors.isEmpty {
+            lines.append("  Read errors: " + Self.describe(b.readErrors))
+        }
+        // Behind a USB-C to HDMI adapter the EDID usually reads fine and says nothing new.
+        if let probe = result.edidOverI2C, verdict != .hdmiAdapter {
+            lines.append("  Its ID info (EDID) over the same wire: " + (probe.valid ? "read fine"
+                : probe.status != 0 ? "failed (error \(Self.hex(probe.status)))" : "came back, but not as expected"))
+        }
+        return lines
+    }
+
+    private var softwareDimLine: String? {
+        switch softwareDim {
+        case nil: return nil
+        case .off?: return "Software dimming: off"
+        case .on?: return "Software dimming: on, at \(softwareDimLevel)%"
+        case .paused?: return "Software dimming: paused (another app keeps changing the colors)"
+        case .cantDim?: return "Software dimming: needed, but another app is changing the colors"
+        case .unsupported?: return "Software dimming: needed, but this screen's colors can't be changed"
         }
     }
 
-    /// What locks brightness on the U3818DW (Dell's user's guide): Uniformity
-    /// Compensation in Standard and Color Temp., Dynamic Contrast in Game and Movie.
-    static let unlock = [
-        "  1. Display → Uniformity Compensation → Off",
-        "  2. Display → Dynamic Contrast → Off",
-        "  3. Color → Preset Modes → Standard",
-        "If the Dell's own Brightness/Contrast setting was grayed out, that was it. Then check again.",
-    ]
+    /// The result in a few words: the title of the check's window.
+    var title: String {
+        let name = monitorName
+        let Name = name.prefix(1).uppercased() + name.dropFirst()
+        switch verdict {
+        case .working: return "\(Name) works with Hammer"
+        case .untested: return "\(Name) answers Hammer"
+        case .unsure: return "\(Name) went quiet after a change"
+        case .ignoresChanges: return "\(Name) ignores brightness changes"
+        case .noBrightness: return "\(Name) says it has no brightness setting"
+        case .noMonitor: return "No external monitor found"
+        case .notDirect: return "\(Name) is on DisplayLink, AirPlay or Sidecar"
+        case .notFound: return "Hammer can't find \(name)'s connection"
+        case .cantSend: return "macOS won't let Hammer reach \(name)"
+        case .hdmiAdapter: return "\(Name) is on HDMI through a USB-C adapter"
+        case .noAnswer: return "\(Name) doesn't answer Hammer"
+        }
+    }
+
+    /// What to do, in two or three short lines (and whether Hammer dims in software meanwhile).
+    var advice: [String] {
+        var lines = steps
+        if softwareDim == .on && answering == nil {
+            lines.append("Meanwhile Hammer dims the picture in software (\(softwareDimLevel)%).")
+        }
+        return lines
+    }
+
+    private var steps: [String] {
+        // On HDMI, unless the monitor itself says it's on its DisplayPort input.
+        let hdmi = ports.contains { $0.port.attached && $0.port.looksLikeHDMI && $0.port.monitorInput != .displayPort }
+        let macHDMI = ports.contains { $0.port.attached && $0.port.throughHDMIConverter }
+        let direct = "Plug it straight into the Mac, not through a hub, dock or adapter."
+            + (hdmi ? " Use USB-C rather than HDMI." : "")
+        switch verdict {
+        case .working:
+            return ["Hammer can read and change its brightness."]
+        case .untested:
+            return ["Hammer can read its brightness, but couldn't test changing it.",
+                    "Move the Brightness slider and watch the screen."]
+        case .unsure:
+            return ["Did the screen get brighter or dimmer for a moment during the check? Then it works.",
+                    "The sliders may just not always start at the right place."]
+        case .ignoresChanges, .noBrightness:
+            return ["The monitor has probably locked it (its own Brightness item is then grayed out).",
+                    "On the Dell: Display → Uniformity Compensation → Off, and Display → Dynamic Contrast → Off.",
+                    "Use Color → Preset Modes → Standard, then check again."]
+        case .noMonitor:
+            return ["Check the cable at both ends.",
+                    "On the monitor, choose the right input: Menu → Input Source."]
+        case .notDirect:
+            return ["Those can't carry brightness control.",
+                    "Plug its USB-C or DisplayPort cable straight into the Mac."]
+        case .notFound:
+            return ["Plug its USB-C cable straight into the Mac, then check again.",
+                    "If that doesn't help, send this report along."]
+        case .cantSend:
+            if macHDMI {
+                return ["This Mac's HDMI port doesn't pass monitor control.",
+                        "Plug the monitor's USB-C or DisplayPort cable straight into the Mac instead, then check again."]
+            }
+            if hdmi {
+                return ["HDMI doesn't pass monitor control here.",
+                        "Connect to the monitor's DisplayPort or USB-C port instead (not HDMI), then check again."]
+            }
+            return ["Plug its USB-C cable straight into the Mac (not through a hub, dock or adapter).",
+                    "Then check again."]
+        case .hdmiAdapter:
+            return ["USB-C to HDMI, in a cable, adapter or hub, drops brightness control.",
+                    "Use the monitor's USB-C or DisplayPort port instead, not HDMI: "
+                        + "a USB-C to USB-C cable, or USB-C to DisplayPort.",
+                    "Then choose Menu → Input Source → USB Type-C (or DP), and check again."]
+        case .noAnswer where wireReads == true:
+            return ["Its ID info (EDID) reads fine, but its control channel (DDC/CI) doesn't answer.",
+                    "On the monitor: Menu → Others → DDC/CI → On. Then unplug its power cord for 10 seconds.",
+                    "Still nothing? " + direct]
+        case .noAnswer where wireReads == false:
+            return ["Nothing comes back over this connection, not even its ID info (EDID).",
+                    "Use a USB-C cable straight into the monitor's USB-C port, or another USB-C port on the Mac.",
+                    "Also check Menu → Others → DDC/CI → On."]
+        case .noAnswer:
+            return ["On the monitor: Menu → Others → DDC/CI → On. Then switch it off and on.",
+                    "Still nothing? " + direct]
+        }
+    }
 
     static func describe(_ read: DDCRead) -> String {
         switch read.answer {
@@ -960,6 +998,15 @@ struct MonitorCheck {
 
 // MARK: - The monitor's part of the menu
 
+/// What dimming the picture in software can do right now (the app works it out, see SoftwareDim).
+enum SoftwareDimState: Equatable {
+    case off            // not needed: the monitor's own controls (or it hasn't been asked yet)
+    case on             // the Brightness slider dims the picture
+    case paused         // dimming, but stopped: another app keeps changing the screen's colors
+    case cantDim        // needed, but another app's colors are on the screen (f.lux?)
+    case unsupported    // needed, but this screen's colors can't be changed
+}
+
 struct MonitorMenu: Equatable {
     var title: String?               // shown instead of the sliders
     var sliders = false
@@ -970,17 +1017,15 @@ struct MonitorMenu: Equatable {
     /// `connections`: external DDC connections found (not counting macOS's default);
     /// `hasDefault`: macOS's default connection is being tried too; `attached`: ports
     /// with a monitor seen; `answers`: whether one gave a value when last asked.
-    /// `software`: the monitor can't be told to dim itself, so the Brightness slider
-    /// dims the picture (SoftwareDim).
+    /// `software`: whether the monitor can't be told to dim itself, so the Brightness
+    /// slider dims the picture instead (SoftwareDim), and whether that can work.
     static func make(connections: Int, hasDefault: Bool = false, attached: Int, screens: [MonitorScreen],
-                     answers: Bool?, hdmiAdapter: Bool = false, software: Bool = false) -> MonitorMenu {
+                     answers: Bool?, hdmiAdapter: Bool = false, software: SoftwareDimState = .off) -> MonitorMenu {
         let external = screens.filter { !$0.builtIn }
         let virtualOnly = !external.isEmpty && external.allSatisfy { $0.direct == false }
         if attached == 0 && external.isEmpty {
-            return MonitorMenu(title: "Dell not connected",
-                               hints: ["Plug it in with USB-C or DisplayPort.",
-                                       "Hammer picks it up automatically.",
-                                       "Not a DisplayLink dock — those block control."])
+            return MonitorMenu(title: "Dell not connected", hints: ["Plug it in with USB-C or DisplayPort."],
+                               offerCheck: true)
         }
         if connections == 0 && virtualOnly {
             return MonitorMenu(title: "Dell connected through DisplayLink or AirPlay",
@@ -988,17 +1033,25 @@ struct MonitorMenu: Equatable {
                                        "USB-C or DisplayPort straight into the Mac."],
                                offerCheck: true)
         }
+        // Dimming in software: one Brightness slider and one line saying why, or just the line.
+        switch software {
+        case .off:
+            break
+        case .on, .paused:
+            let why = software == .paused ? "Paused: another app keeps changing the colors"
+                : hdmiAdapter ? "Dimmed in software: the HDMI adapter blocks control"
+                : connections == 0 && !hasDefault ? "Dimmed in software: can't find the Dell's connection"
+                : "Dimmed in software: the Dell isn't answering"
+            return MonitorMenu(sliders: true, contrast: false, hints: [why], offerCheck: true)
+        case .cantDim:
+            return MonitorMenu(hints: ["Can't dim: another app is changing the colors"], offerCheck: true)
+        case .unsupported:
+            return MonitorMenu(hints: ["Can't dim this screen in software"], offerCheck: true)
+        }
         if connections == 0 && !hasDefault {
             return MonitorMenu(title: "Can't find the Dell's connection", offerCheck: true)
         }
         var menu = MonitorMenu(sliders: true, offerCheck: true)
-        if software {
-            menu.contrast = false
-            menu.hints += hdmiAdapter
-                ? ["Dimming the picture: Hammer can't reach the", "Dell through a USB-C to HDMI adapter."]
-                : ["Dimming the picture: the Dell isn't answering Hammer."]
-            return menu
-        }
         if connections == 0 && answers != true {
             menu.hints.append("Can't find the Dell's port; trying the Mac's default.")
         } else if answers == false && hdmiAdapter {
@@ -1011,6 +1064,12 @@ struct MonitorMenu: Equatable {
             menu.hints.append("It may be on DisplayLink or AirPlay, which block control.")
         }
         return menu
+    }
+
+    /// A monitor slider's value, shown next to its name: "40%". Empty until it's known.
+    static func readout(current: UInt16, max: UInt16) -> String {
+        guard max > 0 else { return "" }
+        return "\(Int((Double(Swift.min(current, max)) * 100 / Double(max)).rounded()))%"
     }
 }
 
@@ -1033,24 +1092,28 @@ final class SliderMoves: @unchecked Sendable {
 
 // MARK: - Dimming the picture in software
 
-/// When the monitor can't be told to dim itself (an HDMI adapter, DDC/CI off),
-/// Hammer dims the picture instead, by scaling the screen's color curves (the
-/// way f.lux adjusts them). It can only go darker than the monitor's own
-/// setting, and the backlight stays as it is. MonitorMac.swift applies it;
-/// macOS undoes it when Hammer quits, so nothing can leave a screen dark.
+/// When the monitor can't be told to dim itself (an HDMI adapter, DDC/CI off, no
+/// connection found), Hammer dims the picture instead, by scaling the screen's color
+/// curves (the way f.lux adjusts them). It can only go darker than the monitor's own
+/// setting, and the backlight stays as it is. MonitorMac.swift applies it; macOS
+/// undoes it when Hammer quits, so nothing can leave a screen dark.
 enum SoftwareDim {
-    /// Never darker than this, so you can always see the screen (and Hammer's menu).
+    /// Never darker than this: 15% of the signal. A screen turns signal into light on
+    /// a curve (gamma about 2.2), so that's only about 1.5% of the light: very dim, but
+    /// never fully dark.
     static let floor = 0.15
 
-    /// The Brightness slider's 0–100 as how much of the picture's light is kept.
+    /// The Brightness slider's 0–100 as how much of the signal is kept, from the floor
+    /// up to all of it. The light falls faster than the signal: 50 keeps about 30% of it.
     static func factor(level: Int) -> Double {
         let clamped = Double(min(100, max(0, level)))
         return floor + (1 - floor) * clamped / 100
     }
 
-    /// A color curve scaled down, kept between 0 and 1.
+    /// A color curve scaled down, kept between 0 and 1. The factor is held between the
+    /// floor and 1 (NaN counts as 1, not dimmed), so a bad number can't black out a screen.
     static func scaled(_ table: [Float], by factor: Double) -> [Float] {
-        let f = Float(min(1, max(0, factor)))
+        let f = Float(factor.isNaN ? 1 : min(1, max(floor, factor)))
         return table.map { min(1, max(0, $0 * f)) }
     }
 
@@ -1061,17 +1124,21 @@ enum SoftwareDim {
     }
 
     /// Dim in software only once the monitor is known not to answer: at once if
-    /// it's behind an HDMI adapter, otherwise after two reads in a row (one miss
-    /// can be a slow monitor). `wasDimming`: it already was (before a wake, a
-    /// replug or a restart), so one miss is enough to carry on.
-    static func applies(answers: Bool?, misses: Int, hdmiAdapter: Bool, wasDimming: Bool = false) -> Bool {
-        answers == false && (hdmiAdapter || wasDimming || misses >= 2)
+    /// it's behind an HDMI adapter or Hammer has no connection to it at all,
+    /// otherwise after two reads in a row (one miss can be a slow monitor).
+    /// `wasDimming`: it already was (before a wake, a replug or a restart), so one
+    /// miss is enough to carry on.
+    static func applies(answers: Bool?, misses: Int, hdmiAdapter: Bool, noConnection: Bool = false,
+                        wasDimming: Bool = false) -> Bool {
+        answers == false && (hdmiAdapter || noConnection || wasDimming || misses >= 2)
     }
 
     /// Which Brightness slider the menu shows: before the monitor has been asked
     /// again (just after a wake or a replug), whatever was in use.
-    static func showing(answers: Bool?, misses: Int, hdmiAdapter: Bool, wasDimming: Bool) -> Bool {
-        answers == nil ? wasDimming : applies(answers: answers, misses: misses, hdmiAdapter: hdmiAdapter, wasDimming: wasDimming)
+    static func showing(answers: Bool?, misses: Int, hdmiAdapter: Bool, noConnection: Bool = false,
+                        wasDimming: Bool) -> Bool {
+        answers == nil ? wasDimming : applies(answers: answers, misses: misses, hdmiAdapter: hdmiAdapter,
+                                              noConnection: noConnection, wasDimming: wasDimming)
     }
 
     /// What to dim from. The screen's curves as they are now, unless they're the
@@ -1086,6 +1153,53 @@ enum SoftwareDim {
     }
 }
 
+/// Watches one screen's curves while Hammer dims it (every 10 seconds), so it puts
+/// its dimming back when macOS resets them, but doesn't fight another app (f.lux,
+/// another dimmer) that keeps changing them.
+struct DimWatch: Equatable {
+    static let giveUpAfter = 3       // changed by something else this many times in a row: stop
+    static let resumeAfter = 3       // the other app's curves gone for this many checks in a row: dim again
+
+    enum Action: Equatable {
+        case leave                   // leave the screen as it is
+        case dim                     // put Hammer's dimming (back) on it
+    }
+
+    private(set) var resets = 0      // checks in a row that found something else's curves
+    private(set) var gaveUp = false
+    private(set) var rival: GammaCurves?     // what was on the screen when Hammer gave up
+    private(set) var calm = 0        // since then: checks in a row with steady curves of the screen's own
+    private var seen: GammaCurves?
+
+    /// One check. `now`: the screen's curves (nil: unreadable); `written`: what Hammer last put there.
+    mutating func check(now: GammaCurves?, written: GammaCurves?) -> Action {
+        if gaveUp {
+            // Look, don't touch. Dim again only once the other app has let go: the screen's own
+            // curves, not the other app's (some look much like a screen's own), steady for a while.
+            guard let now, now.isScreensOwn, !(rival.map(now.matches) ?? false) else {
+                calm = 0
+                seen = nil
+                return .leave
+            }
+            calm = seen.map(now.matches) == true ? calm + 1 : 1
+            seen = now
+            guard calm >= Self.resumeAfter else { return .leave }
+            self = DimWatch()
+            return .dim
+        }
+        guard let written else { return .dim }               // never got to write yet: not anyone's fault
+        if let now, now.matches(written) {
+            resets = 0
+            return .leave
+        }
+        resets += 1
+        guard resets > Self.giveUpAfter else { return .dim }
+        gaveUp = true
+        rival = now
+        return .leave
+    }
+}
+
 /// A screen's three color curves (red, green, blue), each from dark (0) to light (1).
 struct GammaCurves: Equatable {
     var r: [Float]
@@ -1093,14 +1207,15 @@ struct GammaCurves: Equatable {
     var b: [Float]
 
     /// Looks like a screen's own (from its color profile): every color starts near
-    /// dark, the brightest reaches near full light, and none is held far down (a
+    /// dark, the brightest reaches (nearly) full light, and none is held far down (a
     /// warm white point is fine). A dimmed curve, a color-shifting app's, or one
-    /// zeroed by a glitch, doesn't.
+    /// zeroed by a glitch, doesn't. Hammer's own dimming passes only at 97–99 (less
+    /// than 3% off the original), so even taken for the original it can't stack visibly.
     var isScreensOwn: Bool {
         let curves = [r, g, b]
         guard curves.allSatisfy({ $0.count > 1 && ($0.first ?? 1) <= 0.1 }) else { return false }
         let tops = curves.compactMap(\.last)
-        return (tops.max() ?? 0) >= 0.9 && (tops.min() ?? 0) >= 0.6
+        return (tops.max() ?? 0) >= 0.97 && (tops.min() ?? 0) >= 0.6
     }
 
     func scaled(by factor: Double) -> GammaCurves {

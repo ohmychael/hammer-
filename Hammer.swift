@@ -1281,16 +1281,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Set(myBluetoothIDs.compactMap { UUID(uuidString: $0) }).union(lights.compactMap { $0.bluetoothID })
     }
 
+    private var screenChanges = 0                        // a burst of display changes gets one rescan
+
     @objc private func screensChanged() {
-        findMonitors()
-        reapplyIfDimming()
-        rebuildMenuSoon()
+        reapplyIfDimming()                               // macOS resets the colors on a change: dim again at once
+        screenChanges += 1
+        let change = screenChanges
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard self.screenChanges == change else { return }   // more changes came: rescan after the last
+            self.findMonitors()
+            self.reapplyIfDimming()
+            self.rebuildMenuSoon()
+        }
     }
 
     // MARK: Dimming the picture in software (when the monitor can't dim itself)
 
     private var dimmingInSoftware = false               // as last applied
     private var dimWatch: Timer?                         // while dimming: puts it back if something resets it
+    private var softwareReadout: NSTextField?            // the software Brightness slider's "40%"
 
     /// Dimming in software before (this run, or before a restart, until the monitor answers again).
     private var wasDimming: Bool {
@@ -1300,13 +1310,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The menu's Brightness slider is the software one (the same rule as the menu).
     private var softwareSliderShowing: Bool {
         SoftwareDim.showing(answers: monitorAnswers, misses: monitorMisses, hdmiAdapter: monitorViaHDMIAdapter,
-                            wasDimming: wasDimming)
+                            noConnection: noMonitorConnection, wasDimming: wasDimming)
     }
 
     private var dimsInSoftware: Bool {
         SoftwareDim.applies(answers: monitorAnswers, misses: monitorMisses, hdmiAdapter: monitorViaHDMIAdapter,
-                            wasDimming: wasDimming)
+                            noConnection: noMonitorConnection, wasDimming: wasDimming)
     }
+
+    /// What dimming in software can do now, for the menu and the monitor check.
+    private var softwareDimState: SoftwareDimState {
+        guard softwareSliderShowing, !dimmableScreens.isEmpty else { return .off }
+        let dimmer = SoftwareDimmer.shared
+        if dimmableScreens.contains(where: { dimmer.canDim($0) }) { return dimmer.contested ? .paused : .on }
+        return dimmableScreens.contains(where: { dimmer.canRead($0) }) ? .cantDim : .unsupported
+    }
+
+    private var softwareDimLevel: Int { dimmableScreens.first.map { SoftwareDimmer.shared.savedLevel($0) } ?? 100 }
 
     /// External screens with a real cable (not DisplayLink or AirPlay, which have no color curves to change).
     private var dimmableScreens: [CGDirectDisplayID] {
@@ -1316,11 +1336,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Dims (or undims) the picture to match what the monitor said, after each read.
     private func updateSoftwareDimming() {
         guard monitorAnswers != nil else { return }        // not asked yet: reapplyIfDimming covers that time
+        let was = dimmingInSoftware
         dimmingInSoftware = dimsInSoftware
         if dimmingInSoftware || monitorAnswers == true {
             for display in dimmableScreens { SoftwareDimmer.shared.setActive(dimmingInSoftware, for: display) }
         }
-        if dimmingInSoftware { SoftwareDimmer.shared.reapply(on: dimmableScreens) } else { SoftwareDimmer.shared.undoAll() }
+        let dimmer = SoftwareDimmer.shared
+        switch (was, dimmingInSoftware) {
+        case (false, true): dimmer.fade(on: dimmableScreens, dimming: true)      // starting or stopping: a short fade
+        case (true, false): dimmer.fade(on: dimmableScreens, dimming: false)
+        case (true, true): dimmer.reapply(on: dimmableScreens)
+        case (false, false): dimmer.undoAll()
+        }
+        watchDimming()
+    }
+
+    /// At launch (also after an update) or when a monitor that was dimmed in software is
+    /// plugged in again: dim it straight away, rather than at full brightness until it's asked.
+    private func resumeSoftwareDimming() {
+        guard !dimmingInSoftware, dimmableScreens.contains(where: { SoftwareDimmer.shared.wasActive($0) }) else { return }
+        dimmingInSoftware = true
+        reapplyIfDimming()
         watchDimming()
     }
 
@@ -1366,6 +1402,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dimmingInSoftware = true
         watchDimming()
         let level = Int(slider.doubleValue.rounded())
+        softwareReadout?.stringValue = "\(level)%"
         for display in dimmableScreens { SoftwareDimmer.shared.set(level, on: display) }
         if wasContested { rebuildMenuSoon() }              // moving it tries again: drop the note
     }
@@ -1870,6 +1907,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Monitor (the logic is in Monitor.swift, the macOS calls in MonitorMac.swift)
 
+    private var monitorReadouts: [UInt8: NSTextField] = [:]   // each slider's "40%", by DDC code
+
+    /// No DDC connection at all (not even macOS's default): the monitor can't be asked.
+    private var noMonitorConnection: Bool { monitorCount == 0 && !monitorHasDefault }
+
     /// Finds the monitor's connection again (at launch and whenever screens
     /// change), then reads its brightness and contrast for the sliders.
     private func findMonitors() {
@@ -1891,12 +1933,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard self.monitorGeneration == generation else { return }
             self.readMonitor(ifOlderThan: 0)
         }
+        resumeSoftwareDimming()
     }
 
     /// Reads brightness and contrast in the background and moves the sliders to
     /// match, unless you've just moved one yourself.
     private func readMonitor(ifOlderThan seconds: TimeInterval) {
-        guard monitorCount > 0 || monitorHasDefault else { return }
+        if noMonitorConnection {
+            // Nothing to ask: a direct external screen counts as not answering, and is dimmed in software.
+            if monitorAnswers == nil && !dimmableScreens.isEmpty {
+                monitorWasRead([:], answers: false, started: Date(), generation: monitorGeneration)
+            }
+            return
+        }
         if let last = monitorReadAt, Date().timeIntervalSince(last) < seconds { return }
         let started = Date()
         monitorReadAt = started
@@ -1936,42 +1985,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         updateSoftwareDimming()
         if before != answers || monitorMisses == 2 { rebuildMenuSoon() }   // "isn't answering", or dimming in software
+        if !answers && monitorMisses == 1 && !dimmingInSoftware { askMonitorAgain(generation: generation) }
+    }
+
+    /// After a first miss, asks again in 10 seconds: a monitor that still doesn't answer is
+    /// then dimmed in software, rather than only once the menu is opened again.
+    private func askMonitorAgain(generation: Int) {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            guard self.monitorGeneration == generation, self.monitorMisses == 1 else { return }
+            self.readMonitor(ifOlderThan: 5)
+        }
     }
 
     private func addMonitor(to menu: NSMenu) {
         monitorSliders = [:]
-        let software = softwareSliderShowing && dimmableScreens.contains { SoftwareDimmer.shared.canDim($0) }
+        monitorReadouts = [:]
+        softwareReadout = nil
+        let software = softwareDimState
         let state = MonitorMenu.make(connections: monitorCount, hasDefault: monitorHasDefault,
                                      attached: monitorAttached, screens: monitorScreens, answers: monitorAnswers,
                                      hdmiAdapter: monitorViaHDMIAdapter, software: software)
         if let title = state.title { menu.addItem(label(title)) }
-        if state.sliders && software {
-            let level = dimmableScreens.first.map { SoftwareDimmer.shared.savedLevel($0) } ?? 100
-            menu.addItem(sliderItem("Brightness", range: 0...100, value: Double(level),
-                                    action: #selector(softwareDimMoved(_:))) { _ in })
+        if state.sliders && software != .off {
+            let level = softwareDimLevel
+            let item = sliderItem("Brightness", range: 0...100, value: Double(level),
+                                  action: #selector(softwareDimMoved(_:))) { _ in }
+            softwareReadout = addReadout(to: item)
+            softwareReadout?.stringValue = "\(level)%"
+            menu.addItem(item)
         } else if state.sliders {
             menu.addItem(monitorSlider("Brightness", code: DDCCode.brightness))
             if state.contrast { menu.addItem(monitorSlider("Contrast", code: DDCCode.contrast)) }
         }
         for line in state.hints { menu.addItem(hint(line)) }
-        if software && SoftwareDimmer.shared.contested {
-            menu.addItem(hint("Another app keeps changing the screen's colors"))
-            menu.addItem(hint("(f.lux?), so Hammer stopped. Move the slider to retry."))
-        }
         if state.offerCheck { menu.addItem(checkMonitorItem()) }
     }
 
     private func monitorSlider(_ title: String, code: UInt8) -> NSMenuItem {
-        sliderItem(title, range: 0...100, value: 50, action: #selector(monitorSliderMoved(_:))) { slider in
+        let item = sliderItem(title, range: 0...100, value: 50, action: #selector(monitorSliderMoved(_:))) { slider in
             slider.tag = Int(code)
-            if let value = monitorValues[code] { show(value, on: slider) }
             monitorSliders[code] = slider
         }
+        monitorReadouts[code] = addReadout(to: item)
+        if let value = monitorValues[code], let slider = monitorSliders[code] { show(value, on: slider) }
+        return item
+    }
+
+    /// The value on the right of a monitor slider's name ("Brightness   40%"), so you can
+    /// see where it is, and that it moves.
+    private func addReadout(to item: NSMenuItem) -> NSTextField? {
+        guard let view = item.view else { return nil }
+        let readout = NSTextField(labelWithString: "")
+        readout.frame = NSRect(x: 16, y: 28, width: 208, height: 16)
+        readout.alignment = .right
+        readout.textColor = .secondaryLabelColor
+        readout.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        view.addSubview(readout)
+        return readout
     }
 
     private func show(_ value: (current: UInt16, max: UInt16), on slider: NSSlider) {
         slider.maxValue = Double(Swift.max(1, value.max))
         slider.doubleValue = Double(value.current)
+        monitorReadouts[UInt8(slider.tag)]?.stringValue = MonitorMenu.readout(current: value.current, max: value.max)
     }
 
     @objc private func monitorSliderMoved(_ slider: NSSlider) {
@@ -1980,6 +2057,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         monitorMoved[code] = Date()
         sliderMoves.moved()
         monitorValues[code] = (current: value, max: UInt16(slider.maxValue.rounded()))
+        monitorReadouts[code]?.stringValue = MonitorMenu.readout(current: value, max: UInt16(slider.maxValue.rounded()))
         let set = monitors
         schedule("ddc-\(code)", on: ddcQueue, after: 0.05) {
             set.write(code: code, value: value)
@@ -1997,8 +2075,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenuSoon()
         let scan = MacMonitors.scan()
         ddcQueue.async {
-            let check = MacMonitors.check(scan)
+            let found = MacMonitors.check(scan)
             Task { @MainActor in
+                var check = found
+                check.softwareDim = self.softwareDimState      // what dimming in software was doing meanwhile
+                check.softwareDimLevel = self.softwareDimLevel
                 self.checkingMonitor = false
                 self.findMonitors()            // start fresh, in case something changed (e.g. DDC/CI turned on)
                 self.rebuildMenuSoon()
@@ -2010,7 +2091,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func showMonitorCheck(_ check: MonitorCheck) {
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
         let alert = NSAlert()
-        alert.messageText = check.verdict == .working ? "The monitor works with Hammer" : "Monitor check"
+        alert.messageText = check.title
         alert.informativeText = check.advice.joined(separator: "\n")
             + (check.testNote.map { "\n\n" + $0 } ?? "")
 
@@ -2029,7 +2110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         text.isEditable = false
         text.isSelectable = true
         text.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        text.string = check.text
+        text.string = check.details                     // the result and advice are above it
         scroll.documentView = text
         alert.accessoryView = scroll
 

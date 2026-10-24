@@ -9,25 +9,52 @@ import IOKit
 // MARK: - Private IOKit calls
 //
 // macOS has no public API for talking to a display over I²C on Apple Silicon.
-// These functions live inside IOKit but aren't in any header, so we declare
-// them ourselves. MonitorControl, m1ddc and BetterDisplay all use them.
+// These functions live inside IOKit but aren't in any header. MonitorControl,
+// m1ddc and BetterDisplay all use them. They're looked up when first used rather
+// than linked, so a macOS without one of them still opens Hammer (the monitor
+// then just doesn't answer, and Hammer dims the picture in software).
 
 typealias IOAVService = CFTypeRef
 
-/// macOS's default display connection: what plain `m1ddc set …` talks to.
-@_silgen_name("IOAVServiceCreate")
-func IOAVServiceCreate(_ allocator: CFAllocator?) -> Unmanaged<IOAVService>?
+enum AVServiceCalls {
+    private typealias Create = @convention(c) (UnsafeRawPointer?) -> UnsafeMutableRawPointer?
+    private typealias CreateWithService = @convention(c) (UnsafeRawPointer?, io_service_t) -> UnsafeMutableRawPointer?
+    private typealias TransferI2C = @convention(c) (UnsafeRawPointer, UInt32, UInt32, UnsafeMutableRawPointer, UInt32) -> Int32
 
-@_silgen_name("IOAVServiceCreateWithService")
-func IOAVServiceCreateWithService(_ allocator: CFAllocator?, _ service: io_service_t) -> Unmanaged<IOAVService>?
+    private static func lookUp<Function>(_ name: String, as type: Function.Type) -> Function? {
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), name) else { return nil }   // RTLD_DEFAULT
+        return unsafeBitCast(symbol, to: type)
+    }
+    private static let createFunction = lookUp("IOAVServiceCreate", as: Create.self)
+    private static let createWithServiceFunction = lookUp("IOAVServiceCreateWithService", as: CreateWithService.self)
+    private static let readFunction = lookUp("IOAVServiceReadI2C", as: TransferI2C.self)
+    private static let writeFunction = lookUp("IOAVServiceWriteI2C", as: TransferI2C.self)
+    private static let unsupported = Int32(bitPattern: 0xE00002C7)     // kIOReturnUnsupported
 
-@_silgen_name("IOAVServiceReadI2C")
-func IOAVServiceReadI2C(_ service: IOAVService, _ chipAddress: UInt32, _ offset: UInt32,
-                        _ buffer: UnsafeMutableRawPointer, _ size: UInt32) -> IOReturn
+    /// macOS's default display connection: what plain `m1ddc set …` talks to.
+    static func createDefault() -> IOAVService? {
+        guard let create = createFunction, let service = create(nil) else { return nil }
+        return Unmanaged<AnyObject>.fromOpaque(service).takeRetainedValue()
+    }
 
-@_silgen_name("IOAVServiceWriteI2C")
-func IOAVServiceWriteI2C(_ service: IOAVService, _ chipAddress: UInt32, _ dataAddress: UInt32,
-                         _ buffer: UnsafeMutableRawPointer, _ size: UInt32) -> IOReturn
+    /// The connection for one DCPAVServiceProxy in the registry.
+    static func create(for entry: io_service_t) -> IOAVService? {
+        guard let create = createWithServiceFunction, let service = create(nil, entry) else { return nil }
+        return Unmanaged<AnyObject>.fromOpaque(service).takeRetainedValue()
+    }
+
+    static func read(_ service: IOAVService, chip: UInt32, offset: UInt32,
+                     _ buffer: UnsafeMutableRawPointer, _ size: UInt32) -> Int32 {
+        guard let read = readFunction else { return unsupported }
+        return withExtendedLifetime(service) { read(Unmanaged.passUnretained(service).toOpaque(), chip, offset, buffer, size) }
+    }
+
+    static func write(_ service: IOAVService, chip: UInt32, offset: UInt32,
+                      _ buffer: UnsafeMutableRawPointer, _ size: UInt32) -> Int32 {
+        guard let write = writeFunction else { return unsupported }
+        return withExtendedLifetime(service) { write(Unmanaged.passUnretained(service).toOpaque(), chip, offset, buffer, size) }
+    }
+}
 
 /// One display connection's I²C, for DDCLink.
 final class AVServiceBus: DDCBus {
@@ -36,12 +63,12 @@ final class AVServiceBus: DDCBus {
 
     func write(chip: UInt32, offset: UInt32, _ bytes: [UInt8]) -> Int32 {
         var buffer = bytes
-        return IOAVServiceWriteI2C(service, chip, offset, &buffer, UInt32(buffer.count))
+        return AVServiceCalls.write(service, chip: chip, offset: offset, &buffer, UInt32(buffer.count))
     }
 
     func read(chip: UInt32, offset: UInt32, count: Int) -> (status: Int32, bytes: [UInt8]) {
         var buffer = [UInt8](repeating: 0, count: count)
-        let status = IOAVServiceReadI2C(service, chip, offset, &buffer, UInt32(count))
+        let status = AVServiceCalls.read(service, chip: chip, offset: offset, &buffer, UInt32(count))
         return (status, buffer)
     }
 
@@ -95,7 +122,7 @@ enum MacMonitors {
     static func scan() -> Scan {
         var scan = Scan()
         scan.screens = screens()
-        scan.defaultService = IOAVServiceCreate(kCFAllocatorDefault)?.takeRetainedValue()
+        scan.defaultService = AVServiceCalls.createDefault()
 
         let root = IORegistryGetRootEntry(kIOMainPortDefault)
         defer { IOObjectRelease(root) }
@@ -131,8 +158,7 @@ enum MacMonitors {
             if isConnection {
                 item.location = property(entry, "Location") as? String
                 item.provider = parentProperty(entry, "EPICProviderClass") as? String
-                if item.location == "External",
-                   let service = IOAVServiceCreateWithService(kCFAllocatorDefault, entry)?.takeRetainedValue() {
+                if item.location == "External", let service = AVServiceCalls.create(for: entry) {
                     scan.services[id] = service
                 }
             } else {
@@ -252,13 +278,14 @@ final class SoftwareDimmer {
     static let shared = SoftwareDimmer()
     private var original: [CGDirectDisplayID: GammaCurves] = [:]
     private var written: [CGDirectDisplayID: GammaCurves] = [:]   // what Hammer last put on each screen
-    private var resets: [CGDirectDisplayID: Int] = [:]            // times in a row something else changed them
-    private static let giveUpAfter = 3
+    private var writtenFactor: [CGDirectDisplayID: Double] = [:]  // ...and how much of the signal that kept
+    private var watches: [CGDirectDisplayID: DimWatch] = [:]      // whether something else keeps changing them
+    private var fadeID = 0                                        // bumps on every other change: a fade gives way
 
     /// Another app keeps changing a screen's curves (f.lux, another dimmer), so
     /// Hammer has stopped putting its dimming back on that screen.
-    var contested: Bool { resets.values.contains { $0 > Self.giveUpAfter } }
-    private func gaveUp(_ display: CGDirectDisplayID) -> Bool { (resets[display] ?? 0) > Self.giveUpAfter }
+    var contested: Bool { watches.values.contains { $0.gaveUp } }
+    private func gaveUp(_ display: CGDirectDisplayID) -> Bool { watches[display]?.gaveUp ?? false }
 
     /// The level saved for this screen's monitor (100: not dimmed).
     func savedLevel(_ display: CGDirectDisplayID) -> Int {
@@ -283,22 +310,33 @@ final class SoftwareDimmer {
     /// Whether this screen's picture can be dimmed (its curves can be read, and look like its own).
     func canDim(_ display: CGDirectDisplayID) -> Bool { currentOriginal(display) != nil }
 
+    /// Whether this screen's curves can be read at all (if they can but it still can't be
+    /// dimmed, another app's curves are on it).
+    func canRead(_ display: CGDirectDisplayID) -> Bool { read(display) != nil }
+
     /// Dims `display` to `level` (0–100), saving it. false if this screen can't be dimmed this way.
     @discardableResult
     func set(_ level: Int, on display: CGDirectDisplayID, save: Bool = true) -> Bool {
+        fadeID += 1                                      // this has the last word over a fade
         let level = min(100, max(0, level))
         if save {
             UserDefaults.standard.set(level, forKey: Self.key(display))
-            resets[display] = 0                          // you chose it: try again even if something fought it
+            watches[display] = nil                       // you chose it: try again even if something fought it
         }
         guard level < 100 else {
             undo(display)
             return true
         }
+        return apply(SoftwareDim.factor(level: level), on: display)
+    }
+
+    /// Dims to `factor` of the signal, from the screen's own curves.
+    private func apply(_ factor: Double, on display: CGDirectDisplayID) -> Bool {
         guard let base = currentOriginal(display) else { return false }
-        let dimmed = base.scaled(by: SoftwareDim.factor(level: level))
+        let dimmed = base.scaled(by: factor)
         guard write(dimmed, to: display) else { return false }
         written[display] = dimmed
+        writtenFactor[display] = factor
         return true
     }
 
@@ -309,45 +347,68 @@ final class SoftwareDimmer {
     }
 
     /// While dimming: if something reset a screen's curves (display sleep, a new color
-    /// profile), dim it again. If something keeps changing them (another app that
-    /// adjusts colors), stop after three times in a row rather than fight it.
+    /// profile), dim it again. If something keeps changing them (another app that adjusts
+    /// colors), stop rather than fight it, until that app's curves are gone (DimWatch).
     func keepApplied(on displays: [CGDirectDisplayID]) {
-        resets = resets.filter { displays.contains($0.key) }     // screens that are gone
+        watches = watches.filter { displays.contains($0.key) }   // screens that are gone
         for display in displays where savedLevel(display) < 100 {
-            if gaveUp(display) {
-                // Look, don't touch: once the other app lets go (its curves are gone), dim again.
-                guard let now = read(display), now.isScreensOwn else { continue }
-                resets[display] = 0
-                set(savedLevel(display), on: display, save: false)
-                continue
-            }
-            guard let mine = written[display] else {
-                set(savedLevel(display), on: display, save: false)   // never got to write yet: not anyone's fault
-                continue
-            }
-            if let now = read(display), now.matches(mine) {
-                resets[display] = 0
-                continue
-            }
-            resets[display] = (resets[display] ?? 0) + 1
-            if !gaveUp(display) { set(savedLevel(display), on: display, save: false) }
+            var watch = watches[display] ?? DimWatch()
+            let action = watch.check(now: read(display), written: written[display])
+            watches[display] = watch
+            if action == .dim { set(savedLevel(display), on: display, save: false) }
         }
+    }
+
+    /// Starts (`dimming`) or stops dimming in a few steps over about a quarter of a second,
+    /// rather than at once. It ends exactly as reapply or undoAll would; anything else that
+    /// sets a screen meanwhile (the slider, a wake) stops it and has the last word.
+    func fade(on displays: [CGDirectDisplayID], dimming: Bool) {
+        fadeID += 1
+        let id = fadeID
+        // Each screen's way, as how much of the signal is kept: from all of it to its level, or back.
+        let paths: [FadePath] = dimming
+            ? displays.filter { !gaveUp($0) && savedLevel($0) < 100 }
+                .map { FadePath(display: $0, from: 1, to: SoftwareDim.factor(level: savedLevel($0))) }
+            : writtenFactor.filter { isHammers($0.key) }.map { FadePath(display: $0.key, from: $0.value, to: 1) }
+        let steps = 5
+        Task { @MainActor in
+            for step in 1..<steps {
+                guard id == self.fadeID else { return }
+                for path in paths where dimming || self.isHammers(path.display) {
+                    _ = self.apply(path.from + (path.to - path.from) * Double(step) / Double(steps), on: path.display)
+                }
+                try? await Task.sleep(nanoseconds: 60_000_000)
+            }
+            guard id == self.fadeID else { return }
+            if dimming { self.reapply(on: displays) } else { self.undoAll() }
+        }
+    }
+
+    private struct FadePath { let display: CGDirectDisplayID; let from: Double; let to: Double }
+
+    /// The curves on the screen are still the ones Hammer put there.
+    private func isHammers(_ display: CGDirectDisplayID) -> Bool {
+        guard let mine = written[display], let now = read(display) else { return false }
+        return now.matches(mine)
     }
 
     /// Puts back a screen's original curves, if Hammer dimmed it and they're still
     /// Hammer's (if macOS or another app has changed them since, they're left alone).
     func undo(_ display: CGDirectDisplayID) {
-        if let mine = written[display], let base = original[display], let now = read(display), now.matches(mine) {
+        fadeID += 1
+        if let base = original[display], isHammers(display) {
             _ = write(base, to: display)
         }
         written[display] = nil
+        writtenFactor[display] = nil
         original[display] = nil                          // read afresh next time
     }
 
     /// Undoes the dimming on every screen Hammer dimmed (the monitor answers again).
     func undoAll() {
+        fadeID += 1
         for display in Array(written.keys) { undo(display) }
-        resets = [:]
+        watches = [:]
     }
 
     private func currentOriginal(_ display: CGDirectDisplayID) -> GammaCurves? {
@@ -379,8 +440,8 @@ final class SoftwareDimmer {
 
 /// `Hammer dim-check`: dims the main screen to half, then stands in for the things
 /// that change a screen's curves (macOS resetting them, another app dimming them)
-/// and checks Hammer dims from the right curves each time, never stacking; then
-/// puts everything back exactly. Run by the macOS build check. macOS can report
+/// and checks Hammer dims from the right curves each time, never stacking; fades
+/// out; then puts everything back exactly. Run by the macOS build check. macOS can report
 /// curves it didn't actually show, so the screen itself still needs a look on a real Mac.
 @MainActor
 func runDimCheck() -> Int32 {
@@ -409,6 +470,23 @@ func runDimCheck() -> Int32 {
     dimmer.set(50, on: display, save: false)
     check(dimmer.curvesNow(display).map { $0.matches(expected) } == true,
           "after another app dims them: half of the original, not of the other app's")
+    // Starting and stopping fade in a few steps; anything set meanwhile has the last word.
+    func wait(_ seconds: Double) {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end { _ = RunLoop.main.run(mode: .default, before: end) }
+    }
+    dimmer.set(50, on: display, save: false)
+    dimmer.fade(on: [display], dimming: false)
+    wait(0.1)
+    check(dimmer.curvesNow(display).map { !$0.matches(expected) && !$0.matches(before) } == true,
+          "fading out: partway after 0.1 s (top \(dimmer.curvesNow(display)?.r.last ?? -1))")
+    wait(0.5)
+    check(dimmer.curvesNow(display) == before, "fading out: then put back exactly")
+    dimmer.set(50, on: display, save: false)
+    dimmer.fade(on: [display], dimming: false)
+    dimmer.set(50, on: display, save: false)
+    wait(0.5)
+    check(dimmer.curvesNow(display).map { $0.matches(expected) } == true, "set during a fade: that wins")
     dimmer.set(100, on: display, save: false)
     check(dimmer.curvesNow(display) == before, "100%: put back exactly")
     if dimmer.curvesNow(display) != before { _ = dimmer.write(before, to: display) }

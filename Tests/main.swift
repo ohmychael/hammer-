@@ -548,7 +548,7 @@ expect(check.ports[0].change == .confirmed(from: 40, to: 60) && dell.values[0x10
        && dell.sets.map(\.value) == [60, 60, 40, 40] && check.ports[0].restored == true,
        "the change test moves brightness and puts it back")
 expect(check.ports[0].contrast?.reading?.current == 75, "reads contrast too")
-expect(check.text.contains("Result: Working. Hammer can read and change the DELL U3818DW's brightness.")
+expect(check.text.contains("Result: The DELL U3818DW works with Hammer\nHammer can read and change its brightness.")
        && check.text.contains("Mac: MacBookPro18,3 · Apple M1 Pro · macOS Version 15.1 (Build 24B83)")
        && check.text.contains("Screens: Built-in Retina Display (built in), DELL U3818DW")
        && check.text.contains("also DCPAVServiceProxy (Embedded)")
@@ -609,7 +609,7 @@ expect(check.verdict == .noMonitor && check.monitorName == "the monitor", "nothi
 check = runCheck([framebuffer(100, display: true), proxy(101, "Embedded")],
                  [builtIn, MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 900, direct: true)], [:])
 expect(check.verdict == .notFound && check.text.contains("External connections: 0 · also DCPAVServiceProxy (Embedded)")
-       && check.advice.first == "Result: macOS shows the DELL U3818DW, but Hammer can't find the connection it's on.",
+       && check.title == "Hammer can't find the DELL U3818DW's connection",
        "shown but no connection found")
 dell = FakeMonitor(); dell.writeStatus = Int32(bitPattern: 0xE00002BC)
 check = runCheck(airEntries, airScreens, [201: dell])
@@ -723,7 +723,8 @@ expect(check.verdict == .untested && check.ports[0].change == nil && dell.sets.i
        && check.text.contains("40 of 100 (reply had a wrong checksum)"), "a doubtful reading isn't used for the test")
 dell = FakeMonitor(); dell.supported = [0x12]
 check = runCheck(airEntries, airScreens, [201: dell])
-expect(check.verdict == .noBrightness && check.advice.joined().contains("no brightness setting"), "no brightness setting")
+expect(check.verdict == .noBrightness && check.title.contains("no brightness setting")
+       && check.advice.joined().contains("Uniformity Compensation"), "no brightness setting")
 
 // The check falls back to macOS's default connection only if no port answered.
 dell = FakeMonitor(); dell.ddcOn = false
@@ -756,7 +757,8 @@ expect(check.verdict == .noAnswer, "nothing seen attached, but connections sent 
 let dellScreen = MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 400, direct: true)
 let dlScreen = MonitorScreen(id: 3, name: "DELL U3818DW", builtIn: false, framebuffer: nil, direct: false)
 var state = MonitorMenu.make(connections: 2, attached: 0, screens: [builtIn], answers: nil)
-expect(state.title == "Dell not connected" && !state.sliders && !state.offerCheck, "menu: nothing plugged in")
+expect(state.title == "Dell not connected" && !state.sliders && state.hints == ["Plug it in with USB-C or DisplayPort."]
+       && state.offerCheck, "menu: nothing plugged in: one line, and the check")
 state = MonitorMenu.make(connections: 0, attached: 0, screens: [builtIn, dlScreen], answers: nil)
 expect(state.title == "Dell connected through DisplayLink or AirPlay" && !state.sliders && state.offerCheck, "menu: DisplayLink")
 state = MonitorMenu.make(connections: 0, attached: 0, screens: [builtIn, dellScreen], answers: nil)
@@ -844,12 +846,12 @@ expect(check.text.contains("Its ID info (EDID), from macOS: DELL U3818DW") && ch
        && check.text.contains("Its ID info (EDID) over the same wire: read fine")
        && check.advice.joined().contains("its control channel (DDC/CI) doesn't answer")
        && check.advice.joined().contains("not through a hub, dock or adapter")
-       && check.advice.joined().contains("Unplug the monitor's power cord for 10 seconds"), "the report says so:\n\(check.text)")
+       && check.advice.joined().contains("unplug its power cord for 10 seconds"), "the report says so:\n\(check.text)")
 dell = FakeMonitor(); dell.readStatus = avError; dell.edidReadStatus = avError
 check = runCheck(proUSBC, lidClosed, [301: dell])
 expect(check.verdict == .noAnswer && check.wireReads == false
        && check.text.contains("Its ID info (EDID) over the same wire: failed (error e0114103)")
-       && check.advice.first == "Result: Nothing comes back from the DELL U3818DW over this connection, not even its ID info (EDID)."
+       && check.advice.first == "Nothing comes back over this connection, not even its ID info (EDID)."
        && check.advice.joined().contains("Menu → Others → DDC/CI → On"),
        "nothing can be read back at all")
 dell = FakeMonitor(); dell.readStatus = avError; dell.edid = nil
@@ -860,13 +862,14 @@ expect(!dell.writes.contains { $0.chip == EDID.chip } && dell.reads.contains { $
 dell = FakeMonitor(); dell.readStatus = avError; dell.edidReadGarbage = true
 check = runCheck(proUSBC, lidClosed, [301: dell])
 expect(check.wireReads == nil && check.text.contains("over the same wire: came back, but not as expected")
-       && check.advice.first == "Result: Hammer sent messages to the DELL U3818DW, but it didn't answer.",
+       && check.title == "The DELL U3818DW doesn't answer Hammer"
+       && check.advice.first == "On the monitor: Menu → Others → DDC/CI → On. Then switch it off and on.",
        "something that isn't an EDID: inconclusive, the general advice")
 let convEntries = [framebuffer(400, "DELL U3818DW", display: true, transport: "DP → HDMI"),
                    proxy(401, provider: "AppleDCPMCDP29XX")]
 dell = FakeMonitor(); dell.chip = 0xB7; dell.readStatus = avError
 check = runCheck(convEntries, [MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 400, direct: true)], [401: dell])
-expect(check.ports[0].edidOverI2C == nil && check.verdict == .noAnswer && check.advice.joined().contains("1. On the monitor")
+expect(check.ports[0].edidOverI2C == nil && check.verdict == .noAnswer && check.advice.joined().contains("On the monitor: Menu → Others")
        && check.advice.joined().contains("Use USB-C rather than HDMI"), "through the M1 HDMI converter: no EDID probe")
 expect(check.ports[0].brightness.tries == 9,
        "converter: 3 ways × 2 on 0xB7, 0x37 refused after 2, one slow try on 0xB7")
@@ -901,6 +904,11 @@ expect(EDID.isValid(realEDID) && EDID.name(realEDID) == "DELL U3818DW", "EDID la
 var twoNames = realEDID
 twoNames.replaceSubrange(72..<90, with: [0, 0, 0, 0xFC, 0] + [UInt8](repeating: 0x20, count: 13))
 expect(EDID.name(twoNames) == "DELL U3818DW", "an empty name descriptor is skipped")
+var oddName = makeEDID("X")
+oddName.replaceSubrange(77..<90, with: [0x44, 0x45, 0xFF, 0x4C, 0x4C, 0x07, 0x20, 0x55, 0xC3, 0xA9, 0x33, 0x0A, 0x20])
+var junkName = makeEDID("X")
+junkName.replaceSubrange(77..<90, with: [UInt8](repeating: 0xFF, count: 13))
+expect(EDID.name(oddName) == "DELL U3" && EDID.name(junkName) == nil, "EDID names: printable ASCII only")
 
 // Which probes count: the port with the monitor.
 dell = FakeMonitor(); dell.readStatus = avError
@@ -909,6 +917,20 @@ let mixEntries = [framebuffer(300, "DELL U3818DW", display: true), proxy(301), f
 check = runCheck(mixEntries, [MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 300, direct: true)],
                  [301: dell, 501: deadEmpty])
 expect(check.wireReads == true, "the empty port's failed probe doesn't count against the Dell's")
+
+// macOS's default connection is usually the Dell's port again: if it says the same, one line.
+dell = FakeMonitor(); dell.readStatus = avError
+let sameAgain = FakeMonitor(); sameAgain.readStatus = avError
+check = MonitorCheck.run(mac: mac, screens: lidClosed, entries: proUSBC, bus: { $0 == 301 ? dell : nil },
+                         defaultBus: sameAgain, sleep: { _ in })
+expect(check.ports.count == 2 && check.details.contains("Tried last (macOS default connection): the same as above")
+       && check.details.components(separatedBy: "Read errors: e0114103 ×7").count == 2,
+       "the default connection saying the same: said once\n\(check.details)")
+let saysOther = FakeMonitor(); saysOther.ddcOn = false
+check = MonitorCheck.run(mac: mac, screens: lidClosed, entries: proUSBC, bus: { $0 == 301 ? dell : nil },
+                         defaultBus: saysOther, sleep: { _ in })
+expect(check.details.contains("Tried last (macOS default connection)\n  Its ID info") && !check.details.contains("the same as above"),
+       "the default connection saying something else: all of it\n\(check.details)")
 
 
 // MARK: Monitor: a USB-C to HDMI cable (what the user had)
@@ -927,7 +949,7 @@ dell = FakeMonitor(); dell.readStatus = avError; dell.edid = makeEDID("DELL U381
 check = runCheck(proUSBC, lidClosed, [301: dell])
 expect(check.verdict == .hdmiAdapter && check.ports[0].port.throughHDMIAdapter(onMac: mac.model)
        && check.text.contains("Its ID info (EDID), from macOS: DELL U3818DW, on its HDMI input")
-       && check.advice.joined(separator: " ").contains("a USB-C to USB-C cable into the monitor's USB-C port")
+       && check.advice.joined(separator: " ").contains("a USB-C to USB-C cable, or USB-C to DisplayPort")
        && check.advice.joined(separator: " ").contains("Input Source → USB Type-C"), "USB-C to HDMI cable:\n\(check.text)")
 dell = FakeMonitor(); dell.edid = makeEDID("DELL U3818DW", hdmi: true)
 check = runCheck(proUSBC, lidClosed, [301: dell])
@@ -945,6 +967,56 @@ expect(state.sliders && state.hints == ["The Dell is on HDMI from USB-C, which u
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: true, hdmiAdapter: true)
 expect(state.hints.isEmpty, "menu: an adapter that works isn't mentioned")
 
+// The check's window: the verdict as its title, two or three short lines of advice, and the
+// details below without the advice again. Copy Report and Terminal get all of it.
+func fake(_ setUp: (FakeMonitor) -> Void) -> FakeMonitor { let m = FakeMonitor(); setUp(m); return m }
+func belkinLikeEntries() -> [RegistryEntry] {
+    [framebuffer(300, "DELL U3818DW", display: true, transport: "DP → HDMI"), proxy(301, path: "IOService:/x/dcpext0@1/y")]
+}
+let everyVerdict = [
+    runCheck(airEntries, airScreens, [201: FakeMonitor()]),
+    runCheck(airEntries, airScreens, [201: fake { $0.values[0x10] = (0, 0) }]),
+    runCheck(airEntries, airScreens, [201: fake { $0.answerLimit = 2 }]),
+    runCheck(airEntries, airScreens, [201: fake { $0.applySets = false }]),
+    runCheck(airEntries, airScreens, [201: fake { $0.supported = [0x12] }]),
+    runCheck([], [builtIn], [:]),
+    runCheck([framebuffer(100, display: true), proxy(101, "Embedded"), framebuffer(300), proxy(301)], displayLink, [301: unplugged]),
+    runCheck([framebuffer(100, display: true), proxy(101, "Embedded")],
+             [builtIn, MonitorScreen(id: 2, name: "DELL U3818DW", builtIn: false, framebuffer: 900, direct: true)], [:]),
+    runCheck(airEntries, airScreens, [201: fake { $0.writeStatus = Int32(bitPattern: 0xE00002BC) }]),
+    runCheck(proEntries, proScreens, [301: empty, 401: fake { $0.chip = 0xB7; $0.writeStatus = Int32(bitPattern: 0xE0114000) }]),
+    runCheck(belkinLikeEntries(), lidClosed, [301: fake { $0.writeStatus = Int32(bitPattern: 0xE0114000) }]),
+    runCheck(proUSBC, lidClosed, [301: fake { $0.readStatus = avError; $0.edid = makeEDID("DELL U3818DW", hdmi: true) }]),
+    runCheck(proUSBC, lidClosed, [301: fake { $0.readStatus = avError }]),
+    runCheck(proUSBC, lidClosed, [301: fake { $0.readStatus = avError; $0.edidReadStatus = avError }]),
+    runCheck(airEntries, airScreens, [201: fake { $0.ddcOn = false; $0.edidReadGarbage = true }]),
+]
+expect(Set(everyVerdict.map { "\($0.verdict)" }).count == 11, "every verdict is covered")
+for found in everyVerdict {
+    expect((1...3).contains(found.advice.count) && !found.title.isEmpty && !found.title.hasPrefix("Result")
+           && found.advice.allSatisfy { $0.count <= 120 && !found.details.contains($0) }
+           && found.text.hasPrefix("Hammer monitor check\n\nResult: \(found.title)\n" + found.advice.joined(separator: "\n"))
+           && found.text.hasSuffix(found.details) && !found.details.contains("Result"),
+           "\(found.verdict): a title, a few short lines, said once:\n\(found.text)")
+}
+dell = FakeMonitor(); dell.readStatus = avError; dell.edid = makeEDID("DELL U3818DW", hdmi: true)
+check = runCheck(proUSBC, lidClosed, [301: dell])
+expect(check.title == "The DELL U3818DW is on HDMI through a USB-C adapter" && check.ports[0].edidOverI2C?.valid == true
+       && !check.details.contains("over the same wire"), "adapter: the EDID-over-the-wire line is left out (it says nothing new)")
+expect(!check.details.contains("Software dimming") && !check.advice.joined().contains("Meanwhile"),
+       "from Terminal: nothing said about dimming in software (it can't tell)")
+check.softwareDim = .on; check.softwareDimLevel = 40
+expect(check.advice.count == 4 && check.advice.last == "Meanwhile Hammer dims the picture in software (40%)."
+       && check.details.contains("External connections: 1\nSoftware dimming: on, at 40%"),
+       "dimming in software meanwhile: said, and in the report\n\(check.text)")
+check.softwareDim = .cantDim
+expect(!check.advice.joined().contains("Meanwhile")
+       && check.details.contains("Software dimming: needed, but another app is changing the colors"), "can't dim: the report says why")
+check = runCheck(airEntries, airScreens, [201: FakeMonitor()])
+check.softwareDim = .on
+expect(!check.advice.joined().contains("Meanwhile") && check.details.contains("Software dimming: on"),
+       "the monitor answers: nothing about \"meanwhile\" (Hammer stops dimming in software)")
+
 // What the user had next: a USB-C to DisplayPort adapter, then HDMI into the Dell. macOS calls
 // the link "DP → HDMI" (no M1 converter) and refuses to send (e0114000).
 let belkinEntries = [framebuffer(300, "DELL U3818DW", display: true, transport: "DP → HDMI"),
@@ -955,8 +1027,8 @@ let belkinAdvice = check.advice.joined(separator: "\n")
 expect(check.verdict == .hdmiAdapter && check.ports[0].port.throughHDMIAdapter(onMac: mac.model)
        && check.text.contains("DELL U3818DW (dcpext0, DP → HDMI)") && check.text.contains("Sent: no (error e0114000)"),
        "USB-C, then HDMI into the monitor, reported as DP → HDMI: the adapter case\n\(check.text)")
-expect(belkinAdvice.contains("plugged into one of its HDMI ports") && belkinAdvice.contains("plus the DisplayPort cable from the Dell's box, into its DP port")
-       && belkinAdvice.contains("Not a DisplayPort to HDMI cable") && !belkinAdvice.contains("This Mac's HDMI port")
+expect(check.title == "The DELL U3818DW is on HDMI through a USB-C adapter"
+       && belkinAdvice.contains("USB-C or DisplayPort port instead, not HDMI") && !belkinAdvice.contains("This Mac's HDMI port")
        && !belkinAdvice.contains("\n    "), // no indented lines: the check's window doesn't use a fixed-width font
        "says to use the monitor's DP or USB-C port, not that the Mac's own HDMI port is the problem:\n\(belkinAdvice)")
 // The same, but the monitor's ID info doesn't say which input: no guessing about adapters.
@@ -996,11 +1068,20 @@ expect(MonitorPort.hdmiLinkIsAdapter(onMac: "MacBookPro18,1") && MonitorPort.hdm
 expect(SoftwareDim.factor(level: 100) == 1 && SoftwareDim.factor(level: 0) == SoftwareDim.floor
        && abs(SoftwareDim.factor(level: 50) - 0.575) < 1e-9, "slider 0–100 → 15%–100% of the light")
 expect(SoftwareDim.factor(level: -20) == SoftwareDim.floor && SoftwareDim.factor(level: 250) == 1, "out-of-range levels are clamped")
-expect(SoftwareDim.floor >= 0.1, "never dark enough to lose the screen")
+expect(SoftwareDim.floor >= 0.1, "never fully dark")
 let dimCurve: [Float] = [0, 0.25, 0.5, 1]
 expect(SoftwareDim.scaled(dimCurve, by: 0.5) == [0, 0.125, 0.25, 0.5], "the curve scales down")
 expect(SoftwareDim.scaled(dimCurve, by: 1) == dimCurve, "100%: the curve as it was")
 expect(SoftwareDim.scaled([1.2, -0.1], by: 2) == [1, 0], "never outside 0…1, whatever comes in")
+expect(SoftwareDim.scaled(dimCurve, by: .nan) == dimCurve && SoftwareDim.scaled(dimCurve, by: .infinity) == dimCurve,
+       "a bad factor (NaN, infinity) doesn't dim at all")
+expect(SoftwareDim.scaled(dimCurve, by: 0) == SoftwareDim.scaled(dimCurve, by: SoftwareDim.floor)
+       && SoftwareDim.scaled(dimCurve, by: -1) == SoftwareDim.scaled(dimCurve, by: SoftwareDim.floor)
+       && SoftwareDim.scaled(dimCurve, by: 0).last! > 0.1, "0 or less: the floor, never black")
+expect(SoftwareDim.applies(answers: false, misses: 1, hdmiAdapter: false, noConnection: true)
+       && SoftwareDim.showing(answers: false, misses: 1, hdmiAdapter: false, noConnection: true, wasDimming: false)
+       && !SoftwareDim.applies(answers: nil, misses: 0, hdmiAdapter: false, noConnection: true),
+       "no connection to the monitor at all: dimmed in software at once")
 expect(SoftwareDim.key(vendor: 0x10AC, model: 0xD0D1, serial: 0x4C4C) == "softwareDim.10ac-d0d1-4c4c", "saved per monitor")
 expect(SoftwareDim.applies(answers: false, misses: 1, hdmiAdapter: true), "HDMI adapter, no answer: at once")
 expect(!SoftwareDim.applies(answers: false, misses: 1, hdmiAdapter: false)
@@ -1010,15 +1091,38 @@ expect(SoftwareDim.applies(answers: false, misses: 1, hdmiAdapter: false, wasDim
        "already dimming before a wake or replug: carries on at the first miss, stops once it answers")
 expect(!SoftwareDim.applies(answers: true, misses: 0, hdmiAdapter: true) && !SoftwareDim.applies(answers: nil, misses: 5, hdmiAdapter: true),
        "answers (or not asked yet): the monitor's own brightness")
-state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, hdmiAdapter: true, software: true)
+state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, hdmiAdapter: true, software: .on)
 expect(state.sliders && !state.contrast && state.offerCheck
-       && state.hints == ["Dimming the picture: Hammer can't reach the", "Dell through a USB-C to HDMI adapter."],
-       "menu, adapter: Brightness dims the picture, no Contrast, says why")
-state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, software: true)
-expect(state.sliders && !state.contrast && state.hints == ["Dimming the picture: the Dell isn't answering Hammer."],
+       && state.hints == ["Dimmed in software: the HDMI adapter blocks control"],
+       "menu, adapter: Brightness dims the picture, no Contrast, one line says why")
+state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, software: .on)
+expect(state.sliders && !state.contrast && state.hints == ["Dimmed in software: the Dell isn't answering"],
        "menu, no answer: the same")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: true)
 expect(state.sliders && state.contrast && state.hints.isEmpty, "menu, working: both sliders, no hint")
+state = MonitorMenu.make(connections: 0, attached: 0, screens: lidClosed, answers: nil)
+expect(state.title == "Can't find the Dell's connection" && !state.sliders, "no connection, not decided yet: says so")
+state = MonitorMenu.make(connections: 0, attached: 0, screens: lidClosed, answers: false, software: .on)
+expect(state.sliders && !state.contrast && state.title == nil && state.offerCheck
+       && state.hints == ["Dimmed in software: can't find the Dell's connection"], "no connection at all: dimmed in software")
+state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, hdmiAdapter: true, software: .paused)
+expect(state.sliders && !state.contrast && state.hints == ["Paused: another app keeps changing the colors"],
+       "paused for another app: one line; moving the slider tries again")
+state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, hdmiAdapter: true, software: .cantDim)
+expect(!state.sliders && state.title == nil && state.offerCheck && state.hints == ["Can't dim: another app is changing the colors"],
+       "can't dim (another app's curves on the screen): one line, no sliders that do nothing")
+state = MonitorMenu.make(connections: 1, attached: 1, screens: lidClosed, answers: false, software: .unsupported)
+expect(!state.sliders && state.hints == ["Can't dim this screen in software"], "a screen whose colors can't be changed: the same")
+for software in [SoftwareDimState.on, .paused, .cantDim, .unsupported] {
+    for (connections, adapter) in [(1, true), (1, false), (0, false)] {
+        let menu = MonitorMenu.make(connections: connections, attached: 1, screens: lidClosed, answers: false,
+                                    hdmiAdapter: adapter, software: software)
+        expect(menu.hints.count == 1 && menu.hints[0].count <= 54, "\(software): one short line (\(menu.hints))")
+    }
+}
+expect(MonitorMenu.readout(current: 40, max: 100) == "40%" && MonitorMenu.readout(current: 50, max: 200) == "25%"
+       && MonitorMenu.readout(current: 120, max: 100) == "100%" && MonitorMenu.readout(current: 5, max: 0) == "",
+       "the sliders' readouts")
 
 // Which slider shows: before the monitor is asked again (after a wake or replug), whatever was in use.
 expect(SoftwareDim.showing(answers: nil, misses: 0, hdmiAdapter: false, wasDimming: true)
@@ -1041,6 +1145,44 @@ expect(!GammaCurves(r: ramp(256), g: ramp(256, top: 0.8), b: ramp(256, top: 0.5)
 expect(!GammaCurves(r: ramp(256), g: [Float](repeating: 0, count: 256), b: ramp(256)).isScreensOwn
        && !GammaCurves(r: [1], g: [1], b: [1]).isScreensOwn && !GammaCurves(r: [], g: [], b: []).isScreensOwn,
        "nor a zeroed or empty one")
+expect(!ownCurves.scaled(by: SoftwareDim.factor(level: 89)).isScreensOwn
+       && !ownCurves.scaled(by: SoftwareDim.factor(level: 96)).isScreensOwn,
+       "Hammer's own dimming at 89–96 isn't taken for a screen's own")
+
+// Watching the screen while dimming: put back after a reset, but never fight another app.
+let mine = ownCurves.scaled(by: SoftwareDim.factor(level: 40))
+var watch = DimWatch()
+expect(watch.check(now: ownCurves, written: nil) == .dim, "nothing written yet: dim")
+expect(watch.check(now: mine, written: mine) == .leave && watch.resets == 0, "still Hammer's: leave it")
+expect(watch.check(now: ownCurves, written: mine) == .dim && watch.resets == 1, "reset once (display sleep): dim again")
+expect(watch.check(now: mine, written: mine) == .leave && watch.resets == 0, "and it holds")
+let nearOwn = GammaCurves(r: ramp(256), g: ramp(256, top: 0.99), b: ramp(256, top: 0.97))
+expect(nearOwn.isScreensOwn, "an app's curves can look like a screen's own")
+var actions = (0..<4).map { _ in watch.check(now: nearOwn, written: mine) }
+expect(actions == [.dim, .dim, .dim, .leave] && watch.gaveUp && watch.rival == nearOwn,
+       "something keeps changing them: three tries, then stop")
+actions = (0..<30).map { _ in watch.check(now: nearOwn, written: mine) }
+expect(actions.allSatisfy { $0 == .leave } && watch.gaveUp, "while its curves stay: Hammer stays out (no flicker every 10 s)")
+let driftA = GammaCurves(r: ramp(256), g: ramp(256), b: ramp(256, top: 0.8))
+let driftB = GammaCurves(r: ramp(256), g: ramp(256), b: ramp(256, top: 0.9))
+actions = (0..<10).map { i in watch.check(now: i % 2 == 0 ? driftA : driftB, written: mine) }
+expect(actions.allSatisfy { $0 == .leave } && watch.gaveUp, "curves that keep moving: the other app is still at it")
+actions = (0..<3).map { _ in watch.check(now: ownCurves, written: mine) }
+expect(actions == [.leave, .leave, .dim] && !watch.gaveUp && watch.resets == 0,
+       "the other app let go (the screen's own curves, steady for three checks): dim again")
+let flux = GammaCurves(r: ramp(256), g: ramp(256, top: 0.8), b: ramp(256, top: 0.5))
+watch = DimWatch()
+for _ in 0..<4 { _ = watch.check(now: flux, written: mine) }
+actions = (0..<5).map { _ in watch.check(now: flux, written: mine) }
+expect(watch.gaveUp && watch.rival == flux && actions.allSatisfy { $0 == .leave }, "f.lux's curves: stopped, and stays stopped")
+actions = (0..<5).map { _ in watch.check(now: nil, written: mine) }
+expect(actions.allSatisfy { $0 == .leave } && watch.calm == 0 && watch.gaveUp, "curves that can't be read: nothing changes")
+actions = (0..<3).map { _ in watch.check(now: profile2, written: mine) }
+expect(actions == [.leave, .leave, .dim], "f.lux quit and the profile is back: dim again")
+watch = DimWatch()
+for _ in 0..<4 { _ = watch.check(now: nil, written: mine) }
+actions = (0..<3).map { _ in watch.check(now: ownCurves, written: mine) }
+expect(actions == [.leave, .leave, .dim], "unreadable for a while, then the screen's own: dim again")
 let resampled = GammaCurves(r: ramp(1024), g: ramp(1024), b: ramp(1024)).scaled(by: SoftwareDim.factor(level: 50))
 expect(halfDim.matches(resampled), "the same curves handed back with more steps still match")
 expect(!halfDim.matches(ownCurves) && !halfDim.matches(ownCurves.scaled(by: 0.6)), "different curves don't")
