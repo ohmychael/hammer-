@@ -119,6 +119,23 @@ jobs:
           pkill -x Hammer || true
           ! grep -q "stopped" /tmp/launch.txt
 
+      - name: Tour (every menu, submenu and dialog, as pictures; plain and with stand-in data)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: |
+          set +e
+          pkill -x Hammer; sleep 1
+          app=~/Applications/Hammer.app/Contents/MacOS/Hammer
+          perl -e 'alarm shift; exec @ARGV' 120 "$app" tour /tmp/player-shots/tour > /tmp/tour.txt 2>&1
+          echo "exit $?" >> /tmp/tour.txt
+          pkill -x Hammer; sleep 1
+          perl -e 'alarm shift; exec @ARGV' 120 "$app" tour /tmp/player-shots/tour --demo >> /tmp/tour.txt 2>&1
+          echo "exit $?" >> /tmp/tour.txt
+          pkill -x Hammer
+          cat /tmp/tour.txt
+          ls /tmp/player-shots/tour
+          [ "$(grep -c '^exit 0$' /tmp/tour.txt)" = 2 ]
+
       - name: YouTube player check (loads a real video, pops it out, takes pictures)
         timeout-minutes: 4
         run: |
@@ -153,8 +170,8 @@ jobs:
         env:
           TOKEN: ${{ github.token }}
         run: |
-          ls /tmp/player-shots/*.png >/dev/null 2>&1 || exit 0
-          cp /tmp/player.txt /tmp/edge.txt /tmp/player-shots/ 2>/dev/null || true
+          find /tmp/player-shots -name '*.png' 2>/dev/null | grep -q . || exit 0
+          cp /tmp/player.txt /tmp/edge.txt /tmp/tour.txt /tmp/player-shots/ 2>/dev/null || true
           cd /tmp/player-shots
           git init -q && git checkout -q -b ci-screenshots
           git add -A
@@ -185,7 +202,7 @@ jobs:
             [ -f "$log" ] || continue
             { grep -E "error:" "$log" || true; } | head -10 | while IFS= read -r line; do echo "::error::$line"; done
           done
-          for file in /tmp/launch.txt /tmp/player.txt /tmp/edge.txt /tmp/dim.txt /tmp/check.txt /tmp/install1.log /tmp/req1.txt /tmp/sign2.log /tmp/req2.txt /tmp/ps.log; do
+          for file in /tmp/launch.txt /tmp/tour.txt /tmp/player.txt /tmp/edge.txt /tmp/dim.txt /tmp/check.txt /tmp/install1.log /tmp/req1.txt /tmp/sign2.log /tmp/req2.txt /tmp/ps.log; do
             [ -f "$file" ] || continue
             body="$(tail -40 "$file" | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
             echo "::notice title=$(basename "$file")::$body"

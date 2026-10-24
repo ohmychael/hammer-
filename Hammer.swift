@@ -1047,6 +1047,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let goveeQueue = DispatchQueue(label: "Hammer.govee")   // one light command at a time
     private var pending: [String: DispatchWorkItem] = [:]            // latest value per slider
 
+    /// `Hammer tour <folder> [--demo]`: screenshots of every menu and window (TourMac below).
+    static var tour: (folder: URL, demo: Bool)?
+    private var tourDemo: Bool { Self.tour?.demo == true }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "hammer", accessibilityDescription: "Hammer")
@@ -1065,7 +1069,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let delegate = self else { return }
             Task { @MainActor in delegate.rebuildMenuSoon() }
         }
-        DeliveryWatcher.shared.start()       // checks Gmail for deliveries, if set up
+        if !tourDemo { DeliveryWatcher.shared.start() }   // checks Gmail for deliveries, if set up
         scheduleUpdateChecks()
         rescanLights()                       // also builds the menu
 
@@ -1079,6 +1083,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
                                                name: NSApplication.didChangeScreenParametersNotification,
                                                object: nil)
+        if Self.tour != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.startTour() }
+        }
     }
 
     /// Opening Hammer again (from Apps, Spotlight or Finder) shows its menu
@@ -1262,6 +1269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func bluetoothChanged() {
+        guard !tourDemo else { return }                  // the tour's stand-in lights stay
         bluetoothLights = GoveeBluetooth.shared.lights
         GoveeBluetooth.shared.hold(heldBluetoothIDs)
         rebuildMenuSoon()
@@ -2043,7 +2051,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         goveeQueue.async {
             let found = Govee.discover()
             Task { @MainActor in
-                self.networkLights = found
+                if !self.tourDemo { self.networkLights = found }
                 self.searchingForLights = false
                 self.rebuildMenu()
             }
@@ -2658,6 +2666,16 @@ enum Hammer {
             case "dim-check": exit(runDimCheck())
             case "player-check": PlayerCheck.run(args)
             case "edge-check": EdgeCheck.run()
+            case "tour":
+                guard args.count >= 2 else { print("usage: Hammer tour <folder> [--demo]"); exit(2) }
+                let demo = args.contains("--demo")
+                // The stand-in data goes into Hammer's settings, so only on a build server.
+                if demo && ProcessInfo.processInfo.environment["CI"] != "true" {
+                    print("--demo only runs on a build server (it would change your settings).")
+                    exit(2)
+                }
+                AppDelegate.tour = (URL(fileURLWithPath: args[1]), demo)
+                if demo { AppDelegate.writeTourDeliveries() }
             case "govee": exit(runGoveeCommand(Array(args.dropFirst())))
             default: break
             }
@@ -2768,5 +2786,138 @@ enum Hammer {
             print("Done.")
         }
         return 0
+    }
+}
+
+// MARK: - Tour (`Hammer tour <folder> [--demo]`, run by the macOS build check)
+
+/// Opens the real menu, each submenu, the dialogs and the YouTube dropdown, and
+/// takes a screenshot of each, so the build check shows what Hammer looks like.
+/// `--demo` (build servers only) first fills in stand-in lights, a monitor that
+/// can only be dimmed in software, and a few deliveries, like the real setup.
+extension AppDelegate {
+    private struct TourStep {
+        let name: String
+        let wait: Double                    // seconds before the picture
+        let open: () -> Void
+        let close: () -> Void
+    }
+
+    /// Stand-in deliveries, written before Hammer starts (build servers only).
+    static func writeTourDeliveries() {
+        let now = Date()
+        let deliveries = [
+            Delivery(kind: .delivered, store: "eBay", item: "Belkin USB-C to DisplayPort Adapter", subject: "",
+                     messageID: "<tour1@example.com>", date: now.addingTimeInterval(-3600), uid: 1),
+            Delivery(kind: .delivered, store: "Amazon", item: "Anker 735 Charger", subject: "",
+                     messageID: "<tour2@example.com>", date: now.addingTimeInterval(-86_400 * 2), uid: 2),
+            Delivery(kind: .problem, store: "UPS", item: "Delivery attempted", subject: "",
+                     messageID: "<tour3@example.com>", date: now.addingTimeInterval(-86_400 * 3), uid: 3),
+        ]
+        UserDefaults.standard.set("appPassword", forKey: "deliverySource")
+        UserDefaults.standard.set("you@gmail.com", forKey: "deliveryEmail")
+        if let data = try? JSONEncoder().encode(deliveries) { UserDefaults.standard.set(data, forKey: "recentDeliveries") }
+    }
+
+    private func applyTourDemo() {
+        networkLights = [
+            GoveeLight(id: "D1:7A:A4:C1:38:42:11:90", sku: "H6159", name: "Desk Strip", lanIP: "192.168.1.40"),
+            GoveeLight(id: "C3:12:A4:C1:38:9B:20:4E", sku: "H6006", name: "Bedroom Bulb", lanIP: nil),
+            GoveeLight(id: "A8:55:A4:C1:38:61:7F:02", sku: "H6006", name: "Hallway Bulb", lanIP: nil),
+        ]
+        let nearby = UUID(uuidString: "6F1C2B9A-5D3E-4A7B-9C10-2E8F4D6A1B3C")!
+        bluetoothLights = [GoveeLight(id: nearby.uuidString, sku: "H6006", name: "H6006", lanIP: nil, bluetoothID: nearby)]
+        searchingForLights = false
+        // The Dell on HDMI through a USB-C adapter: it doesn't answer, so the picture is dimmed.
+        monitorCount = 1
+        monitorAttached = 1
+        monitorViaHDMIAdapter = true
+        monitorAnswers = false
+        monitorMisses = 1
+        monitorScreens = [MonitorScreen(id: CGMainDisplayID(), name: "DELL U3818DW", builtIn: false,
+                                        framebuffer: 300, direct: true)]
+        dimmingInSoftware = true
+        rebuildMenu()
+    }
+
+    func startTour() {
+        guard let tour = Self.tour else { return }
+        try? FileManager.default.createDirectory(at: tour.folder, withIntermediateDirectories: true)
+        if tour.demo { applyTourDemo() }
+        let prefix = tour.demo ? "demo" : "plain"
+        var steps: [TourStep] = []
+
+        // The menu, as you see it when you click the hammer.
+        steps.append(TourStep(name: "\(prefix)-01-menu", wait: 1.5,
+                              open: { [weak self] in self?.statusItem.button?.performClick(nil) },
+                              close: { [weak self] in self?.statusItem.menu?.cancelTracking() }))
+        // Each submenu, opened on its own near the menu bar.
+        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1024, height: 740)
+        let spot = NSPoint(x: screen.maxX - 330, y: screen.maxY - 8)
+        var number = 2
+        for item in statusItem.menu?.items ?? [] {
+            guard let submenu = item.submenu else { continue }
+            let title = item.title.isEmpty ? "item" : item.title
+            let safe = String(title.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" })
+            steps.append(TourStep(name: String(format: "\(prefix)-%02d-sub-\(safe)", number), wait: 1.2,
+                                  open: {
+                                      item.submenu = nil            // a menu can only be in one place
+                                      submenu.popUp(positioning: nil, at: spot, in: nil)
+                                      item.submenu = submenu
+                                  },
+                                  close: { submenu.cancelTracking() }))
+            number += 1
+        }
+        if tour.demo {
+            // Dialogs.
+            let modalClose = { if NSApp.modalWindow != nil { NSApp.abortModal() } }
+            steps.append(TourStep(name: "demo-20-turn-on-at", wait: 2,
+                                  open: { [weak self] in self?.setTurnOnTime() }, close: modalClose))
+            steps.append(TourStep(name: "demo-21-rename", wait: 2, open: { [weak self] in
+                let item = NSMenuItem()
+                item.representedObject = self?.lights.first?.id
+                self?.renameLight(item)
+            }, close: modalClose))
+            steps.append(TourStep(name: "demo-22-delivery-setup", wait: 2,
+                                  open: { [weak self] in self?.setUpDeliveries() }, close: modalClose))
+        } else {
+            steps.append(TourStep(name: "plain-20-monitor-check", wait: 12,
+                                  open: { [weak self] in self?.checkMonitor() },
+                                  close: { if NSApp.modalWindow != nil { NSApp.abortModal() } }))
+            steps.append(TourStep(name: "plain-21-youtube-dropdown", wait: 12,
+                                  open: { [weak self] in self?.player.showDropdown() },
+                                  close: { [weak self] in self?.player.putAway() }))
+        }
+        runTour(steps)
+    }
+
+    private func runTour(_ steps: [TourStep]) {
+        guard let step = steps.first, let folder = Self.tour?.folder else {
+            print("Tour finished.")
+            exit(0)
+        }
+        let rest = Array(steps.dropFirst())
+        // A timer in every run loop mode, so it fires while a menu or dialog is up.
+        let timer = Timer(timeInterval: step.wait, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                Self.screenshot(folder.appendingPathComponent(step.name + ".png"))
+                print("  \(step.name)")
+                fflush(stdout)
+                step.close()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    Task { @MainActor in self?.runTour(rest) }
+                }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        step.open()                                   // returns at once, or once the menu or dialog is closed
+    }
+
+    nonisolated private static func screenshot(_ url: URL) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        task.arguments = ["-x", url.path]
+        try? task.run()
+        task.waitUntilExit()
     }
 }
