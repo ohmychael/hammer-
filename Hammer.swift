@@ -2795,6 +2795,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateMacWake(from current: MacWake.Event?, to wanted: MacWake.Event?) {
         hammerWake = current                          // saves one worked out from older settings
         wakeBlocked = false
+        guard current != nil || wanted != nil else { return }
         wakeQueue.async { [weak self] in
             guard let schedule = Self.pmsetSchedule() else { return }
             let plan = MacWake.plan(current: current, wanted: wanted, schedule: schedule, now: Date())
