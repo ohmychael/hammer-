@@ -9,12 +9,21 @@
 import AppKit
 import WebKit
 
-/// A panel that can take typing (YouTube's search box) and closes on Escape.
+/// A panel that can take typing (YouTube's search box) and closes on Escape or ⌘W.
 final class PlayerPanel: NSPanel {
     var onEscape: (() -> Void)?
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
     override func cancelOperation(_ sender: Any?) { onEscape?() }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.type == .keyDown, event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+           event.charactersIgnoringModifiers?.lowercased() == "w", let onEscape {
+            onEscape()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 
     /// Rounded, shadowed, no title or traffic lights; the content fills it.
     static func make(resizable: Bool, activating: Bool) -> PlayerPanel {
@@ -34,6 +43,24 @@ final class PlayerPanel: NSPanel {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isMovable = resizable
         return panel
+    }
+}
+
+extension NSScreen {
+    /// The screen with the pointer: YouTube opens where you're working, which may not be
+    /// the screen with the menu bar icon.
+    static var withPointer: NSScreen? {
+        let point = NSEvent.mouseLocation
+        return screens.first { NSMouseInRect(point, $0.frame, false) }
+    }
+}
+
+/// Says when the light or dark look changes (the glass's tint follows it).
+private final class AppearanceView: NSView {
+    var onChange: (() -> Void)?
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        onChange?()
     }
 }
 
@@ -63,7 +90,9 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         + "(KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
 
     private let anchor: () -> (screen: NSScreen?, iconFrame: NSRect?)   // the menu bar icon: its screen and where it is
-    private let web: WKWebView
+    /// The page, while there is one: made when it's first needed, and let go (its memory
+    /// and its web process with it) after a long time put away or when you switch to Edge.
+    private var webView: WKWebView?
     private let dropdown = PlayerPanel.make(resizable: true, activating: true)
     private let mini = PlayerPanel.make(resizable: true, activating: false)
     private let webHolder = NSView()                     // the web view's place in the dropdown
@@ -78,7 +107,9 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
     private var clickMonitor: Any?
     private var loaded = false
     private var popOutPending = false
+    private var popOutGeneration = 0                     // each pop-out's own; an older one's time limit can't end a newer one
     private var idleGeneration = 0
+    private var stayPutUntil = Date.distantPast         // just paused it: a late "playing" from the page doesn't pop it out
     private let sizeKey = "playerDropdownSize"
     /// The dropdown's size as you last left it.
     private var dropdownSize: CGSize {
@@ -89,6 +120,22 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
 
     init(anchor: @escaping () -> (screen: NSScreen?, iconFrame: NSRect?)) {
         self.anchor = anchor
+        super.init()
+        buildDropdown()
+        buildMini()
+        NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
+                                               name: NSApplication.didChangeScreenParametersNotification, object: nil)
+    }
+
+    /// The page, made if there isn't one yet.
+    private var web: WKWebView {
+        if let webView { return webView }
+        let made = makeWebView()
+        webView = made
+        return made
+    }
+
+    private func makeWebView() -> WKWebView {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()                 // stays signed in between launches
         config.mediaTypesRequiringUserActionForPlayback = []
@@ -99,9 +146,8 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
             config.userContentController.addUserScript(
                 WKUserScript(source: script, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: .defaultClient))
         }
-        web = WKWebView(frame: NSRect(x: 0, y: 0, width: 420, height: 660), configuration: config)
-        super.init()
         config.userContentController.add(WeakScriptHandler(self), contentWorld: .defaultClient, name: "hammer")
+        let web = WKWebView(frame: NSRect(x: 0, y: 0, width: 420, height: 660), configuration: config)
         web.customUserAgent = Self.userAgent
         // See-through, so the glass shows behind YouTube (the page's own background is cleared too).
         if web.responds(to: NSSelectorFromString("_setDrawsBackground:")) || web.responds(to: NSSelectorFromString("setDrawsBackground:")) {
@@ -112,13 +158,35 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         web.navigationDelegate = self
         web.uiDelegate = self
         web.autoresizingMask = [.width, .height]
-        buildDropdown()
-        buildMini()
-        NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
-                                               name: NSApplication.didChangeScreenParametersNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(appResigned),
-                                               name: NSApplication.didResignActiveNotification, object: nil)
+        return web
     }
+
+    /// Lets the page go: nothing of it is left to go back to, and its memory and web
+    /// process are freed. The next open starts afresh at YouTube's home page.
+    private func unloadPage() {
+        guard let old = webView else { return }
+        webView = nil
+        old.stopLoading()
+        old.navigationDelegate = nil
+        old.uiDelegate = nil
+        old.configuration.userContentController.removeAllScriptMessageHandlers()
+        old.removeFromSuperview()
+        loaded = false
+        playing = false
+        hasVideo = false
+        ad = false
+        title = ""
+        titleLabel.stringValue = "YouTube"
+        backButton.isEnabled = false
+        popOutButton.isEnabled = false
+        overlay.setAd(false)
+        overlay.setPlaying(false)
+        onChange?()
+    }
+
+    /// Whether the page is there, and what Back goes back to (for the self-test).
+    var hasPage: Bool { webView != nil }
+    var backHistory: [URL] { webView?.backForwardList.backList.map(\.url) ?? [] }
 
     /// PlayerScript.js: in the app's Resources (build.sh puts it there).
     static var scriptURL: URL? {
@@ -127,9 +195,10 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         return nil
     }
 
-    /// Runs JavaScript in Hammer's world in the page (where PlayerScript.js lives).
+    /// Runs JavaScript in Hammer's world in the page (where PlayerScript.js lives). No page: nothing to run.
     private func run(_ script: String, inPage: Bool = false, done: ((Any?) -> Void)? = nil) {
-        web.evaluateJavaScript(script, in: nil, in: inPage ? .page : .defaultClient) { result in
+        guard let webView else { done?(nil); return }
+        webView.evaluateJavaScript(script, in: nil, in: inPage ? .page : .defaultClient) { result in
             done?(try? result.get())
         }
     }
@@ -151,7 +220,7 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
 
     /// YouTube's own full-screen view has the web view: leave the windows alone.
     private var inFullScreen: Bool {
-        if #available(macOS 13, *) { return web.fullscreenState != .notInFullscreen }
+        if #available(macOS 13, *), let webView { return webView.fullscreenState != .notInFullscreen }
         return false
     }
 
@@ -179,7 +248,7 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
 
     // MARK: Showing and hiding
 
-    /// Control-Option-Y and the menu: open the dropdown; close it (a playing video
+    /// The shortcut and the menu: open the dropdown; close it (a playing video
     /// pops out); from the mini player, back to the dropdown.
     func toggle() {
         guard !inFullScreen else { return }
@@ -204,7 +273,9 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         }
         run("window.__hammer && window.__hammer.mini(false)")   // always the full page here
         attachWeb(to: webHolder)
-        let visible = (anchor().screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        // On the screen you're working on (the one with the pointer), else the menu bar icon's.
+        let screen = NSScreen.withPointer ?? anchor().screen ?? NSScreen.main
+        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let frame = PlayerGeometry.dropdown(size: dropdownSize, visible: visible)     // flush in the top-right corner
         if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
         dropdown.setFrame(frame.offsetBy(dx: 0, dy: 10), display: false)
@@ -228,38 +299,44 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         if playing { popOut() } else { hideAll() }
     }
 
-    /// Pops the video out into the floating mini player, if there is one.
+    /// Pops the video out into the floating mini player, if there is one: from the
+    /// dropdown, or when a video starts playing with no window (you closed the dropdown
+    /// before it began).
     func popOut() {
-        guard place == .dropdown, !popOutPending else { return }
+        guard place == .dropdown || place == .hidden, !popOutPending else { return }
         popOutPending = true
+        popOutGeneration += 1
+        let generation = popOutGeneration
         run("window.__hammer ? window.__hammer.mini(true) : false") { result in
             let hadVideo = (result as? Bool) == true
-            Task { @MainActor [weak self] in self?.finishPopOut(hadVideo: hadVideo) }
+            Task { @MainActor [weak self] in self?.finishPopOut(generation, hadVideo: hadVideo) }
         }
         // If the page doesn't answer (it hung), close anyway.
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
-            self?.finishPopOut(hadVideo: false)
+            self?.finishPopOut(generation, hadVideo: false)
         }
     }
 
-    private func finishPopOut(hadVideo: Bool) {
-        guard popOutPending else { return }                  // already done (answer or time-out)
+    private func finishPopOut(_ generation: Int, hadVideo: Bool) {
+        guard popOutPending, generation == popOutGeneration else { return }   // done already, or a newer one is on
         popOutPending = false
-        guard place == .dropdown, hadVideo else {
-            run("window.__hammer && window.__hammer.mini(false)")
+        guard place == .dropdown || place == .hidden, hadVideo else {
+            // No video to show it in (or the page didn't answer): nothing may play with no window.
+            stayPutUntil = Date().addingTimeInterval(2)
+            run("window.__hammer && (window.__hammer.pause(), window.__hammer.mini(false))")
             if place == .dropdown { hideAll() }
             return
         }
         attachWeb(to: mini.contentView!, below: overlay)
-        let visible = (dropdown.screen ?? NSScreen.main)?.visibleFrame ?? .zero
+        let visible = (dropdown.screen ?? NSScreen.withPointer ?? NSScreen.main)?.visibleFrame ?? .zero
         let frame = miniFrame.map { PlayerGeometry.snap($0, in: visible) } ?? PlayerGeometry.miniDefault(visible: visible)
         mini.setFrame(frame, display: true)
         mini.orderFrontRegardless()
         dropdown.orderOut(nil)
         watchOutsideClicks(false)
         place = .mini
-        NSApp.deactivate()                                   // back to what you were doing
+        if NSApp.isActive { NSApp.deactivate() }             // back to what you were doing
         overlay.flash()
         onChange?()
     }
@@ -272,22 +349,27 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
     /// Where the dropdown is (for the self-test).
     var dropdownFrame: NSRect { dropdown.frame }
 
-    /// Pauses and closes both windows (you switched to YouTube in Edge).
+    /// Puts both windows away and lets the page go (you switched to YouTube in Edge).
     func putAway() {
+        stayPutUntil = Date().addingTimeInterval(2)
         run("window.__hammer && (window.__hammer.pause(), window.__hammer.mini(false))")
         if place != .hidden { hideAll() }
+        unloadPage()
     }
 
-    /// The mini player's ✕: pauses and puts it away.
+    /// The mini player's ✕ (and Esc): pauses and puts it away.
     func closeMini() {
+        stayPutUntil = Date().addingTimeInterval(2)
         run("window.__hammer && (window.__hammer.pause(), window.__hammer.mini(false))")
         hideAll()
     }
 
     private func hideAll() {
+        popOutGeneration += 1                                // a pop-out still on its way is off
+        popOutPending = false
         dropdown.orderOut(nil)
         mini.orderOut(nil)
-        attachWeb(to: webHolder)
+        if webView != nil { attachWeb(to: webHolder) }
         watchOutsideClicks(false)
         place = .hidden
         if NSApp.isActive { NSApp.deactivate() }             // typing goes back to your app
@@ -295,7 +377,7 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         unloadWhenIdle()
     }
 
-    /// After half an hour put away and paused, YouTube is unloaded to free memory;
+    /// After half an hour put away and paused, the page is let go to free memory;
     /// the next open starts at the home page.
     private func unloadWhenIdle() {
         idleGeneration += 1
@@ -303,26 +385,27 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
             guard let self, self.idleGeneration == generation, self.place == .hidden, !self.playing else { return }
-            self.loaded = false
-            self.hasVideo = false
-            self.title = ""
-            self.web.load(URLRequest(url: URL(string: "about:blank")!))
+            self.unloadPage()
         }
     }
 
     private func attachWeb(to holder: NSView, below other: NSView? = nil) {
+        let web = self.web
         guard web.superview !== holder else { return }
         web.removeFromSuperview()
         web.frame = holder.bounds
         if let other { holder.addSubview(web, positioned: .below, relativeTo: other) } else { holder.addSubview(web) }
     }
 
-    /// While the dropdown is open, a click in another app (or switching apps) closes it, unless pinned.
+    /// While the dropdown is open, a click anywhere outside it closes it, unless pinned:
+    /// in another app's window, on the desktop, in the Dock. Switching apps (⌘Tab, an app
+    /// taking the focus, a link opening in your browser) doesn't.
     private func watchOutsideClicks(_ on: Bool) {
         if let monitor = clickMonitor { NSEvent.removeMonitor(monitor) }
         clickMonitor = nil
         guard on else { return }
-        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { _ in
+        // A global monitor sees the clicks that go to other apps (Hammer's own don't reach it).
+        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { _ in
             Task { @MainActor [weak self] in self?.clickedOutside() }
         }
     }
@@ -331,12 +414,6 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
     /// icon, which has its own menu) never does.
     private func clickedOutside() {
         guard place == .dropdown, !pinned, !isOverPlayer(NSEvent.mouseLocation) else { return }
-        closeDropdown()
-    }
-
-    @objc private func appResigned() {
-        guard place == .dropdown, !pinned else { return }
-        if NSEvent.pressedMouseButtons != 0 && isOverPlayer(NSEvent.mouseLocation) { return }
         closeDropdown()
     }
 
@@ -353,7 +430,7 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
             if fixed != mini.frame { mini.setFrame(fixed, display: true) }
             miniFrame = fixed
         } else if place == .dropdown {
-            if let visible = (anchor().screen ?? NSScreen.main)?.visibleFrame {
+            if let visible = (dropdown.screen ?? NSScreen.withPointer ?? NSScreen.main)?.visibleFrame {
                 dropdown.setFrame(PlayerGeometry.dropdown(size: dropdownSize, visible: visible), display: true)
             }
         }
@@ -375,8 +452,11 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         if place == .mini {
             // YouTube moves on to the next video in the same page: keep showing it.
             run("window.__hammer && window.__hammer.mini(true)")
+        } else if place == .hidden && playing && Date() > stayPutUntil {
+            // Playing with no window (you closed the dropdown before the video began): into the mini player.
+            popOut()
         }
-        backButton.isEnabled = web.canGoBack
+        backButton.isEnabled = webView?.canGoBack ?? false
         onChange?()
     }
 
@@ -429,7 +509,7 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         hasVideo = false
         ad = false
         if place == .mini { hideAll() }
-        if place == .dropdown { webView.reload() } else { loaded = false }
+        if place == .dropdown { webView.reload() } else { unloadPage() }
         onChange?()
     }
 
@@ -451,7 +531,7 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         header.autoresizingMask = [.width, .minYMargin]
         backButton = iconButton("chevron.left", "Back", #selector(goBack))
         let home = iconButton("house", "YouTube home", #selector(goHome))
-        let browser = iconButton("safari", "Open in your browser", #selector(openInBrowser))
+        let browser = iconButton("arrow.up.right.square", "Open in your browser", #selector(openInBrowser))
         popOutButton = iconButton("pip.exit", "Pop out into the mini player", #selector(popOutPressed))
         pinButton = iconButton("pin", "Keep open when you click elsewhere", #selector(togglePin))
         let close = iconButton("xmark", "Close (Esc)", #selector(closePressed))
@@ -484,12 +564,18 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         background.addSubview(header)
     }
 
+    /// The glass's tint now (for the self-test): nil where there's no Liquid Glass.
+    var glassTint: NSColor? {
+        guard let glass = dropdown.contentView, glass.responds(to: NSSelectorFromString("tintColor")) else { return nil }
+        return glass.value(forKey: "tintColor") as? NSColor
+    }
+
     /// The same glass as macOS's own menus: Liquid Glass on macOS 26 (looked up at
     /// run time, so Hammer still builds and runs on older systems), frosted glass before.
     /// Returns the view for the window and the view to put things in.
     private static func glass(size: CGSize) -> (NSView, NSView) {
         let frame = NSRect(origin: .zero, size: size)
-        let content = NSView(frame: frame)
+        let content = AppearanceView(frame: frame)
         content.autoresizingMask = [.width, .height]
         if let type = NSClassFromString("NSGlassEffectView") as? NSView.Type {
             let glass = type.init(frame: frame)
@@ -499,10 +585,16 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
                     glass.setValue(NSNumber(value: 16.0), forKey: "cornerRadius")
                 }
                 glass.autoresizingMask = [.width, .height]
-                // A light tint toward YouTube's own theme (it follows the system's), so text stays readable.
+                // A light tint toward YouTube's own theme (it follows the system's), so text stays
+                // readable; it follows when you switch between light and dark.
                 if glass.responds(to: NSSelectorFromString("setTintColor:")) {
-                    let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                    glass.setValue((dark ? NSColor.black : NSColor.white).withAlphaComponent(0.25), forKey: "tintColor")
+                    let tint = { [weak glass, weak content] in
+                        guard let glass, let content else { return }
+                        let dark = content.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                        glass.setValue((dark ? NSColor.black : NSColor.white).withAlphaComponent(0.25), forKey: "tintColor")
+                    }
+                    content.onChange = tint
+                    tint()
                 }
                 return (glass, content)
             }
@@ -532,14 +624,38 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         return button
     }
 
-    @objc private func goBack() { if web.canGoBack { web.goBack() } }
+    @objc private func goBack() { if webView?.canGoBack == true { webView?.goBack() } }
     @objc private func goHome() { web.load(URLRequest(url: YouTubeLink.home)) }
+
+    /// The page in your browser, on YouTube's full site, at the moment you're at; the player pauses.
     @objc private func openInBrowser() {
-        if let url = web.url, let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http" {
-            NSWorkspace.shared.open(url)
+        guard let page = webView?.url else { return }
+        let handed = HandOff()
+        let go: @MainActor (Double?) -> Void = { [weak self] seconds in
+            guard !handed.done else { return }
+            handed.done = true
+            if let url = YouTubeLink.browserURL(for: page, at: seconds) { NSWorkspace.shared.open(url) }
+            self?.run("window.__hammer && window.__hammer.pause()")
         }
-        run("window.__hammer && window.__hammer.pause()")
+        run("window.__hammer ? window.__hammer.time() : null") { result in
+            let seconds = (result as? NSNumber)?.doubleValue
+            Task { @MainActor in go(seconds) }
+        }
+        Task { @MainActor in                                 // the page doesn't answer: without the time
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            go(nil)
+        }
     }
+
+    /// The URL "Open in your browser" opens now (for the self-test).
+    func browserURL() async -> URL? {
+        guard let page = webView?.url else { return nil }
+        let seconds: Double? = await withCheckedContinuation { continuation in
+            run("window.__hammer ? window.__hammer.time() : null") { continuation.resume(returning: ($0 as? NSNumber)?.doubleValue) }
+        }
+        return YouTubeLink.browserURL(for: page, at: seconds)
+    }
+
     @objc private func popOutPressed() { popOut() }
     @objc private func closePressed() { closeDropdown() }
     @objc private func togglePin() {
@@ -559,15 +675,31 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
         mini.contentAspectRatio = NSSize(width: 16, height: 9)
         mini.minSize = NSSize(width: PlayerGeometry.minMiniWidth, height: PlayerGeometry.minMiniWidth * 9 / 16)
         mini.delegate = self
-        mini.becomesKeyOnlyIfNeeded = true                   // clicking its buttons keeps your typing where it was
+        // Click it and it takes the keys (Esc, Space, ← →) without taking over from your app.
+        mini.becomesKeyOnlyIfNeeded = false
         mini.onEscape = { [weak self] in self?.closeMini() }
         overlay.frame = content.bounds
         overlay.autoresizingMask = [.width, .height]
         content.addSubview(overlay)
+        mini.initialFirstResponder = overlay
         overlay.onToggle = { [weak self] in self?.run("window.__hammer && window.__hammer.toggle()") }
         overlay.onSeek = { [weak self] seconds in self?.run("window.__hammer && window.__hammer.seek(\(seconds))") }
         overlay.onExpand = { [weak self] in self?.expand() }
         overlay.onClose = { [weak self] in self?.closeMini() }
+    }
+
+    /// A key pressed in the mini player or the dropdown, as if you had (for the self-test).
+    func press(_ key: String, keyCode: UInt16, command: Bool = false) {
+        let window = place == .mini ? mini : dropdown
+        if place == .mini {
+            window.makeKey()
+            window.makeFirstResponder(overlay)
+        }
+        guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: command ? [.command] : [],
+                                           timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                                           context: nil, characters: key, charactersIgnoringModifiers: key,
+                                           isARepeat: false, keyCode: keyCode) else { return }
+        if command { _ = window.performKeyEquivalent(with: event) } else { window.sendEvent(event) }
     }
 
     /// After you drag the mini player, it settles into the nearest corner.
@@ -609,8 +741,16 @@ final class YouTubePlayer: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindo
     }
 }
 
+/// Whether "Open in your browser" has gone already (the page's answer or the time limit, whichever is first).
+@MainActor
+private final class HandOff {
+    var done = false
+}
+
 /// The mini player's controls: they appear while the pointer is over it. Drag
-/// anywhere to move it; double-click to go back to the dropdown.
+/// anywhere to move it; double-click to go back to the dropdown. Once you've
+/// clicked it: Esc closes it, Space plays or pauses, ← and → go 10 seconds back
+/// or forward (not during an ad).
 final class MiniOverlay: NSView {
     var onToggle: (() -> Void)?
     var onSeek: ((Int) -> Void)?
@@ -693,8 +833,11 @@ final class MiniOverlay: NSView {
         return (image, bar.frame)
     }
 
+    private var ad = false
+
     /// While an ad plays: says so, and seeking is off (Hammer never skips ads).
     func setAd(_ ad: Bool) {
+        self.ad = ad
         adLabel.isHidden = !ad
         for button in seekButtons {
             button.isEnabled = !ad
@@ -757,7 +900,27 @@ final class MiniOverlay: NSView {
     override func mouseDown(with event: NSEvent) {
         dragging = false
         downEvent = event
+        takeKeys()
         if event.clickCount == 2 { onExpand?() }
+    }
+
+    /// Clicked: the mini player takes the keys (it's a panel, so your app stays the active one).
+    private func takeKeys() {
+        window?.makeKey()
+        window?.makeFirstResponder(self)
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        let plain = event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+        switch event.keyCode {
+        case 53: onClose?()                                  // Esc
+        case 49 where plain: onToggle?()                     // Space
+        case 123 where plain: if !ad { onSeek?(-10) }        // ←
+        case 124 where plain: if !ad { onSeek?(10) }         // →
+        default: super.keyDown(with: event)
+        }
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -939,7 +1102,100 @@ final class PlayerCheck: NSObject, NSApplicationDelegate {
         player.toggle()
         expect(player.place == .hidden, "and it closes again")
 
+        await keysAndHandOff()
         note(failed ? "Some checks failed." : "All player checks passed.")
         exit(failed ? 1 : 0)
+    }
+
+    private var isPlaying: Bool? {
+        get async {
+            await player.evaluateBool("""
+                (() => { const v = document.querySelector('video[data-hammer-main]') || document.querySelector('video');
+                  return !!v && !v.paused })()
+                """)
+        }
+    }
+
+    /// The keys, the browser hand-off, a video that starts with no window, the glass's tint,
+    /// and letting the page go.
+    private func keysAndHandOff() async {
+        // ⌘W closes the dropdown.
+        player.toggle()
+        expect(player.place == .dropdown, "open again")
+        player.press("w", keyCode: 13, command: true)
+        let closedByKey = await wait(3, until: { self.player.place != .dropdown })
+        expect(closedByKey, "⌘W closes the dropdown")
+        _ = await wait(3) { self.player.place != .mini }
+        if player.place == .mini { player.closeMini() }
+
+        // "Open in your browser": the full site, at the moment the video is at.
+        player.toggle()
+        _ = await player.evaluateBool("(() => { const v = document.querySelector('video'); if (v) v.currentTime = 7; return true })()")
+        let handOff = await player.browserURL()
+        let link = handOff?.absoluteString ?? "none"
+        expect(link.hasPrefix("https://www.youtube.com/watch?v=jNQXAC9IVRw"), "\"Open in your browser\" goes to YouTube's full site: \(link)")
+        note(link.hasSuffix("&t=7s") ? "  ok   …at the moment the video is at" : "  note …without the time here (\(link))")
+
+        // You close the dropdown before the video starts; then it starts: into the mini player, never playing unseen.
+        _ = await player.evaluateBool("(() => { const v = document.querySelector('video'); if (v) v.pause(); return true })()")
+        _ = await wait(3) { !self.player.playing }
+        player.closeDropdown()
+        expect(player.place == .hidden, "closed while paused: put away")
+        _ = await player.evaluateBool("window.__hammer ? window.__hammer.toggle() : false")
+        if await wait(10, until: { self.player.playing }) {
+            let popped = await wait(5) { self.player.place == .mini }
+            expect(popped, "it starts with no window: it comes up in the mini player")
+        } else {
+            note("  note it didn't start playing again here, so the no-window case can't be checked")
+        }
+
+        // In the mini player: Space plays and pauses, Esc closes it (and pauses).
+        if player.place != .mini {
+            player.toggle()
+            _ = await player.evaluateBool("window.__hammer ? (window.__hammer.pause(), window.__hammer.toggle()) : false")
+            _ = await wait(5) { self.player.playing }
+            player.popOut()
+            _ = await wait(5) { self.player.place == .mini }
+        }
+        if player.place == .mini {
+            let before = await isPlaying
+            player.press(" ", keyCode: 49)
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            let after = await isPlaying
+            expect(before != nil && after != nil && before != after, "Space in the mini player plays or pauses (\(String(describing: before)) → \(String(describing: after)))")
+            player.press("\u{1B}", keyCode: 53)
+            expect(player.place == .hidden, "Esc closes the mini player")
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            let stillPlaying = await isPlaying
+            expect(stillPlaying == false, "…and pauses it")
+        } else {
+            expect(false, "the mini player for the keys")
+        }
+
+        // The glass's tint follows light and dark (Liquid Glass only, macOS 26).
+        if player.glassTint != nil {
+            NSApp.appearance = NSAppearance(named: .darkAqua)
+            player.toggle()
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            let dark = player.glassTint?.usingColorSpace(.genericGray)?.whiteComponent ?? -1
+            NSApp.appearance = NSAppearance(named: .aqua)
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            let light = player.glassTint?.usingColorSpace(.genericGray)?.whiteComponent ?? -1
+            NSApp.appearance = nil
+            expect(dark >= 0 && dark < 0.5 && light > 0.5, "the glass's tint follows light and dark (\(dark), \(light))")
+            player.toggle()
+        } else {
+            note("  note no Liquid Glass here (before macOS 26), so its tint isn't checked")
+        }
+
+        // Switching to Edge lets the page go; opening again starts afresh, with nothing to go back to.
+        player.putAway()
+        expect(!player.hasPage && player.place == .hidden, "put away for Edge: the page is let go")
+        player.toggle()
+        expect(player.hasPage, "opening again: a fresh page")
+        _ = await wait(20) { self.player.title.lowercased().contains("youtube") }
+        let back = player.backHistory.map(\.absoluteString)
+        expect(!back.contains { $0 == "about:blank" || $0.contains("jNQXAC9IVRw") }, "…with nothing of the old one to go back to: \(back)")
+        player.toggle()
     }
 }

@@ -29,10 +29,15 @@ enum YouTubeLink {
     }
 
     /// The video in a link: youtube.com/watch?v=…, youtu.be/…, /shorts/…, /embed/…,
-    /// /live/…, /v/…, on www., m. or music., with or without https://, and the
-    /// start time if it has one (t=90, t=1m30s, start=90). nil if it isn't one.
+    /// /live/…, /v/…, on www., m. or music., youtube-nocookie.com/embed/…, with or
+    /// without https://, and the start time if it has one (t=90, t=1m30s, start=90).
+    /// Links as they come in messages work too: <https://…>, or with a "." or ")" after
+    /// them. nil if it isn't one.
     static func video(in text: String) -> (id: String, start: Int?)? {
         var raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.hasPrefix("<") && raw.hasSuffix(">") { raw = String(raw.dropFirst().dropLast()) }
+        if raw.hasPrefix("(") { raw.removeFirst() }
+        while raw.hasSuffix(".") || raw.hasSuffix(")") { raw.removeLast() }
         guard !raw.isEmpty, raw.count < 2048, !raw.contains(" "), !raw.contains("\n") else { return nil }
         if !raw.lowercased().hasPrefix("http://") && !raw.lowercased().hasPrefix("https://") { raw = "https://" + raw }
         guard let parts = URLComponents(string: raw), let host = parts.host?.lowercased() else { return nil }
@@ -50,6 +55,8 @@ enum YouTubeLink {
             } else if path.count >= 2, ["shorts", "embed", "live", "v", "e"].contains(path[0]) {
                 id = path[1]
             }
+        } else if host == "youtube-nocookie.com" || host == "www.youtube-nocookie.com" {
+            if path.count >= 2, path[0] == "embed" { id = path[1] }
         }
         guard let found = id, isVideoID(found) else { return nil }
         return (found, start)
@@ -60,28 +67,51 @@ enum YouTubeLink {
         text.count == 11 && text.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
     }
 
-    /// "90", "90s", "1m30s", "1h2m3s" → seconds. Absurd numbers give nil, never a crash.
+    /// A start time later than this (24 hours) isn't a real one.
+    static let latestStart = 24 * 3600
+
+    /// "90", "90s", "1m30s", "1h2m3s" → seconds: each of h, m and s at most once, in that
+    /// order, up to 24 hours. Anything else ("1h1h1h", absurd numbers) gives nil, never a crash.
     static func parseTime(_ text: String) -> Int? {
-        guard text.count <= 24 else { return nil }
-        if text.allSatisfy(\.isNumber) { return text.count <= 7 ? Int(text) : nil }
-        var total = 0, number = "", sawUnit = false
+        guard !text.isEmpty, text.count <= 24 else { return nil }
+        if text.allSatisfy({ $0.isASCII && $0.isNumber }) {
+            guard text.count <= 7, let seconds = Int(text), seconds <= latestStart else { return nil }
+            return seconds
+        }
+        var total = 0, number = ""
+        var units = "hms"[...]                               // the units still allowed, in order
         for character in text.lowercased() {
             if character.isASCII && character.isNumber {
                 number.append(character)
-            } else {
-                guard number.count <= 7, let value = Int(number) else { return nil }     // up to 9,999,999
-                switch character {
-                case "h": total += value * 3600
-                case "m": total += value * 60
-                case "s": total += value
-                default: return nil
-                }
-                number = ""
-                sawUnit = true
+                continue
             }
+            guard number.count <= 7, let value = Int(number),         // up to 9,999,999
+                  let at = units.firstIndex(of: character) else { return nil }
+            units = units[units.index(after: at)...]
+            total += value * (character == "h" ? 3600 : character == "m" ? 60 : 1)
+            number = ""
         }
-        guard sawUnit, number.isEmpty else { return nil }
+        guard number.isEmpty, total <= latestStart else { return nil }
         return total
+    }
+
+    /// The page in your browser: a video on YouTube's full site at the moment you're at
+    /// (www.youtube.com/watch?v=…&t=…s), another YouTube page on the full site, and any
+    /// other web page as it is. nil for anything that isn't a web page.
+    static func browserURL(for page: URL, at seconds: Double?) -> URL? {
+        if let video = video(in: page.absoluteString) {
+            let now = seconds.flatMap { $0.isFinite && $0 >= 1 && $0 <= Double(latestStart) ? Int($0) : nil }
+            return EdgeYouTube.watchURL(id: video.id, start: seconds == nil ? video.start : now)
+        }
+        guard let scheme = page.scheme?.lowercased(), scheme == "https" || scheme == "http",
+              var parts = URLComponents(url: page, resolvingAgainstBaseURL: false), let host = parts.host?.lowercased() else {
+            return nil
+        }
+        if host == "m.youtube.com" || host == "youtube.com" {
+            parts.scheme = "https"
+            parts.host = "www.youtube.com"
+        }
+        return parts.url
     }
 
     static func isYouTubeHost(_ host: String) -> Bool {
@@ -111,14 +141,37 @@ enum PlayerNavigation: Equatable {
         // Signing in to YouTube goes through these.
         let google = ["accounts.google.com", "consent.google.com", "myaccount.google.com", "gds.google.com", "www.google.com"]
         if google.contains(host) { return true }
-        // Google's sign-in in other countries: accounts.google.de, .co.uk, .com.au …
-        let parts = host.split(separator: ".").map(String.init)
-        guard parts.count >= 3, parts[0] == "accounts", parts[1] == "google" else { return false }
-        let country = Array(parts.dropFirst(2))
-        let isCountry = { (code: String) in code.count == 2 && code.allSatisfy { $0.isASCII && $0.isLetter } }
-        if country.count == 1 { return isCountry(country[0]) }
-        if country.count == 2 { return ["co", "com"].contains(country[0]) && isCountry(country[1]) }
-        return false
+        // Google's sign-in in other countries (accounts.google.de, .co.uk, .com.au …): only Google's own domains.
+        let prefix = "accounts.google."
+        return host.hasPrefix(prefix) && googleCountries.contains(String(host.dropFirst(prefix.count)))
+    }
+
+    /// The country domains Google signs in on: google.de, google.co.uk, google.com.au …
+    /// (Google's list of its domains). Only these, so a look-alike can't stay in the player.
+    static let googleCountries: Set<String> = {
+        let bare = "ad ae al am as at az ba be bf bg bi bj bs bt by ca cat cd cf cg ch ci cl cm cn cv cz de dj dk dm dz ee es "
+            + "fi fm fr ga ge gg gl gm gp gr gy hn hr ht hu ie im iq is it je jo kg ki kz la li lk lt lu lv md me mg mk ml mn "
+            + "ms mu mv mw ne nl no nr nu pl pn ps pt ro rs ru rw sc se sh si sk sm sn so sr st td tg tk tl tm tn to tt vg vu ws"
+        let co = "ao bw ck cr id il in jp ke kr ls ma mz nz th tz ug uk uz ve vi za zm zw"
+        let com = "af ag ai ar au bd bh bn bo br bz co cu cy do ec eg et fj gh gi gt hk jm kh kw lb ly mm mt mx my na ng ni "
+            + "np om pa pe pg ph pk pr py qa sa sb sg sl sv tj tr tw ua uy vc vn"
+        let words = { (text: String) in text.split(separator: " ").map(String.init) }
+        return Set(words(bare) + words(co).map { "co." + $0 } + words(com).map { "com." + $0 })
+    }()
+}
+
+// MARK: - The shortcut's key
+
+/// ⌘Y and ⌃⌥Y go on whichever key types "y" on your keyboard layout, not on the key
+/// where Y is on an American keyboard (on a German one that key types Z, so ⌘Y would
+/// take Undo; on Dvorak it types F, so ⌘Y would take Find).
+enum ShortcutKey {
+    static let americanY: UInt16 = 0x10                      // kVK_ANSI_Y
+
+    /// The first key (0 to 127) that types exactly `letter`, given what each key types on
+    /// the layout (`typed`, nil if it can't tell). nil if none does (a Cyrillic layout, say).
+    static func code(typing letter: String, _ typed: (UInt16) -> String?) -> UInt16? {
+        (0..<128).map(UInt16.init).first { typed($0) == letter }
     }
 }
 
@@ -216,18 +269,29 @@ enum EdgeYouTube {
     /// top-left corner of the main screen (the one with the menu bar), y going
     /// down. `frame` is in macOS's own coordinates (from the bottom left, y going up).
     static func bounds(_ frame: CGRect, mainScreenHeight: CGFloat) -> [Int] {
-        [Int(frame.minX.rounded()), Int((mainScreenHeight - frame.maxY).rounded()),
-         Int(frame.maxX.rounded()), Int((mainScreenHeight - frame.minY).rounded())]
+        [whole(frame.minX), whole(mainScreenHeight - frame.maxY), whole(frame.maxX), whole(mainScreenHeight - frame.minY)]
     }
 
-    /// The window's size from its bounds, or nil if they don't make sense.
+    /// No screen is ten million points across: a position or size from Edge beyond this is nonsense.
+    static let farthest: Double = 10_000_000
+
+    /// A point as a whole number, never a crash (nonsense becomes 0, or the farthest there is).
+    private static func whole(_ value: CGFloat) -> Int {
+        guard value.isFinite else { return 0 }
+        return Int(min(max(Double(value), -farthest), farthest).rounded())
+    }
+
+    /// The window's size from its bounds, or nil if they don't make sense. Worked out in
+    /// Double, so huge numbers can't overflow.
     static func size(ofBounds bounds: [Int]) -> CGSize? {
-        guard bounds.count == 4, bounds[2] > bounds[0], bounds[3] > bounds[1] else { return nil }
-        return CGSize(width: bounds[2] - bounds[0], height: bounds[3] - bounds[1])
+        guard bounds.count == 4, bounds.allSatisfy({ abs(Double($0)) <= farthest }) else { return nil }
+        let width = Double(bounds[2]) - Double(bounds[0]), height = Double(bounds[3]) - Double(bounds[1])
+        guard width > 0, height > 0 else { return nil }
+        return CGSize(width: width, height: height)
     }
 
-    /// Where to show it: the top-right corner of the screen with the menu bar
-    /// icon, at the size you left it (or the default), fitted to the screen.
+    /// Where to show it: the top-right corner of the screen (the one with the
+    /// pointer), at the size you left it (or the default), fitted to the screen.
     static func showBounds(current: [Int]?, visible: CGRect, mainScreenHeight: CGFloat) -> [Int] {
         let size = current.flatMap(size(ofBounds:)) ?? PlayerGeometry.dropdownSize
         return bounds(PlayerGeometry.dropdown(size: size, visible: visible), mainScreenHeight: mainScreenHeight)
@@ -257,12 +321,18 @@ enum EdgeYouTube {
     /// question, in some countries): still Hammer's window.
     static let detours = ["https://consent.youtube.com/"]
 
+    /// Hammer's window on any YouTube page (you may have gone to another video since).
+    static let anyPage = [home.absoluteString] + detours
+
     /// The windows that could be Hammer's: ordinary (not InPrivate) Edge windows
-    /// with one tab whose address starts with one of `prefixes`. The script does
-    /// the checking; only the windows' numbers come back to Hammer, as "3,7,".
-    static func findScript(prefixes: [String]) -> String {
+    /// with one tab whose address starts with one of `prefixes` and, with `at`, whose
+    /// bounds are exactly those. The script does the checking; only the windows'
+    /// numbers come back to Hammer, as "3,7,".
+    static func findScript(prefixes: [String], at place: [Int]? = nil) -> String {
         let address = prefixes.isEmpty ? "false"
             : prefixes.map { "(u starts with \(quoted($0)))" }.joined(separator: " or ")
+        let there = place.flatMap { $0.count == 4 ? " and ((bounds of w) is {\($0.map(String.init).joined(separator: ", "))})" : nil }
+            ?? ""
         return """
         \(tellEdge)
             set found to ""
@@ -270,7 +340,7 @@ enum EdgeYouTube {
                 try
                     if (mode of w is "normal") and ((count of tabs of w) is 1) then
                         set u to URL of active tab of w
-                        if \(address) then set found to found & ((id of w) as text) & ","
+                        if (\(address))\(there) then set found to found & ((id of w) as text) & ","
                     end if
                 end try
             end repeat
@@ -348,13 +418,19 @@ enum EdgeYouTube {
         Double(text.trimmingCharacters(in: .whitespaces)).flatMap { $0.isFinite ? $0 : nil }
     }
 
+    /// A position on screen: a whole number within ten million points, else nil (never a crash).
+    private static func coordinate(_ text: Substring) -> Int? {
+        guard let value = number(text), abs(value) <= farthest else { return nil }
+        return Int(exactly: value.rounded())
+    }
+
     static func parseState(_ output: String, id: Int) -> StateAnswer {
         let lines = output.split(whereSeparator: \.isNewline)
         guard let first = lines.first else { return .unreadable }
         if first.trimmingCharacters(in: .whitespaces) == "missing" { return .missing }
         let head = first.split(separator: ",", omittingEmptySubsequences: false)
         guard head.count == 5, let minimized = flag(head[0]) else { return .unreadable }
-        let bounds = head[1...].compactMap { number($0).map { Int($0.rounded()) } }
+        let bounds = head[1...].compactMap(coordinate)
         guard bounds.count == 4 else { return .unreadable }
         let windows = lines.dropFirst().compactMap { line -> Order? in
             let parts = line.split(separator: ",", omittingEmptySubsequences: false)
@@ -465,7 +541,7 @@ protocol EdgeDriver: AnyObject {
     func launch(_ arguments: [String]) async -> Bool
     func bringForward() async
     func pause(_ seconds: Double) async
-    /// The visible frame of the screen with the menu bar icon, and the main screen's height.
+    /// The visible frame of the screen to show it on (the one with the pointer), and the main screen's height.
     func screen() -> (visible: CGRect, mainHeight: CGFloat)
     func remembered(_ key: String) -> String?
     func remember(_ value: String?, _ key: String)
@@ -492,8 +568,17 @@ final class EdgeController {
     let driver: EdgeDriver
     /// Looking for a window Hammer just opened stops after this long.
     var findFor: TimeInterval = 25
+    /// The time now (the tests set their own).
+    var clock: () -> Date = Date.init
+    /// A window Hammer opened before Edge was even running is looked for this long afterwards.
+    static let launchedFor: TimeInterval = 600
     private let windowKey = "edgeYouTubeWindow"   // "<Edge's run>|<window ID>"
     private let sizeKey = "edgeYouTubeSize"       // the size you last left it at: "width,height"
+    /// A window Hammer opened but hasn't found yet: "<Edge's run, or nothing if Edge wasn't
+    /// running yet>|<when, in seconds since 1970>|<the window IDs that were there already>".
+    private let launchedKey = "edgeYouTubeLaunched"
+    /// Where Hammer's window last was, "left,top,right,bottom": Edge puts it back there when it restarts.
+    private let placeKey = "edgeYouTubePlace"
 
     init(driver: EdgeDriver) { self.driver = driver }
 
@@ -505,15 +590,56 @@ final class EdgeController {
         return id
     }
 
+    /// A window Hammer opened in this run of Edge (or just before Edge started) that it
+    /// hasn't found yet, and the windows that were already there then (they aren't it).
+    func launchedUnfound(in edge: String) -> Set<Int>? {
+        guard let saved = driver.remembered(launchedKey) else { return nil }
+        let parts = saved.split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count == 3, let when = Double(parts[1]) else { return nil }
+        if parts[0].isEmpty {
+            let age = clock().timeIntervalSince1970 - when
+            guard age >= -60, age < Self.launchedFor else { return nil }
+        } else if String(parts[0]) != edge {
+            return nil
+        }
+        return EdgeYouTube.parseIDs(String(parts[2]))
+    }
+
+    private func markLaunched(in edge: String?, besides: Set<Int> = []) {
+        let when = Int(clock().timeIntervalSince1970)
+        driver.remember("\(edge ?? "")|\(when)|" + besides.sorted().map(String.init).joined(separator: ","), launchedKey)
+    }
+
+    /// From now on this is Hammer's window.
+    private func keep(_ id: Int, in edge: String) {
+        driver.remember("\(edge)|\(id)", windowKey)
+        driver.remember(nil, launchedKey)
+    }
+
     private var rememberedSize: [Int]? {
         guard let parts = driver.remembered(sizeKey)?.split(separator: ",").compactMap({ Int($0) }),
               parts.count == 2, parts[0] > 0, parts[1] > 0 else { return nil }
         return [0, 0, parts[0], parts[1]]
     }
 
-    private func rememberSize(_ bounds: [Int]) {
+    /// Where Hammer's window last was (Edge puts it back there when it restarts).
+    var rememberedPlace: [Int]? {
+        guard let parts = driver.remembered(placeKey)?.split(separator: ",", omittingEmptySubsequences: false),
+              parts.count == 4 else { return nil }
+        let bounds = parts.compactMap { Int($0) }
+        return bounds.count == 4 && EdgeYouTube.size(ofBounds: bounds) != nil ? bounds : nil
+    }
+
+    private func rememberPlace(_ bounds: [Int]) {
+        guard EdgeYouTube.size(ofBounds: bounds) != nil else { return }
+        driver.remember(bounds.map(String.init).joined(separator: ","), placeKey)
+    }
+
+    /// Where the window is now: its size for next time, and its place.
+    private func remember(_ bounds: [Int]) {
         guard let size = EdgeYouTube.size(ofBounds: bounds) else { return }
         driver.remember("\(Int(size.width)),\(Int(size.height))", sizeKey)
+        rememberPlace(bounds)
     }
 
     private func corner(_ current: [Int]?) -> [Int] {
@@ -525,42 +651,71 @@ final class EdgeController {
     func toggle(play url: URL? = nil) async -> Outcome {
         guard driver.installed else { return .notInstalled }
         let target = url ?? EdgeYouTube.home
-        guard let edge = driver.running() else {
-            return await open(target, edgeWasRunning: false)        // starting Edge this way opens just this window
+        guard var edge = driver.running() else {
+            return await open(target, play: url != nil)            // starting Edge this way opens just this window
         }
         let inFront = driver.edgeInFront()                         // before anything changes it
-        switch await driver.permission(ask: true) {
+        var permission = await driver.permission(ask: true)
+        var waits = 0
+        while permission == .notRunning && waits < 10 {
+            // macOS says Edge isn't there while it's starting or quitting: wait until it's one or the other.
+            waits += 1
+            await driver.pause(0.3)
+            guard let now = driver.running() else { break }
+            edge = now
+            permission = await driver.permission(ask: true)
+        }
+        switch permission {
         case .allowed: break
-        case .notRunning: return await open(target, edgeWasRunning: false)   // Edge just quit
-        case .denied, .notAsked:
-            // Can't steer it, but a video you asked for still plays (Edge puts the window where it likes).
-            guard let url else { return .notAllowed(openedAnyway: false) }
-            return .notAllowed(openedAnyway: await driver.launch(EdgeYouTube.launchArguments(url)))
+        case .notRunning:
+            guard driver.running() == nil else { return .failed(EdgeYouTube.plainError(nil)) }
+            return await open(target, play: url != nil)            // Edge quit: start it again with the window
+        case .denied, .notAsked: return await openUnsteered(url, in: edge, besides: nil)
         }
-        guard let id = savedWindow(for: edge) else { return await open(target, edgeWasRunning: true) }
+        var found = savedWindow(for: edge)
+        var neverPlaced = false
+        if found == nil {
+            switch await findOwn(in: edge) {
+            case .window(let id, let placed): found = id; neverPlaced = !placed
+            case .nothing: break
+            case .stop(let outcome): return outcome
+            }
+        }
+        guard let id = found else { return await open(target, play: url != nil) }
 
-        let answer: EdgeYouTube.StateAnswer
-        switch await driver.run(EdgeYouTube.stateScript(id: id)) {
-        case .ok(let text): answer = EdgeYouTube.parseState(text, id: id)
-        case .failed(let number, _):
-            if number == EdgeYouTube.notAllowed { return .notAllowed(openedAnyway: false) }
-            if number == -600 { return await open(target, edgeWasRunning: false) }      // Edge quit meanwhile
-            if number == -1728 || number == -1719 { answer = .missing } else { return .failed(EdgeYouTube.plainError(number)) }
+        var answer = EdgeYouTube.StateAnswer.unreadable
+        for attempt in 1...2 {
+            switch await driver.run(EdgeYouTube.stateScript(id: id)) {
+            case .ok(let text): answer = EdgeYouTube.parseState(text, id: id)
+            case .failed(let number, _):
+                if number == EdgeYouTube.notAllowed { return .notAllowed(openedAnyway: false) }
+                if number == -600 { return await open(target, play: url != nil) }      // Edge quit meanwhile
+                guard number == -1728 || number == -1719 else { return .failed(EdgeYouTube.plainError(number)) }
+                // The window went while Edge was answering: make sure before opening another.
+                answer = .missing
+                if attempt == 1 { continue }
+            }
+            break
         }
+        // Edge's own size for a window Hammer never placed isn't yours: that one gets the size you chose.
+        if case .found(let state) = answer, !neverPlaced { remember(state.bounds) }
         var action = EdgeYouTube.decide(answer, edgeIsFrontApp: inFront)
-        if url != nil && action == .hide { action = .show }        // a video to play: always show it
+        // A video to play, or a window Hammer has never put in the corner: always shown.
+        if (url != nil || neverPlaced) && action == .hide { action = .show }
         switch action {
         case .open:
-            return await open(target, edgeWasRunning: true)
+            return await open(target, play: url != nil)
         case .hide:
             var others = false
-            if case .found(let state) = answer { rememberSize(state.bounds); others = EdgeYouTube.othersShown(state) }
+            if case .found(let state) = answer { others = EdgeYouTube.othersShown(state) }
             return outcome(await driver.run(EdgeYouTube.hideScript(id: id)), success: .hidden(othersShown: others))
         case .show:
             var current: [Int]?
-            if case .found(let state) = answer { current = state.bounds; rememberSize(state.bounds) }
-            let shown = await driver.run(EdgeYouTube.showScript(id: id, bounds: corner(current)))
+            if case .found(let state) = answer, !neverPlaced { current = state.bounds }
+            let place = corner(current)
+            let shown = await driver.run(EdgeYouTube.showScript(id: id, bounds: place))
             if case .failed = shown { return outcome(shown, success: .shown) }
+            rememberPlace(place)
             if let url { _ = await driver.run(EdgeYouTube.goScript(id: id, url: url)) }
             await driver.bringForward()
             return .shown
@@ -575,34 +730,106 @@ final class EdgeController {
         }
     }
 
+    /// Hammer may not steer Edge: a video you asked for still plays (Edge puts the window
+    /// where it likes). Once you allow Hammer, the next press finds that window rather
+    /// than opening another.
+    private func openUnsteered(_ url: URL?, in edge: String?, besides: Set<Int>?) async -> Outcome {
+        guard let url else { return .notAllowed(openedAnyway: false) }
+        let opened = await driver.launch(EdgeYouTube.launchArguments(url))
+        if opened { markLaunched(in: edge, besides: besides ?? []) }
+        return .notAllowed(openedAnyway: opened)
+    }
+
+    private enum Found { case window(Int, placed: Bool), nothing, stop(Outcome) }
+
+    /// No window of Hammer's in this run of Edge yet: is one there anyway? The one Hammer
+    /// opened but couldn't find (Edge was slow, or you hadn't allowed Hammer yet): the
+    /// newest that looks like it. Or the one Edge brought back when it restarted: exactly
+    /// where Hammer's last was. The scripts do the matching; only window numbers come back.
+    private func findOwn(in edge: String) async -> Found {
+        var searches: [(script: String, besides: Set<Int>, placed: Bool)] = []
+        if let besides = launchedUnfound(in: edge) {
+            searches.append((EdgeYouTube.findScript(prefixes: EdgeYouTube.anyPage), besides, false))
+        }
+        if let place = rememberedPlace {
+            searches.append((EdgeYouTube.findScript(prefixes: EdgeYouTube.anyPage, at: place), [], true))
+        }
+        for search in searches {
+            switch await driver.run(search.script) {
+            case .ok(let text):
+                if !search.placed { driver.remember(nil, launchedKey) }     // looked for once
+                guard let id = EdgeYouTube.parseIDs(text).subtracting(search.besides).max() else { continue }
+                keep(id, in: edge)
+                return .window(id, placed: search.placed)
+            case .failed(let number, _):
+                if number == EdgeYouTube.notAllowed { return .stop(.notAllowed(openedAnyway: false)) }
+                if number == -600 { return .nothing }                       // Edge quit meanwhile: opening starts it again
+                return .stop(.failed(EdgeYouTube.plainError(number)))
+            }
+        }
+        return .nothing
+    }
+
+    private enum Snapshot { case taken(edge: String, ids: Set<Int>), edgeGone, stop(Outcome) }
+
+    /// Edge is up (or on its way up or down): the windows already there that look like the
+    /// new one, so none of them is ever taken for it. If Edge can't say, Hammer doesn't guess.
+    private func snapshot(_ find: String, url: URL, play: Bool) async -> Snapshot {
+        for attempt in 1...10 {
+            guard let edge = driver.running() else { return .edgeGone }
+            switch await driver.permission(ask: true) {
+            case .denied, .notAsked:
+                return .stop(await openUnsteered(play ? url : nil, in: edge, besides: nil))
+            case .allowed:
+                switch await driver.run(find) {
+                case .ok(let text): return .taken(edge: edge, ids: EdgeYouTube.parseIDs(text))
+                case .failed(let number, _):
+                    if number == EdgeYouTube.notAllowed { return .stop(.notAllowed(openedAnyway: false)) }
+                    if number != -600 { return .stop(.failed(EdgeYouTube.plainError(number))) }
+                }
+            case .notRunning:
+                break
+            }
+            if attempt < 10 { await driver.pause(0.3) }    // starting or quitting: wait until it's one or the other
+        }
+        return .stop(.failed(EdgeYouTube.plainError(nil)))
+    }
+
     /// Opens a new app window, finds it among Edge's windows, remembers it and puts it in the corner.
-    private func open(_ url: URL, edgeWasRunning: Bool) async -> Outcome {
+    private func open(_ url: URL, play: Bool) async -> Outcome {
         // Known by the address Hammer opened. When Edge starts with this window it
         // doesn't bring back your other windows, and when it's running, windows that
         // were already there don't count; of several new ones, the newest wins.
         let find = EdgeYouTube.findScript(prefixes: [EdgeYouTube.matchPrefix(url)] + EdgeYouTube.detours)
         var before = Set<Int>()
-        if edgeWasRunning {
-            // Windows that already look like it aren't the new one. If Edge can't say, don't guess.
-            switch await driver.run(find) {
-            case .ok(let text): before = EdgeYouTube.parseIDs(text)
-            case .failed(let number, _):
-                if number == EdgeYouTube.notAllowed { return .notAllowed(openedAnyway: false) }
-                if number != -600 { return .failed(EdgeYouTube.plainError(number)) }
+        var run: String?                                 // the run of Edge those windows are from
+        var asked = false
+        if driver.running() != nil {
+            switch await snapshot(find, url: url, play: play) {
+            case .taken(let edge, let ids): before = ids; run = edge; asked = true
+            case .edgeGone: break
+            case .stop(let outcome): return outcome
             }
         }
         guard await driver.launch(EdgeYouTube.launchArguments(url)) else {
             return .failed("Microsoft Edge didn't open. If it's showing a question, answer it and try again.")
         }
-        var asked = edgeWasRunning
-        let deadline = Date().addingTimeInterval(findFor)
+        // Until it's found, the next press looks for this one rather than opening another.
+        markLaunched(in: run, besides: before)
+        let deadline = clock().addingTimeInterval(findFor)
         var tries = 0
-        while tries < 60 && Date() < deadline {                 // about 15 seconds, more if Edge is slow
+        while tries < 60 && clock() < deadline {        // about 15 seconds, more if Edge is slow
             tries += 1
             await driver.pause(0.3)
             guard let edge = driver.running() else { continue }
+            if edge != run {
+                // Edge has just started (or started again): its windows are all new, and IDs start over.
+                before = []
+                run = edge
+                markLaunched(in: edge)
+            }
             if !asked {
-                // Edge has just started: now macOS can ask whether Hammer may steer it.
+                // Now macOS can ask whether Hammer may steer it.
                 switch await driver.permission(ask: true) {
                 case .notRunning: continue
                 case .denied, .notAsked: return .notAllowed(openedAnyway: true)
@@ -611,11 +838,14 @@ final class EdgeController {
             }
             guard case .ok(let text) = await driver.run(find),
                   let id = EdgeYouTube.newWindow(after: EdgeYouTube.parseIDs(text), before: before) else { continue }
-            driver.remember("\(edge)|\(id)", windowKey)
-            _ = await driver.run(EdgeYouTube.showScript(id: id, bounds: corner(nil)))
+            keep(id, in: edge)
+            let place = corner(nil)
+            _ = await driver.run(EdgeYouTube.showScript(id: id, bounds: place))
+            rememberPlace(place)
             await driver.bringForward()
             return .opened
         }
-        return .failed("YouTube opened in Edge, but Hammer couldn't find its window to put it in the corner.")
+        return .failed("Microsoft Edge is taking a while to open YouTube. Once its window is there, try again: "
+                       + "Hammer will put it in the corner.")
     }
 }

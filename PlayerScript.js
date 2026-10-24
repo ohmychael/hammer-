@@ -9,19 +9,28 @@
     try { window.webkit.messageHandlers.hammer.postMessage(message); } catch (e) {}
   };
 
-  // The video being watched: the one playing, else the biggest on the page
-  // (the home feed can hold small muted previews).
+  // A video page: the player's video can be there before it has loaded anything.
+  const onVideoPage = () => /^\/(watch|shorts\/|live\/|embed\/)/.test(location.pathname || '');
+
+  // The video being watched. On a video page: YouTube's own player (it marks it
+  // .html5-main-video), else one with sound, else the biggest; a small muted
+  // preview playing beside it never wins. Elsewhere (the home feed holds small
+  // muted previews): the one playing, with sound first, else the biggest.
   const mainVideo = () => {
     const videos = Array.from(document.querySelectorAll('video'));
     if (videos.length === 0) return null;
-    const area = (v) => { const r = v.getBoundingClientRect(); return r.width * r.height; };
-    const playing = videos.filter((v) => !v.paused && !v.ended);
-    const pool = playing.length > 0 ? playing : videos;
-    return pool.reduce((best, v) => (area(v) > area(best) ? v : best));
+    const area = (v) => { const r = v.getBoundingClientRect(); const a = r.width * r.height; return a > 0 ? a : 0; };
+    const biggest = (pool) => pool.reduce((best, v) => (area(v) > area(best) ? v : best));
+    const first = (...pools) => biggest(pools.find((pool) => pool.length > 0) || videos);
+    const playing = (v) => !v.paused && !v.ended;
+    if (onVideoPage()) {
+      const own = videos.filter((v) => !!(v.classList && v.classList.contains('html5-main-video')));
+      const loud = videos.filter((v) => !v.muted);
+      return first(own.filter(playing), own, loud.filter(playing), loud);
+    }
+    const live = videos.filter(playing);
+    return first(live.filter((v) => !v.muted), live);
   };
-
-  // A video page: the player's video can be there before it has loaded anything.
-  const onVideoPage = () => /^\/(watch|shorts\/|live\/|embed\/)/.test(location.pathname || '');
   // Muted previews in the feed don't count; a video with sound does, on any page.
   const counts = (v) => !!v && (onVideoPage() || !v.muted);
   // YouTube marks its player while an ad plays. Hammer never skips or seeks ads.
@@ -97,10 +106,16 @@
     // Not during an ad: the mini player hides YouTube's own ad controls, so it mustn't skip one.
     seek(seconds) {
       const v = mainVideo();
-      if (!v || adShowing()) return false;
+      if (!v || adShowing() || !Number.isFinite(seconds)) return false;
       const end = v.duration > 0 ? v.duration : Infinity;
-      v.currentTime = Math.min(end, Math.max(0, v.currentTime + seconds));
+      const now = Number.isFinite(v.currentTime) ? v.currentTime : 0;
+      v.currentTime = Math.min(end, Math.max(0, now + seconds));
       return true;
+    },
+    // Where the video is, in seconds (for "Open in your browser"); null during an ad or without one.
+    time() {
+      const v = mainVideo();
+      return v && counts(v) && !adShowing() && Number.isFinite(v.currentTime) ? v.currentTime : null;
     },
     hasVideo() { return !!mainVideo(); },
     report,

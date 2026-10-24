@@ -13,13 +13,16 @@ function makeBox(parent) {
   return { parentElement: parent, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, removeAttribute(k) { delete this.attrs[k]; } };
 }
 
-function makeVideo({ paused = true, width = 100, height = 56, duration = 100, readyState = 4, parent = null, muted = false } = {}) {
+function makeVideo({ paused = true, width = 100, height = 56, duration = 100, readyState = 4, parent = null, muted = false,
+                     youtubes = false, rejects = false } = {}) {
   return {
     parentElement: parent, paused, muted, ended: false, currentTime: 0, duration, readyState, attrs: {}, plays: 0,
+    // YouTube marks its own player's video .html5-main-video.
+    classList: youtubes ? { contains: (c) => c === 'html5-main-video' } : { contains: () => false },
     getBoundingClientRect() { return { width, height }; },
     setAttribute(k, v) { this.attrs[k] = v; },
     removeAttribute(k) { delete this.attrs[k]; },
-    play() { this.paused = false; this.plays++; return Promise.resolve(); },
+    play() { this.paused = false; this.plays++; return rejects ? Promise.reject(new Error('NotAllowedError')) : Promise.resolve(); },
     pause() { this.paused = true; },
   };
 }
@@ -174,5 +177,122 @@ let threw = false;
 try { page.run(); page.window.__hammer.report(); } catch (e) { threw = true; }
 expect(!threw, 'no message handler: no error');
 
-console.log(`${checks} checks, ${failures} failed`);
-process.exit(failures === 0 ? 0 : 1);
+// A watch page: the video is paused, and a small muted preview (in the list beside it) plays.
+{
+  const watched = makeVideo({ width: 420, height: 236 });
+  const beside = makeVideo({ width: 160, height: 90, muted: true, paused: false });
+  page = makePage([watched, beside], '/watch');
+  page.run();
+  const h = page.window.__hammer;
+  expect(page.posted[0].playing === false, 'a muted preview playing beside a paused video is not "playing"');
+  expect(h.mini(true) === true && 'data-hammer-main' in watched.attrs && !('data-hammer-main' in beside.attrs),
+         'the mini player shows the video being watched, not the preview');
+  h.mini(false);
+  h.toggle();
+  expect(watched.paused === false && beside.paused === false, 'play/pause plays the video being watched');
+}
+// YouTube's own player wins on a watch page, even muted and smaller.
+{
+  const own = makeVideo({ width: 300, height: 170, muted: true, youtubes: true });
+  const other = makeVideo({ width: 640, height: 360, paused: false });
+  page = makePage([other, own], '/watch');
+  page.run();
+  page.window.__hammer.mini(true);
+  expect('data-hammer-main' in own.attrs, "YouTube's own player (.html5-main-video) is the one");
+  page.window.__hammer.mini(false);
+}
+// Two videos with sound on a watch page, neither YouTube's: the playing one, else the biggest.
+{
+  const small = makeVideo({ width: 160, height: 90, paused: false }), big = makeVideo({ width: 640, height: 360 });
+  page = makePage([small, big], '/watch');
+  page.run();
+  page.window.__hammer.toggle();
+  expect(small.paused === true && big.paused === true, 'with sound and playing: that one is paused');
+  page.window.__hammer.toggle();
+  expect(big.paused === false, 'none playing: the biggest plays');
+}
+// The home feed: a muted preview and one with sound both playing: the one with sound.
+{
+  const preview = makeVideo({ width: 640, height: 360, muted: true, paused: false });
+  const loud = makeVideo({ width: 160, height: 90, paused: false });
+  page = makePage([preview, loud], '/');
+  page.run();
+  page.window.__hammer.mini(true);
+  expect('data-hammer-main' in loud.attrs, 'home feed: the playing video with sound');
+}
+// A video with no size yet (NaN) never wins over a real one.
+{
+  const blank = makeVideo({ width: NaN, height: NaN }), real = makeVideo({ width: 300, height: 200 });
+  page = makePage([blank, real], '/watch');
+  page.run();
+  page.window.__hammer.mini(true);
+  expect('data-hammer-main' in real.attrs, 'a video with NaN size is never chosen over a real one');
+  page = makePage([real, blank], '/watch');
+  page.run();
+  page.window.__hammer.mini(true);
+  expect('data-hammer-main' in real.attrs, '…in either order');
+}
+// Seeking with odd numbers, and a video that hasn't loaded.
+{
+  const v = makeVideo();
+  page = makePage([v], '/watch');
+  page.run();
+  v.currentTime = 50;
+  expect(page.window.__hammer.seek(NaN) === false && v.currentTime === 50, 'seek(NaN) leaves the time alone');
+  expect(page.window.__hammer.seek(Infinity) === false && v.currentTime === 50, 'seek(Infinity) too');
+  v.duration = 0;
+  page.window.__hammer.seek(10);
+  expect(v.currentTime === 60, 'no length known yet (0): seeks freely');
+  v.currentTime = NaN;
+  page.window.__hammer.seek(10);
+  expect(v.currentTime === 10, 'no current time yet: seeks from the start');
+}
+// The time, for "Open in your browser": not during an ad, and not without a video.
+{
+  const v = makeVideo({ paused: false });
+  page = makePage([v], '/watch');
+  page.run();
+  v.currentTime = 61.5;
+  expect(page.window.__hammer.time() === 61.5, 'the time the video is at');
+  page.ad = true;
+  expect(page.window.__hammer.time() === null, 'during an ad: none (that time is the ad\'s)');
+  page.ad = false;
+  v.currentTime = NaN;
+  expect(page.window.__hammer.time() === null, 'no time yet: none');
+  page = makePage([], '/results');
+  page.run();
+  expect(page.window.__hammer.time() === null, 'no video: none');
+  page = makePage([makeVideo({ muted: true, paused: false })], '/');
+  page.run();
+  expect(page.window.__hammer.time() === null, 'a muted feed preview: none');
+}
+// play() refused (the page's autoplay rules): no unhandled error.
+{
+  const v = makeVideo({ rejects: true });
+  page = makePage([v], '/watch');
+  page.run();
+  let failed = false;
+  const unhandled = () => { failed = true; };
+  process.on('unhandledRejection', unhandled);
+  try { page.window.__hammer.toggle(); } catch (e) { failed = true; }
+  setTimeout(() => {
+    process.removeListener('unhandledRejection', unhandled);
+    expect(!failed, 'a refused play(): no error');
+    finish();
+  }, 20);
+}
+// No <head> yet: the style still goes in, no error.
+{
+  page = makePage([makeVideo()], '/watch');
+  const into = [];
+  page.document.head = null;
+  page.document.documentElement.appendChild = (n) => into.push(n);
+  let broke = false;
+  try { page.run(); } catch (e) { broke = true; }
+  expect(!broke && into.length === 1, 'no <head>: the style goes on <html>, no error');
+}
+
+function finish() {
+  console.log(`${checks} checks, ${failures} failed`);
+  process.exit(failures === 0 ? 0 : 1);
+}
