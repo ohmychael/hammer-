@@ -165,6 +165,17 @@ enum GoveeName {
     }
 }
 
+// MARK: - Text
+
+enum TimerText {
+    /// 5 → "5 min", 60 → "1 hr", 90 → "1 hr 30 min".
+    static func describe(minutes: Int) -> String {
+        if minutes < 60 { return "\(minutes) min" }
+        let hours = minutes / 60, rest = minutes % 60
+        return rest == 0 ? "\(hours) hr" : "\(hours) hr \(rest) min"
+    }
+}
+
 // MARK: - Updates: what update.sh last did, and how Hammer was started
 
 /// ~/Hammer/update-status, which update.sh (and build.sh) write: one `key=value` per line.
@@ -235,15 +246,4 @@ enum Launch {
     }
 
     static func atLogin(_ args: [String]) -> Bool { args.contains("--login") }
-}
-
-// MARK: - Text
-
-enum TimerText {
-    /// 5 → "5 min", 60 → "1 hr", 90 → "1 hr 30 min".
-    static func describe(minutes: Int) -> String {
-        if minutes < 60 { return "\(minutes) min" }
-        let hours = minutes / 60, rest = minutes % 60
-        return rest == 0 ? "\(hours) hr" : "\(hours) hr \(rest) min"
-    }
 }
