@@ -20,8 +20,8 @@ mkdir -p "$WORK/mod"
   "$HERE/CoreBluetooth.swift" -emit-module-path "$WORK/mod/CoreBluetooth.swiftmodule" \
   -o "$WORK/mod/libCoreBluetooth.so" || exit 1
 
-# 2. GoveeLight and GoveeBluetooth, copied out of Hammer.swift unchanged except that
-#    Bluetooth counts as available (the app checks its Info.plist).
+# 2. GoveeBluetooth, copied out of Hammer.swift unchanged except that Bluetooth
+#    counts as available (the app checks its Info.plist). GoveeLight is in HammerCore.swift.
 python3 - "$REPO/Hammer.swift" "$WORK/GB.swift" <<'PY' || exit 1
 import sys
 src = open(sys.argv[1]).read()
@@ -31,9 +31,7 @@ cls = src[start:end]
 check = 'Bundle.main.object(forInfoDictionaryKey: "NSBluetoothAlwaysUsageDescription") != nil'
 assert cls.count(check) == 1, "GoveeBluetooth.isAvailable changed; update run.sh"
 cls = cls.replace(check, 'true')
-light = src[src.index('struct GoveeLight'):]
-light = light[:light.index('\n}\n') + 3]
-open(sys.argv[2], 'w').write('import Foundation\nimport CoreBluetooth\n\n' + light + '\n' + cls)
+open(sys.argv[2], 'w').write('import Foundation\nimport CoreBluetooth\n\n' + cls)
 PY
 
 # 3. Build and run.
@@ -42,7 +40,8 @@ PY
 ALL="phone phone-long restart-busy first-run storm short-links discovery-once discovery-always
      discovery-hangs incompatible no-service busy-link slider reset bluetooth-off remove
      remove-connected neighbor blink echo steady two-bulbs silent first-drop dying-link
-     delivered-then-drop blink-thrice"
+     delivered-then-drop blink-thrice launch-send reset-keeps alarm-phone gave-up limit
+     blink-restores rescan-twice forget"
 LIST="${*:-$ALL}"
 mkdir -p "$WORK/out"
 for s in $LIST; do

@@ -48,6 +48,8 @@ func addBulb(name: String? = "ihoment_H6006_0FC3") -> Bulb {
 let gb = GoveeBluetooth()
 var heldSet: Set<UUID> = []
 var rebuilds = 0
+var results: [(id: UUID, ok: Bool)] = []          // what onCommandResult reported
+gb.onCommandResult = { id, ok in results.append((id, ok)) }
 gb.onChange = {                                   // what AppDelegate does on every change
     Task { @MainActor in
         rebuilds += 1
@@ -368,12 +370,13 @@ case "reset":   // Bluetooth resets (e.g. waking from sleep)
     bulb.peripheral._state = .disconnected
     gb.centralManagerDidUpdateState(simCentral!)
     check(gb.isOn(bulb.id) == nil && !gb.isConnected(bulb.id), "forgets the link and its on/off")
-    gb.send([0x33, 0x01, 0x00], to: bulb.id)                     // a tap while it's resetting is ignored safely
+    gb.send([0x33, 0x01, 0x00], to: bulb.id)                     // a tap while it's resetting waits for it
     run(0.5)
     powerOn()
     run(2)
     check(simRetrieveCalls > retrievesBefore, "asks macOS for the bulb again")
     check(gb.isConnected(bulb.id), "reconnected after the reset")
+    check(bulb.power == false, "and the tap made during the reset is delivered")
 
 case "bluetooth-off":   // Bluetooth turned off, then on
     let bulb = addBulb()
@@ -388,7 +391,8 @@ case "bluetooth-off":   // Bluetooth turned off, then on
     powerOn()
     run(2)
     check(gb.isConnected(bulb.id), "reconnects when Bluetooth is back")
-    check(commands(to: bulb).isEmpty, "a tap made while Bluetooth was off isn't replayed")
+    check(commands(to: bulb).isEmpty, "a tap made 15 s before Bluetooth came back isn't replayed")
+    check(results.contains { $0.id == bulb.id && !$0.ok }, "and Hammer says it didn't go out")
 
 case "remove":   // you remove a bulb from My Lights while Hammer is retrying it
     let bulb = addBulb()
@@ -531,6 +535,130 @@ case "blink-thrice":   // Blink to Identify the same neighbor's bulb three times
         check(commands(to: bulb, since: tap) == ["on"], "round \(round) goes out at once")
         run(11)                                                  // released after 10 s each time
     }
+
+// From the lights review: commands that used to be lost, and the menu's hints.
+
+case "launch-send":   // Hammer just started: the sleep timer or Turn On At sends before Bluetooth is on
+    let bulb = addBulb()
+    UserDefaults.standard.set([bulb.id.uuidString: "H6006|H6006 bulb 0FC3"], forKey: "bluetoothBulbs")
+    heldSet = [bulb.id]
+    gb.start()
+    gb.hold(heldSet)
+    gb.send([0x33, 0x01, 0x01], to: bulb.id, keepFor: 300)       // Bluetooth's state is still unknown
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { powerOn() }
+    run(4)
+    check(gb.isConnected(bulb.id), "connected once Bluetooth is on")
+    check(commands(to: bulb) == ["on"], "the command sent before that is delivered: \(commands(to: bulb))")
+    check(results.contains { $0.id == bulb.id && $0.ok }, "and reported as sent")
+
+case "reset-keeps":   // Bluetooth resets (common on wake) while a command waits for the phone to let go
+    let bulb = addBulb()
+    startHammer(holding: [bulb])
+    run(2)
+    phoneTakes(bulb)
+    run(0.3)
+    gb.send([0x33, 0x01, 0x01], to: bulb.id, keepFor: 300)
+    run(0.5)
+    simCentral!._state = .resetting
+    bulb.peripheral._state = .disconnected
+    gb.centralManagerDidUpdateState(simCentral!)
+    bulb.phoneHasIt = false
+    run(0.5)
+    powerOn()
+    run(3)
+    check(gb.isConnected(bulb.id), "reconnected")
+    check(commands(to: bulb).contains("on"), "the waiting command survives the reset: \(commands(to: bulb))")
+
+case "alarm-phone":   // Turn On At fires while the phone has the bulb; the phone lets go 20 s later
+    let bulb = addBulb()
+    startHammer(holding: [bulb])
+    run(2)
+    phoneTakes(bulb)
+    run(0.5)
+    let tap = Date()
+    gb.send([0x33, 0x01, 0x01], to: bulb.id, keepFor: 300)       // scheduled: waits up to 5 minutes
+    gb.send([0x33, 0x04, 50], to: bulb.id)                       // a tap: 15 s
+    run(20)
+    check(results.filter { !$0.ok }.count == 1, "only the tap is given up; the scheduled command still waits")
+    phoneLetsGo(bulb)
+    run(2)
+    check(commands(to: bulb, since: tap) == ["on"], "the scheduled on still lands after 20 s, the old tap doesn't: \(commands(to: bulb, since: tap))")
+
+case "gave-up":   // a command that never goes out is reported, so the menu can say so
+    let bulb = addBulb()
+    startHammer(holding: [bulb])
+    run(2)
+    gb.send([0x33, 0x01, 0x00], to: bulb.id)
+    run(0.5)
+    check(results.last.map { $0.id == bulb.id && $0.ok } == true, "a delivered command is reported as sent")
+    phoneTakes(bulb)
+    run(0.5)
+    results.removeAll()
+    gb.send([0x33, 0x01, 0x01], to: bulb.id, keepFor: 3)
+    run(2)
+    check(results.isEmpty, "nothing reported while it's still waiting")
+    run(3)
+    check(results.count == 1 && results[0].id == bulb.id && !results[0].ok, "given up after its time, once: \(results.map { $0.ok })")
+    let neighbor = addBulb(name: "ihoment_H6006_ABCD")
+    neighbor.connectFails = true
+    results.removeAll()
+    gb.send([0x33, 0x01, 0x01], to: neighbor.id)
+    run(1)
+    check(results.contains { $0.id == neighbor.id && !$0.ok }, "a neighbor's bulb that won't connect is reported at once")
+
+case "limit":   // macOS refuses another link (too many devices); the bulb is otherwise free
+    var list: [Bulb] = []
+    for i in 0..<5 { list.append(addBulb(name: "ihoment_H6006_00\(i)\(i)")) }
+    list[4].connectFails = true
+    let busy = addBulb(name: "ihoment_H6006_BEEF")
+    busy.phoneHasIt = true
+    startHammer(holding: list + [busy])
+    run(10)
+    check(gb.cantReach(list[4].id) && gb.connectError(list[4].id) != nil, "can't reach, and the menu knows the connection failed")
+    check(gb.cantReach(busy.id) && gb.connectError(busy.id) == nil, "a bulb the phone holds just never answers (the phone hint)")
+
+case "blink-restores":   // Blink to Identify a neighbor's bulb that was off: it ends off
+    let theirs = addBulb(name: "ihoment_H6006_ABCD")
+    theirs.power = false
+    startHammer(holding: [])
+    run(1)
+    gb.send([0xAA, 0x01], to: theirs.id)                         // what Govee.readPower does first
+    var waited = 0.0
+    while gb.isOn(theirs.id) == nil && waited < 4 { run(0.1); waited += 0.1 }
+    check(gb.isOn(theirs.id) == false, "learns it's off before blinking")
+    for on in Blink.steps(wasOn: gb.isOn(theirs.id), mine: false) {
+        gb.send([0x33, 0x01, on ? 1 : 0], to: theirs.id)
+        run(0.7)
+    }
+    check(commands(to: theirs) == ["on", "off", "on", "off"], "two flashes: \(commands(to: theirs))")
+    run(12)
+    check(theirs.power == false && theirs.peripheral._state == .disconnected, "left off, and let go")
+
+case "rescan-twice":   // opening the menu again 10 s into a scan runs a full 15 s from then
+    let bulb = addBulb()
+    startHammer(holding: [bulb])
+    run(10)                                                      // Bluetooth came on at 0.1 s: scanning
+    gb.rescan()                                                  // the menu opens again
+    run(6)                                                       // 16 s: the first scan's stop is due
+    check(simScanning, "still scanning 6 s after the second open")
+    run(10)
+    check(!simScanning, "stops 15 s after it")
+
+case "forget":   // neighbors' bulbs not seen for 30 days are forgotten; yours never
+    let mine = addBulb(), theirs = addBulb(name: "ihoment_H6006_ABCD")
+    let old = Date().addingTimeInterval(-40 * 86_400)
+    UserDefaults.standard.set([mine.id.uuidString: "H6006|H6006 bulb 0FC3", theirs.id.uuidString: "H6006|H6006 bulb ABCD",
+                               "11111111-2222-3333-4444-555555555555": "H6006|H6006 bulb 1111"], forKey: "bluetoothBulbs")
+    UserDefaults.standard.set([mine.id.uuidString: old, theirs.id.uuidString: old], forKey: "bluetoothBulbsSeen")
+    mine.phoneHasIt = true
+    startHammer(holding: [mine])
+    run(1)
+    let saved = UserDefaults.standard.dictionary(forKey: "bluetoothBulbs") as? [String: String] ?? [:]
+    let seen = UserDefaults.standard.dictionary(forKey: "bluetoothBulbsSeen") as? [String: Date] ?? [:]
+    check(saved[theirs.id.uuidString] == nil, "the neighbor's bulb is forgotten")
+    check(saved[mine.id.uuidString] != nil && gb.lights.first?.name == "H6006 bulb 0FC3", "yours keeps its name")
+    check(saved["11111111-2222-3333-4444-555555555555"] != nil && seen["11111111-2222-3333-4444-555555555555"] != nil,
+          "one with no date yet starts counting")
 
 default:
     print("unknown scenario"); exit(2)
