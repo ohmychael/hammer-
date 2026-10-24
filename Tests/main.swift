@@ -1020,6 +1020,11 @@ check.missingCalls = ["IOAVServiceCopyEDID"]
 expect(check.verdict == .working, "a monitor that answers: working, whatever is missing")
 dell = FakeMonitor(); dell.readStatus = avError; dell.edid = makeEDID("DELL U3818DW", hdmi: true)
 check = runCheck(proUSBC, lidClosed, [301: dell])
+check.missingCalls = ["IOAVServiceCreate"]
+expect(check.verdict == .hdmiAdapter && !check.lacksCalls && check.details.contains("Not in this macOS: IOAVServiceCreate"),
+       "only macOS's default connection call missing while the ports have theirs: still the adapter verdict")
+dell = FakeMonitor(); dell.readStatus = avError; dell.edid = makeEDID("DELL U3818DW", hdmi: true)
+check = runCheck(proUSBC, lidClosed, [301: dell])
 expect(check.title == "The DELL U3818DW is on HDMI through a USB-C adapter" && check.ports[0].edidOverI2C?.valid == true
        && !check.details.contains("over the same wire"), "adapter: the EDID-over-the-wire line is left out (it says nothing new)")
 expect(!check.details.contains("Software dimming") && !check.advice.joined().contains("Meanwhile"),
@@ -1154,6 +1159,11 @@ state = MonitorMenu.make(connections: 2, attached: 2, screens: [studio, dellWith
 expect(state.sliders && state.hints == ["Software dimming: the Dell isn't answering"], "an Apple display next to the Dell: the Dell's menu")
 state = MonitorMenu.make(connections: 1, attached: 1, screens: [], answers: nil)
 expect(state.title != "Apple display connected" && state.sliders, "no screen list: never taken for an Apple display")
+let appleSidecar = MonitorScreen(id: 6, name: "Sidecar Display (AirPlay)", builtIn: false, framebuffer: nil, direct: false,
+                                 vendor: 0x610)
+state = MonitorMenu.make(connections: 0, attached: 0, screens: [builtIn, appleSidecar], answers: nil)
+expect(!appleSidecar.brightnessByMacOS && state.title == "Dell connected through DisplayLink or AirPlay",
+       "a Sidecar or AirPlay screen with Apple's ID isn't an Apple display")
 for software in [SoftwareDimState.on, .paused, .cantDim, .adjusted, .unsupported] {
     for (connections, adapter) in [(1, true), (1, false), (0, false)] {
         let menu = MonitorMenu.make(connections: connections, attached: 1, screens: lidClosed, answers: false,
@@ -1230,7 +1240,7 @@ expect(watchActions == [.leave, .leave, .dim], "unreadable for a while, then the
 curveWatch = DimWatch()
 let ownFour = (0..<4).map { _ in curveWatch.check(now: ownCurves, written: hammersCurves, original: ownCurves) }
 let ownHundred = (0..<100).map { _ in curveWatch.check(now: ownCurves, written: hammersCurves, original: ownCurves) }
-expect(ownFour.allSatisfy { $0 == .dim } && ownHundred.allSatisfy { $0 == .dim } && !curveWatch.gaveUp && !curveWatch.sawOther,
+expect(ownFour.allSatisfy { $0 == .dim } && ownHundred.allSatisfy { $0 == .dim } && !curveWatch.gaveUp && !curveWatch.otherAppAtWork,
        "own ×4 then own ×100: dims again each time, never gives up")
 // A rival writing curves that look like a screen's own still gets Hammer to stop, even though
 // Hammer dims again from them each time (they're what it dims from by then).
@@ -1239,7 +1249,7 @@ _ = curveWatch.check(now: hammersCurves, written: hammersCurves, original: ownCu
 let fromRival = nearOwn.scaled(by: SoftwareDim.factor(level: 40))
 watchActions = [curveWatch.check(now: nearOwn, written: hammersCurves, original: ownCurves)]
     + (0..<3).map { _ in curveWatch.check(now: nearOwn, written: fromRival, original: nearOwn) }
-expect(watchActions == [.dim, .dim, .dim, .leave] && curveWatch.gaveUp && curveWatch.sawOther,
+expect(watchActions == [.dim, .dim, .dim, .leave] && curveWatch.gaveUp && curveWatch.otherAppAtWork,
        "an app's near-own curves, adopted as the original: still stops after three tries")
 curveWatch = DimWatch()
 watchActions = [curveWatch.check(now: nearOwn, written: hammersCurves, original: ownCurves)]
@@ -1254,6 +1264,15 @@ watchActions = [curveWatch.check(now: newProfile, written: hammersCurves, origin
            curveWatch.check(now: newProfile, written: fromNew, original: newProfile)]
 expect(watchActions == [.dim, .leave, .dim] && curveWatch.resets == 0 && curveWatch.own == newProfile,
        "a new color profile: dimmed from, and then it's the screen's own")
+curveWatch = DimWatch()
+_ = curveWatch.check(now: hammersCurves, written: hammersCurves, original: ownCurves)
+_ = curveWatch.check(now: newProfile, written: hammersCurves, original: ownCurves)
+let changedOnce = curveWatch.otherAppAtWork
+_ = curveWatch.check(now: fluxCurves, written: fromNew, original: newProfile)
+let changedTwice = curveWatch.otherAppAtWork
+_ = curveWatch.check(now: fromNew, written: fromNew, original: newProfile)
+expect(!changedOnce && changedTwice && !curveWatch.otherAppAtWork,
+       "\"another app\" only while the curves keep changing (not a one-time profile change), and not once all is well")
 
 // The app's side: launch, reads, the 10-second check.
 var dimApp = SoftwareDimming()

@@ -414,9 +414,10 @@ struct MonitorScreen: Equatable {
 
     static let appleVendor: UInt32 = 0x610
 
-    /// An Apple display (Studio Display, Pro Display XDR): macOS sets its brightness itself
-    /// (keys, Control Center), so Hammer leaves it alone: no DDC, never dimmed in software.
-    var brightnessByMacOS: Bool { vendor == Self.appleVendor }
+    /// An Apple display (Studio Display, Pro Display XDR) on a cable: macOS sets its brightness
+    /// itself (keys, Control Center), so Hammer leaves it alone: no DDC, never dimmed in software.
+    /// Not a Sidecar iPad or an AirPlay screen, which can report Apple's ID too.
+    var brightnessByMacOS: Bool { vendor == Self.appleVendor && direct != false }
 }
 
 /// One external DDC connection.
@@ -645,9 +646,15 @@ struct MonitorCheck {
         case macOSLacksCalls         // this macOS doesn't have the private calls Hammer talks through
     }
 
-    /// The private calls Hammer can't reach a monitor without (IOAVServiceCopyEDID only adds detail).
-    static let neededCalls: Set<String> = ["IOAVServiceCreate", "IOAVServiceCreateWithService",
-                                           "IOAVServiceReadI2C", "IOAVServiceWriteI2C"]
+    /// The private calls Hammer can't reach a monitor without (IOAVServiceCopyEDID only adds detail;
+    /// IOAVServiceCreate, macOS's default connection, matters only if no port has a connection).
+    static let neededCalls: Set<String> = ["IOAVServiceCreateWithService", "IOAVServiceReadI2C", "IOAVServiceWriteI2C"]
+
+    /// This macOS lacks a call Hammer needs to reach the monitor.
+    var lacksCalls: Bool {
+        missingCalls.contains(where: Self.neededCalls.contains)
+            || (missingCalls.contains("IOAVServiceCreate") && !ports.contains { !$0.port.isDefault && !$0.noService })
+    }
 
     var mac = Mac()
     var screens: [MonitorScreen] = []
@@ -763,7 +770,7 @@ struct MonitorCheck {
             if externalScreens.isEmpty { return .noMonitor }
             if externalScreens.allSatisfy({ $0.direct == false }) { return .notDirect }
         }
-        if missingCalls.contains(where: Self.neededCalls.contains) { return .macOSLacksCalls }
+        if lacksCalls { return .macOSLacksCalls }
         // Nothing known to have a monitor: every connection is a candidate.
         let candidates = attached.isEmpty ? ports : attached
         if candidates.allSatisfy({ $0.port.isDefault }) { return .notFound }   // only macOS's guess was left
@@ -1196,7 +1203,6 @@ struct DimWatch: Equatable {
     private(set) var gaveUp = false
     private(set) var rival: GammaCurves?     // what was on the screen when Hammer gave up
     private(set) var calm = 0        // since then: checks in a row with steady curves of the screen's own
-    private(set) var sawOther = false        // another app's curves have been seen here (not just a reset)
     private(set) var own: GammaCurves?       // the screen's own curves, as they were while all was well
     private var seen: GammaCurves?
 
@@ -1216,7 +1222,7 @@ struct DimWatch: Equatable {
             calm = seen.map(now.matches) == true ? calm + 1 : 1
             seen = now
             guard calm >= Self.resumeAfter else { return .leave }
-            self = DimWatch(sawOther: sawOther, own: own)
+            self = DimWatch(own: own)
             return .dim
         }
         guard let written else { return .dim }               // never got to write yet: not anyone's fault
@@ -1228,17 +1234,17 @@ struct DimWatch: Equatable {
         if let now, let own = own ?? original, now.matches(own) { return .dim }
         if own == nil { own = original }   // before dimming again from the other app's curves, if they look like a screen's own
         resets += 1
-        if now != nil { sawOther = true }
         guard resets > Self.giveUpAfter else { return .dim }
         gaveUp = true
         rival = now
         return .leave
     }
 
-    private init(sawOther: Bool, own: GammaCurves?) {
-        self.sawOther = sawOther
-        self.own = own
-    }
+    /// Another app is changing the curves under Hammer: twice in a row or more (a new color
+    /// profile changes them once), or Hammer gave up. Not any more once all is well again.
+    var otherAppAtWork: Bool { gaveUp || resets >= 2 }
+
+    private init(own: GammaCurves?) { self.own = own }
 
     init() {}
 }

@@ -291,7 +291,7 @@ final class SoftwareDimmer {
     private var written: [CGDirectDisplayID: GammaCurves] = [:]   // what Hammer last put on each screen
     private var writtenFactor: [CGDirectDisplayID: Double] = [:]  // ...and how much of the signal that kept
     private var watches: [CGDirectDisplayID: DimWatch] = [:]      // whether something else keeps changing them
-    private var otherAppSeen: Set<CGDirectDisplayID> = []         // another app's curves were seen on these
+    private var otherAppSeen: Set<CGDirectDisplayID> = []         // another app kept changing these (until Hammer dims again)
     private var fades = DimFade()                                 // any other change interrupts a fade
 
     /// Another app keeps changing a screen's curves (f.lux, another dimmer), so
@@ -329,7 +329,8 @@ final class SoftwareDimmer {
     /// dimmed, they're already adjusted: another app, or a calibration).
     func canRead(_ display: CGDirectDisplayID) -> Bool { read(display) != nil }
 
-    /// Whether another app's curves have been seen changing this screen's under Hammer.
+    /// Whether another app has been changing this screen's curves under Hammer (since Hammer
+    /// last dimmed it, or the last wake or display change).
     func sawOtherApp(_ display: CGDirectDisplayID) -> Bool { otherAppSeen.contains(display) }
 
     /// After a wake or a display change: try again where Hammer gave way to another app
@@ -338,6 +339,7 @@ final class SoftwareDimmer {
     func forgetGiveUps() -> Bool {
         let any = contested
         watches = watches.filter { !$0.value.gaveUp }
+        otherAppSeen = []
         return any
     }
 
@@ -364,6 +366,7 @@ final class SoftwareDimmer {
         guard write(dimmed, to: display) else { return false }
         written[display] = dimmed
         writtenFactor[display] = factor
+        otherAppSeen.remove(display)                     // dimmed again: whatever was there is gone
         return true
     }
 
@@ -382,7 +385,7 @@ final class SoftwareDimmer {
             var watch = watches[display] ?? DimWatch()
             let action = watch.check(now: read(display), written: written[display], original: original[display])
             watches[display] = watch
-            if watch.sawOther { otherAppSeen.insert(display) }
+            if watch.otherAppAtWork { otherAppSeen.insert(display) }
             if action == .dim { set(savedLevel(display), on: display, save: false) }
         }
     }
