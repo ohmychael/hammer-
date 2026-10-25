@@ -1,0 +1,13 @@
+Microsoft Edge check
+  ok   Edge found: /Applications/Microsoft Edge.app
+  ok   the find script compiles against Edge's dictionary
+  ok   the find-where-it-was script compiles against Edge's dictionary
+  ok   the state script compiles against Edge's dictionary
+  ok   the show script compiles against Edge's dictionary
+  ok   the hide script compiles against Edge's dictionary
+  ok   the play script compiles against Edge's dictionary
+  ok   the activate script compiles against Edge's dictionary
+  permission to steer Edge without asking: notRunning (a build server has none)
+  SKIPPED opening the window: macOS is asking whether to open Edge for the first time.
+All Edge checks that can run here passed.
+exit 0

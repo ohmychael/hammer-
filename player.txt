@@ -1,0 +1,42 @@
+YouTube player check
+  ok   PlayerScript.js found
+  ok   the dropdown is flush in the top-right corner: (264.0, 283.0, 760.0, 460.0) on (0.0, 62.0, 1024.0, 681.0)
+  backgrounds home: {"size":[760,419],"html":"darker-dark-theme= lang=en","points":[[380,12,[]],[380,210,["div.search-bar-entry-point-button.search-bar-entry-point-primary-button rgba(0, 0, 0, 0.05)"]],[380,407,["ytm-pivot-bar-renderer.frosted-glass rgba(255, 255, 255, 0.9)"]],[8,140,[]],[752,335,[]]],"vars":{}}
+  ok   YouTube's background is cleared, so the glass shows
+  ok   the dropdown opens
+  ok   the page script sees the video
+  ok   it knows the title: Me at the zoo
+  ok   it plays
+  backgrounds watch: {"size":[760,419],"html":"darker-dark-theme= lang=en class=sticky-player watch-scroll","points":[[380,12,[]],[380,210,["div.interstitialViewModelModelContainer rgb(15, 15, 15)","div.player-size.player-placeholder rgb(0, 0, 0)"]],[380,407,[]],[8,140,["div.interstitialViewModelModelContainer rgb(15, 15, 15)","div.player-size.player-placeholder rgb(0, 0, 0)"]],[752,335,[]]],"vars":{}}
+  saved dropdown.png
+  ok   it pops out into the mini player
+  ok   the mini player shows only the video
+  ok   the video fills the mini player, nothing on top
+  saved mini.png
+  ok   back to the dropdown
+  ok   the page looks normal again
+  ok   closing the mini player puts it away
+  ok   and pauses the video
+  ok   opening it again shows the full page
+  ok   YouTube's own scripts can't see Hammer's
+  ok   and it closes again
+  ok   open again
+  ok   ⌘W closes the dropdown
+  ok   "Open in your browser" goes to YouTube's full site: https://www.youtube.com/watch?v=jNQXAC9IVRw&t=7s
+  ok   …at the moment the video is at
+  ok   the ↗ button opens it in your browser and closes the dropdown (https://www.youtube.com/watch?v=jNQXAC9IVRw&t=7s, hidden)
+  ok   closed while paused: put away
+  ok   it starts with no window: it comes up in the mini player
+  ok   a pause that doesn't take, held back twice: still into the mini player (hidden)
+  ok   clicking a mini player button leaves your typing where it was
+  ok   clicking the video gives the mini player the keys
+  ok   Space in the mini player plays or pauses (Optional(false) → Optional(true))
+  ok   Esc closes the mini player
+  ok   …and pauses it
+  note no Liquid Glass here (before macOS 26), so its tint isn't checked
+  ok   put away for Edge: the page is let go
+  ok   opening again: a fresh page
+  ok   …with nothing of the old one to go back to: []
+All player checks passed.
+exit 0
+53 checks, 0 failed
